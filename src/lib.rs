@@ -99,7 +99,8 @@ impl Value {
             (pattern::Pattern::U8(i0), Value::U8(i1)) => i0 == i1,
             (pattern::Pattern::U16(i0), Value::U16(i1)) => i0 == i1,
             (pattern::Pattern::U32(i0), Value::U32(i1)) => i0 == i1,
-            (pattern::Pattern::Tuple(ps), Value::Tuple(vs)) | (pattern::Pattern::Seq(ps), Value::Seq(vs))
+            (pattern::Pattern::Tuple(ps), Value::Tuple(vs))
+            | (pattern::Pattern::Seq(ps), Value::Seq(vs))
                 if ps.len() == vs.len() =>
             {
                 let initial_len = scope.len();
@@ -111,7 +112,9 @@ impl Value {
                 }
                 true
             }
-            (pattern::Pattern::Variant(label0, p), Value::Variant(label1, v)) if label0 == label1 => {
+            (pattern::Pattern::Variant(label0, p), Value::Variant(label1, v))
+                if label0 == label1 =>
+            {
                 v.matches(scope, p)
             }
             _ => false,
@@ -662,9 +665,6 @@ enum Decoder {
     Dynamic(DynFormat),
     Apply(String),
 }
-
-
-
 
 impl Expr {
     fn eval<'a>(&'a self, scope: &'a mut Scope) -> Cow<'a, Value> {
@@ -1831,8 +1831,6 @@ impl<'a> Compiler<'a> {
     }
 }
 
-
-
 impl TypeRef {
     #[allow(dead_code)]
     fn from_value_type<'a>(compiler: &mut Compiler<'a>, t: &ValueType) -> Self {
@@ -2401,7 +2399,8 @@ fn make_huffman_codes(lengths: &[usize]) -> Format {
         let len = lengths[n];
         if len != 0 {
             codes.push((n.to_string(), bit_range(len, next_code[len])));
-            let pattern = pattern::Pattern::Variant(n.to_string(), Box::new(pattern::Pattern::Wildcard));
+            let pattern =
+                pattern::Pattern::Variant(n.to_string(), Box::new(pattern::Pattern::Wildcard));
             let val = Expr::U16(n.try_into().unwrap());
             branches.push((pattern, val));
             //println!("{:?}", codes[codes.len()-1]);

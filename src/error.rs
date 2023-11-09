@@ -1,4 +1,4 @@
-use crate::{byte_set::ByteSet, ReadCtxt, Scope, Value};
+use crate::{byte_set::ByteSet, ReadCtxt, Value, VecScope};
 
 pub type ParseResult<T> = Result<T, ParseError>;
 
@@ -84,8 +84,11 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 impl ParseError {
-    pub fn fail(scope: &Scope, input: ReadCtxt<'_>) -> Self {
-        let bindings = scope.iter().collect::<Vec<_>>();
+    pub fn fail(scope: &VecScope, input: ReadCtxt<'_>) -> Self {
+        let bindings = scope
+            .iter()
+            .map(|(lab, val)| (lab.clone(), val.clone()))
+            .collect::<Vec<_>>();
         let buffer = input.input.to_owned();
         let offset = input.offset;
         Self::Fail {

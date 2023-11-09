@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::{scope::TypeScope, Format, FormatModule, Expr, ValueType};
+use crate::{scope::TypeScope, Expr, Format, FormatModule, ValueType};
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize)]
 #[serde(tag = "tag", content = "data")]

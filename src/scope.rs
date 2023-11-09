@@ -1,49 +1,8 @@
-use crate::{Value, ValueType, Decoder, error::ParseResult, ReadCtxt, Program};
+use crate::{error::ParseResult, Decoder, Program, ReadCtxt, Value, ValueType};
 
 pub struct TypeScope {
     names: Vec<String>,
     types: Vec<ValueType>,
-}
-
-pub struct Scope {
-    names: Vec<String>,
-    values: Vec<Value>,
-    decoders: Vec<Option<Decoder>>,
-}
-
-pub struct ScopeIter {
-    name_iter: std::vec::IntoIter<String>,
-    value_iter: std::vec::IntoIter<Value>,
-}
-
-impl Iterator for ScopeIter {
-    type Item = (String, Value);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match (self.name_iter.next(), self.value_iter.next()) {
-            (Some(name), Some(value)) => Some((name, value)),
-            _ => None,
-        }
-    }
-}
-
-impl IntoIterator for &Scope {
-    type Item = (String, Value);
-
-    type IntoIter = ScopeIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        ScopeIter {
-            name_iter: self.names.clone().into_iter(),
-            value_iter: self.values.clone().into_iter(),
-        }
-    }
-}
-
-impl Scope {
-    pub fn iter(&self) -> impl Iterator<Item = (String, Value)> {
-        (&self).into_iter()
-    }
 }
 
 impl TypeScope {
@@ -82,12 +41,18 @@ impl TypeScope {
     }
 }
 
-impl Scope {
+pub struct VecScope {
+    names: Vec<String>,
+    values: Vec<Value>,
+    decoders: Vec<Option<Decoder>>,
+}
+
+impl VecScope {
     pub fn new() -> Self {
         let names = Vec::new();
         let values = Vec::new();
         let decoders = Vec::new();
-        Scope {
+        VecScope {
             names,
             values,
             decoders,
@@ -116,7 +81,7 @@ impl Scope {
         self.decoders.truncate(len);
     }
 
-    pub fn extend(&mut self, other: Scope) {
+    pub fn extend(&mut self, other: VecScope) {
         self.names.extend(other.names);
         self.values.extend(other.values);
         self.decoders.extend(other.decoders);
@@ -155,3 +120,57 @@ impl Scope {
         res
     }
 }
+
+pub struct VecScopeIter {
+    name_iter: std::vec::IntoIter<String>,
+    value_iter: std::vec::IntoIter<Value>,
+}
+
+pub struct SliceScopeIter<'a> {
+    name_iter: std::slice::Iter<'a, String>,
+    value_iter: std::slice::Iter<'a, Value>,
+}
+
+impl<'a> Iterator for SliceScopeIter<'a> {
+    type Item = (&'a String, &'a Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match (self.name_iter.next(), self.value_iter.next()) {
+            (Some(name), Some(value)) => Some((name, value)),
+            _ => None,
+        }
+    }
+}
+
+impl Iterator for VecScopeIter {
+    type Item = (String, Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match (self.name_iter.next(), self.value_iter.next()) {
+            (Some(name), Some(value)) => Some((name, value)),
+            _ => None,
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a VecScope {
+    type Item = (&'a String, &'a Value);
+
+    type IntoIter = SliceScopeIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        SliceScopeIter {
+            name_iter: self.names.iter(),
+            value_iter: self.values.iter(),
+        }
+    }
+}
+
+impl VecScope {
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
+        (&self).into_iter()
+    }
+}
+
+// NOTE - Scaffolding in case we ever want to redefine Scope to have more ergonomic nesting capabilities
+pub type Scope = VecScope;
