@@ -1,6 +1,6 @@
 use std::{borrow::Cow, fmt, io, ops::Deref, rc::Rc};
 
-use crate::{Expr, Format, FormatModule, Scope, Value};
+use crate::{etc, Expr, Format, FormatModule, Scope, Value};
 
 use super::{Fragment, FragmentBuilder, Symbol};
 
@@ -79,7 +79,7 @@ impl<'module> MonoidalPrinter<'module> {
     fn is_record_with_atomic_fields<'a>(
         &'a self,
         format: &'a Format,
-    ) -> Option<Cow<'a, [(Cow<'static, str>, Format)]>> {
+    ) -> Option<Cow<'a, [(etc::Label, Format)]>> {
         match format {
             Format::ItemVar(level, _args) => {
                 self.is_record_with_atomic_fields(self.module.get_format(*level))
@@ -294,10 +294,7 @@ impl<'module> MonoidalPrinter<'module> {
         }
     }
 
-    fn extract_string_field<'a>(
-        &self,
-        fields: &'a Vec<(Cow<'static, str>, Value)>,
-    ) -> Option<&'a Value> {
+    fn extract_string_field<'a>(&self, fields: &'a Vec<(etc::Label, Value)>) -> Option<&'a Value> {
         fields
             .iter()
             .find_map(|(label, value)| (label == "string").then_some(value))
@@ -456,7 +453,7 @@ impl<'module> MonoidalPrinter<'module> {
     fn compile_table(
         &mut self,
         cols: &[usize],
-        header: &[Cow<'static, str>],
+        header: &[etc::Label],
         rows: &[Vec<String>],
     ) -> Fragment {
         let mut frags = FragmentBuilder::new();
@@ -487,8 +484,8 @@ impl<'module> MonoidalPrinter<'module> {
 
     fn compile_record(
         &mut self,
-        value_fields: &[(Cow<'static, str>, Value)],
-        format_fields: Option<&[(Cow<'static, str>, Format)]>,
+        value_fields: &[(etc::Label, Value)],
+        format_fields: Option<&[(etc::Label, Format)]>,
     ) -> Fragment {
         let mut value_fields_filt = Vec::new();
         let mut format_fields_filt = format_fields.map(|_| Vec::new());

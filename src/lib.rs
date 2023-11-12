@@ -14,6 +14,7 @@ use crate::byte_set::ByteSet;
 pub mod bounds;
 pub mod byte_set;
 pub mod error;
+mod etc;
 pub mod output;
 
 use error::{ParseError, ParseResult};
@@ -21,7 +22,7 @@ use error::{ParseError, ParseResult};
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize)]
 #[serde(tag = "tag", content = "data")]
 pub enum Pattern {
-    Binding(Cow<'static, str>),
+    Binding(etc::Label),
     Wildcard,
     Bool(bool),
     U8(u8),
@@ -29,7 +30,7 @@ pub enum Pattern {
     U32(u32),
     Char(char),
     Tuple(Vec<Pattern>),
-    Variant(Cow<'static, str>, Box<Pattern>),
+    Variant(etc::Label, Box<Pattern>),
     Seq(Vec<Pattern>),
 }
 
@@ -40,7 +41,7 @@ impl Pattern {
         Pattern::Seq(bs.iter().copied().map(Pattern::U8).collect())
     }
 
-    pub fn variant(label: impl Into<Cow<'static, str>>, value: impl Into<Box<Pattern>>) -> Pattern {
+    pub fn variant(label: impl Into<etc::Label>, value: impl Into<Box<Pattern>>) -> Pattern {
         Pattern::Variant(label.into(), value.into())
     }
 
@@ -113,8 +114,8 @@ pub enum ValueType {
     U32,
     Char,
     Tuple(Vec<ValueType>),
-    Record(Vec<(Cow<'static, str>, ValueType)>),
-    Union(Vec<(Cow<'static, str>, ValueType)>),
+    Record(Vec<(etc::Label, ValueType)>),
+    Union(Vec<(etc::Label, ValueType)>),
     Seq(Box<ValueType>),
     Format(Box<ValueType>),
 }
@@ -128,8 +129,8 @@ pub enum Value {
     U32(u32),
     Char(char),
     Tuple(Vec<Value>),
-    Record(Vec<(Cow<'static, str>, Value)>),
-    Variant(Cow<'static, str>, Box<Value>),
+    Record(Vec<(etc::Label, Value)>),
+    Variant(etc::Label, Box<Value>),
     Seq(Vec<Value>),
     Format(Box<Format>),
 }
@@ -137,9 +138,7 @@ pub enum Value {
 impl Value {
     pub const UNIT: Value = Value::Tuple(Vec::new());
 
-    fn record<Label: Into<Cow<'static, str>>>(
-        fields: impl IntoIterator<Item = (Label, Value)>,
-    ) -> Value {
+    fn record<Label: Into<etc::Label>>(fields: impl IntoIterator<Item = (Label, Value)>) -> Value {
         Value::Record(
             fields
                 .into_iter()
@@ -148,7 +147,7 @@ impl Value {
         )
     }
 
-    fn variant(label: impl Into<Cow<'static, str>>, value: impl Into<Box<Value>>) -> Value {
+    fn variant(label: impl Into<etc::Label>, value: impl Into<Box<Value>>) -> Value {
         Value::Variant(label.into(), value.into())
     }
 
@@ -309,7 +308,7 @@ impl ValueType {
                 Ok(ValueType::Record(fs))
             }
             (ValueType::Union(bs1), ValueType::Union(bs2)) => {
-                let mut bs: Vec<(Cow<'static, str>, ValueType)> = Vec::new();
+                let mut bs: Vec<(etc::Label, ValueType)> = Vec::new();
                 for (label, t2) in bs2 {
                     let t = if let Some((_l, t1)) = bs.iter().find(|(l, _)| label == l) {
                         t1.unify(t2)?
@@ -334,19 +333,19 @@ impl ValueType {
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize)]
 #[serde(tag = "tag", content = "data")]
 pub enum Expr {
-    Var(Cow<'static, str>),
+    Var(etc::Label),
     Bool(bool),
     U8(u8),
     U16(u16),
     U32(u32),
     Tuple(Vec<Expr>),
     TupleProj(Box<Expr>, usize),
-    Record(Vec<(Cow<'static, str>, Expr)>),
-    RecordProj(Box<Expr>, Cow<'static, str>),
-    Variant(Cow<'static, str>, Box<Expr>),
+    Record(Vec<(etc::Label, Expr)>),
+    RecordProj(Box<Expr>, etc::Label),
+    Variant(etc::Label, Box<Expr>),
     Seq(Vec<Expr>),
     Match(Box<Expr>, Vec<(Pattern, Expr)>),
-    Lambda(Cow<'static, str>, Box<Expr>),
+    Lambda(etc::Label, Box<Expr>),
 
     BitAnd(Box<Expr>, Box<Expr>),
     BitOr(Box<Expr>, Box<Expr>),
@@ -385,7 +384,7 @@ pub enum Expr {
 impl Expr {
     pub const UNIT: Expr = Expr::Tuple(Vec::new());
 
-    pub fn record_proj(head: impl Into<Box<Expr>>, label: impl Into<Cow<'static, str>>) -> Expr {
+    pub fn record_proj(head: impl Into<Box<Expr>>, label: impl Into<etc::Label>) -> Expr {
         Expr::RecordProj(head.into(), label.into())
     }
 }
@@ -444,16 +443,16 @@ pub enum Format {
     /// Matches a byte in the given byte set
     Byte(ByteSet),
     /// Matches the union of all the formats and returns a variant
-    Union(Vec<(Cow<'static, str>, Format)>),
+    Union(Vec<(etc::Label, Format)>),
     /// Temporary hack for nondeterministic unions
-    NondetUnion(Vec<(Cow<'static, str>, Format)>),
+    NondetUnion(Vec<(etc::Label, Format)>),
     /// Matches the union of all the formats, which must have the same type
     IsoUnion(Vec<Format>),
     /// Matches a sequence of concatenated formats
     Tuple(Vec<Format>),
     /// Matches a sequence of named formats where later formats can depend on
     /// the decoded value of earlier formats
-    Record(Vec<(Cow<'static, str>, Format)>),
+    Record(Vec<(etc::Label, Format)>),
     /// Repeat a format zero-or-more times
     Repeat(Box<Format>),
     /// Repeat a format one-or-more times
@@ -479,11 +478,11 @@ pub enum Format {
     /// Pattern match on an expression
     Match(Expr, Vec<(Pattern, Format)>),
     /// Pattern match on an expression and return a variant
-    MatchVariant(Expr, Vec<(Pattern, Cow<'static, str>, Format)>),
+    MatchVariant(Expr, Vec<(Pattern, etc::Label, Format)>),
     /// Format generated dynamically
     Dynamic(DynFormat),
     /// Apply a dynamic format from a named variable in the scope
-    Apply(Cow<'static, str>),
+    Apply(etc::Label),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize)]
@@ -494,7 +493,7 @@ pub enum DynFormat {
 impl Format {
     pub const EMPTY: Format = Format::Tuple(Vec::new());
 
-    pub fn alts<Label: Into<Cow<'static, str>>>(
+    pub fn alts<Label: Into<etc::Label>>(
         fields: impl IntoIterator<Item = (Label, Format)>,
     ) -> Format {
         Format::Union(
@@ -504,7 +503,7 @@ impl Format {
         )
     }
 
-    pub fn record<Label: Into<Cow<'static, str>>>(
+    pub fn record<Label: Into<etc::Label>>(
         fields: impl IntoIterator<Item = (Label, Format)>,
     ) -> Format {
         Format::Record(
@@ -534,8 +533,8 @@ impl FormatRef {
 
 #[derive(Debug, Serialize)]
 pub struct FormatModule {
-    names: Vec<Cow<'static, str>>,
-    args: Vec<Vec<(Cow<'static, str>, ValueType)>>,
+    names: Vec<etc::Label>,
+    args: Vec<Vec<(etc::Label, ValueType)>>,
     formats: Vec<Format>,
     format_types: Vec<ValueType>,
 }
@@ -550,18 +549,14 @@ impl FormatModule {
         }
     }
 
-    pub fn define_format(
-        &mut self,
-        name: impl Into<Cow<'static, str>>,
-        format: Format,
-    ) -> FormatRef {
+    pub fn define_format(&mut self, name: impl Into<etc::Label>, format: Format) -> FormatRef {
         self.define_format_args(name, vec![], format)
     }
 
     pub fn define_format_args(
         &mut self,
-        name: impl Into<Cow<'static, str>>,
-        args: Vec<(Cow<'static, str>, ValueType)>,
+        name: impl Into<etc::Label>,
+        args: Vec<(etc::Label, ValueType)>,
         format: Format,
     ) -> FormatRef {
         let mut scope = TypeScope::new();
@@ -584,7 +579,7 @@ impl FormatModule {
         &self.names[level]
     }
 
-    fn get_args(&self, level: usize) -> &[(Cow<'static, str>, ValueType)] {
+    fn get_args(&self, level: usize) -> &[(etc::Label, ValueType)] {
         &self.args[level]
     }
 
@@ -718,7 +713,7 @@ enum Next<'a> {
     Union(Rc<Next<'a>>, Rc<Next<'a>>),
     Cat(&'a Format, Rc<Next<'a>>),
     Tuple(&'a [Format], Rc<Next<'a>>),
-    Record(&'a [(Cow<'static, str>, Format)], Rc<Next<'a>>),
+    Record(&'a [(etc::Label, Format)], Rc<Next<'a>>),
     Repeat(&'a Format, Rc<Next<'a>>),
     RepeatCount(usize, &'a Format, Rc<Next<'a>>),
     Slice(usize, Rc<Next<'a>>, Rc<Next<'a>>),
@@ -746,16 +741,16 @@ pub struct MatchTree {
 
 /// Decoders with a fixed amount of lookahead
 enum Decoder {
-    Call(usize, Vec<(Cow<'static, str>, Expr)>),
+    Call(usize, Vec<(etc::Label, Expr)>),
     Fail,
     EndOfInput,
     Align(usize),
     Byte(ByteSet),
-    Parallel(Vec<(Cow<'static, str>, Decoder)>),
-    Branch(MatchTree, Vec<(Cow<'static, str>, Decoder)>),
+    Parallel(Vec<(etc::Label, Decoder)>),
+    Branch(MatchTree, Vec<(etc::Label, Decoder)>),
     IsoBranch(MatchTree, Vec<Decoder>),
     Tuple(Vec<Decoder>),
-    Record(Vec<(Cow<'static, str>, Decoder)>),
+    Record(Vec<(etc::Label, Decoder)>),
     While(MatchTree, Box<Decoder>),
     Until(MatchTree, Box<Decoder>),
     RepeatCount(Expr, Box<Decoder>),
@@ -768,9 +763,9 @@ enum Decoder {
     WithRelativeOffset(Expr, Box<Decoder>),
     Compute(Expr),
     Match(Expr, Vec<(Pattern, Decoder)>),
-    MatchVariant(Expr, Vec<(Pattern, Cow<'static, str>, Decoder)>),
+    MatchVariant(Expr, Vec<(Pattern, etc::Label, Decoder)>),
     Dynamic(DynFormat),
-    Apply(Cow<'static, str>),
+    Apply(etc::Label),
 }
 
 impl Expr {
@@ -1389,10 +1384,7 @@ impl Format {
         }
     }
 
-    fn union_depends_on_next(
-        branches: &[(Cow<'static, str>, Format)],
-        module: &FormatModule,
-    ) -> bool {
+    fn union_depends_on_next(branches: &[(etc::Label, Format)], module: &FormatModule) -> bool {
         let mut fs = Vec::with_capacity(branches.len());
         for (_label, f) in branches {
             if f.depends_on_next(module) {
@@ -1560,7 +1552,7 @@ impl<'a> MatchTreeStep<'a> {
 
     fn add_record(
         module: &'a FormatModule,
-        fields: &'a [(Cow<'static, str>, Format)],
+        fields: &'a [(etc::Label, Format)],
         next: Rc<Next<'a>>,
     ) -> MatchTreeStep<'a> {
         match fields.split_first() {
@@ -1912,8 +1904,8 @@ pub enum TypeRef {
 
 pub enum TypeDef {
     //Equiv(TypeRef),
-    Union(Vec<(Cow<'static, str>, TypeRef)>),
-    Record(Vec<(Cow<'static, str>, TypeRef)>),
+    Union(Vec<(etc::Label, TypeRef)>),
+    Record(Vec<(etc::Label, TypeRef)>),
 }
 
 pub struct Program {
@@ -1937,8 +1929,8 @@ impl Program {
 pub struct Compiler<'a> {
     module: &'a FormatModule,
     program: Program,
-    record_map: HashMap<Vec<(Cow<'static, str>, TypeRef)>, usize>,
-    union_map: HashMap<Vec<(Cow<'static, str>, TypeRef)>, usize>,
+    record_map: HashMap<Vec<(etc::Label, TypeRef)>, usize>,
+    union_map: HashMap<Vec<(etc::Label, TypeRef)>, usize>,
     decoder_map: HashMap<(usize, Rc<Next<'a>>), usize>,
 }
 
@@ -1983,23 +1975,23 @@ impl<'a> Compiler<'a> {
 }
 
 pub struct TypeScope {
-    names: Vec<Cow<'static, str>>,
+    names: Vec<etc::Label>,
     types: Vec<ValueType>,
 }
 
 pub struct Scope {
-    names: Vec<Cow<'static, str>>,
+    names: Vec<etc::Label>,
     values: Vec<Value>,
     decoders: Vec<Option<Decoder>>,
 }
 
 pub struct ScopeIter {
-    name_iter: std::vec::IntoIter<Cow<'static, str>>,
+    name_iter: std::vec::IntoIter<etc::Label>,
     value_iter: std::vec::IntoIter<Value>,
 }
 
 impl Iterator for ScopeIter {
-    type Item = (Cow<'static, str>, Value);
+    type Item = (etc::Label, Value);
 
     fn next(&mut self) -> Option<Self::Item> {
         match (self.name_iter.next(), self.value_iter.next()) {
@@ -2010,7 +2002,7 @@ impl Iterator for ScopeIter {
 }
 
 impl IntoIterator for &Scope {
-    type Item = (Cow<'static, str>, Value);
+    type Item = (etc::Label, Value);
 
     type IntoIter = ScopeIter;
 
@@ -2023,7 +2015,7 @@ impl IntoIterator for &Scope {
 }
 
 impl Scope {
-    pub fn iter(&self) -> impl Iterator<Item = (Cow<'static, str>, Value)> {
+    pub fn iter(&self) -> impl Iterator<Item = (etc::Label, Value)> {
         (&self).into_iter()
     }
 }
@@ -2035,7 +2027,7 @@ impl TypeScope {
         TypeScope { names, types }
     }
 
-    fn push(&mut self, name: Cow<'static, str>, t: ValueType) {
+    fn push(&mut self, name: etc::Label, t: ValueType) {
         self.names.push(name);
         self.types.push(t);
     }
@@ -2076,7 +2068,7 @@ impl Scope {
         }
     }
 
-    fn push(&mut self, name: Cow<'static, str>, v: Value) {
+    fn push(&mut self, name: etc::Label, v: Value) {
         self.names.push(name);
         self.values.push(v);
         self.decoders.push(None);
@@ -2805,9 +2797,7 @@ fn inflate(codes: &[Value]) -> Vec<Value> {
 mod tests {
     use super::*;
 
-    fn alts<Label: Into<Cow<'static, str>>>(
-        fields: impl IntoIterator<Item = (Label, Format)>,
-    ) -> Format {
+    fn alts<Label: Into<etc::Label>>(fields: impl IntoIterator<Item = (Label, Format)>) -> Format {
         Format::Union(
             (fields.into_iter())
                 .map(|(label, format)| (label.into(), format))
@@ -2815,7 +2805,7 @@ mod tests {
         )
     }
 
-    fn record<Label: Into<Cow<'static, str>>>(
+    fn record<Label: Into<etc::Label>>(
         fields: impl IntoIterator<Item = (Label, Format)>,
     ) -> Format {
         Format::Record(

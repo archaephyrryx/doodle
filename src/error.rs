@@ -1,13 +1,11 @@
-use crate::{byte_set::ByteSet, ReadCtxt, Scope, Value};
-
-use std::borrow::Cow;
+use crate::{byte_set::ByteSet, etc::Label, ReadCtxt, Scope, Value};
 
 pub type ParseResult<T> = Result<T, ParseError>;
 
 #[derive(Debug)]
 pub enum ParseError {
     Fail {
-        bindings: Vec<(Cow<'static, str>, Value)>,
+        bindings: Vec<(Label, Value)>,
         buffer: Vec<u8>,
         offset: usize,
     },
