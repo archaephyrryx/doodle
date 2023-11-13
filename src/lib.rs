@@ -7,6 +7,7 @@ use std::ops::Add;
 use std::rc::Rc;
 
 use serde::Serialize;
+use util::SparseVec;
 
 use crate::bounds::Bounds;
 use crate::byte_set::ByteSet;
@@ -16,6 +17,7 @@ pub mod byte_set;
 pub mod error;
 mod etc;
 pub mod output;
+mod util;
 
 use error::{ParseError, ParseResult};
 
