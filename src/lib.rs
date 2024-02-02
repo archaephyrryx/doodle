@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use std::ops::Add;
 use std::rc::Rc;
 
-use serde::Serialize;
 use anyhow::{anyhow, Result as AResult};
+use serde::Serialize;
 
 use crate::bounds::Bounds;
 use crate::byte_set::ByteSet;
@@ -74,11 +74,10 @@ impl ValueType {
 
     fn record_proj(&self, label: &str) -> ValueType {
         match self {
-            ValueType::Record(fields) =>
-                match fields.iter().find(|(l, _)| label == l) {
-                    Some((_, t)) => t.clone(),
-                    None => panic!("{label} not found in record type"),
-                }
+            ValueType::Record(fields) => match fields.iter().find(|(l, _)| label == l) {
+                Some((_, t)) => t.clone(),
+                None => panic!("{label} not found in record type"),
+            },
             _ => panic!("expected record type"),
         }
     }
@@ -247,11 +246,12 @@ impl Expr {
     // FIXME: is this still an inherent method, or should we have a UD -> TC phase and use get_type_info instead?
     fn infer_type(&self, scope: &TypeScope<'_>) -> AResult<ValueType> {
         match self {
-            Expr::Var(name) =>
-                match scope.get_type_by_name(name) {
-                    ValueKind::Value(t) => Ok(t.clone()),
-                    ValueKind::Format(_t) => Err(anyhow!("expected ValueKind::Value, found ValueKind::Format for var {name}")),
-                }
+            Expr::Var(name) => match scope.get_type_by_name(name) {
+                ValueKind::Value(t) => Ok(t.clone()),
+                ValueKind::Format(_t) => Err(anyhow!(
+                    "expected ValueKind::Value, found ValueKind::Format for var {name}"
+                )),
+            },
             Expr::Bool(_b) => Ok(ValueType::Base(BaseType::Bool)),
             Expr::U8(_n) => Ok(ValueType::Base(BaseType::U8)),
             Expr::U16(_n) => Ok(ValueType::Base(BaseType::U16)),
@@ -263,11 +263,10 @@ impl Expr {
                 }
                 Ok(ValueType::Tuple(ts))
             }
-            Expr::TupleProj(head, index) =>
-                match head.infer_type(scope)? {
-                    ValueType::Tuple(vs) => Ok(vs[*index].clone()),
-                    other => Err(anyhow!("tuple projection on non-tuple type {other:?}")),
-                }
+            Expr::TupleProj(head, index) => match head.infer_type(scope)? {
+                ValueType::Tuple(vs) => Ok(vs[*index].clone()),
+                other => Err(anyhow!("tuple projection on non-tuple type {other:?}")),
+            },
             Expr::Record(fields) => {
                 let mut fs = Vec::new();
                 for (label, expr) in fields {
@@ -277,8 +276,10 @@ impl Expr {
             }
             // FIXME - TupleProj
             Expr::RecordProj(head, label) => Ok(head.infer_type(scope)?.record_proj(label)),
-            Expr::Variant(label, expr) =>
-                Ok(ValueType::Union(vec![(label.clone(), expr.infer_type(scope)?)])),
+            Expr::Variant(label, expr) => Ok(ValueType::Union(vec![(
+                label.clone(),
+                expr.infer_type(scope)?,
+            )])),
             Expr::Seq(exprs) => {
                 let mut t = ValueType::Any;
                 for e in exprs {
@@ -293,81 +294,78 @@ impl Expr {
                 let head_type = Rc::new(head.infer_type(scope)?);
                 let mut t = ValueType::Any;
                 for (pattern, branch) in branches {
-                    t = t.unify(&pattern.infer_expr_branch_type(scope, head_type.clone(), branch)?)?;
+                    t = t.unify(&pattern.infer_expr_branch_type(
+                        scope,
+                        head_type.clone(),
+                        branch,
+                    )?)?;
                 }
                 Ok(t)
             }
             Expr::Lambda(..) => Err(anyhow!("infer_type encountered unexpected lambda")),
 
             Expr::IntRel(_rel, x, y) => match (x.infer_type(scope)?, y.infer_type(scope)?) {
-                (ValueType::Base(b1), ValueType::Base(b2)) if b1 == b2 && b1.is_numeric() => Ok(ValueType::Base(BaseType::Bool)),
-                (x, y) => Err(anyhow!("mismatched operand types for {_rel:?}: {x:?}, {y:?}")),
+                (ValueType::Base(b1), ValueType::Base(b2)) if b1 == b2 && b1.is_numeric() => {
+                    Ok(ValueType::Base(BaseType::Bool))
+                }
+                (x, y) => Err(anyhow!("mismatched operands {x:?}, {y:?}")),
             },
             Expr::Arith(_arith, x, y) => match (x.infer_type(scope)?, y.infer_type(scope)?) {
-                (ValueType::Base(b1), ValueType::Base(b2)) if b1 == b2 && b1.is_numeric() => Ok(ValueType::Base(b1)),
-                (x, y) => Err(anyhow!("mismatched operand types for {_arith:?}: {x:?}, {y:?}")),
+                (ValueType::Base(b1), ValueType::Base(b2)) if b1 == b2 && b1.is_numeric() => {
+                    Ok(ValueType::Base(b1))
+                }
+                (x, y) => Err(anyhow!("mismatched operands {x:?}, {y:?}")),
             },
 
-            Expr::AsU8(x) =>
-                match x.infer_type(scope)? {
-                    ValueType::Base(b) if b.is_numeric() => Ok(ValueType::Base(BaseType::U8)),
-                    x => Err(anyhow!("unsound type cast AsU8(_ : {x:?})")),
-                }
-            Expr::AsU16(x) =>
-                match x.infer_type(scope)? {
-                    ValueType::Base(b) if b.is_numeric() =>
-                        Ok(ValueType::Base(BaseType::U16)),
-                    x => Err(anyhow!("unsound type cast AsU16(_ : {x:?})")),
-                }
-            Expr::AsU32(x) =>
-                match x.infer_type(scope)? {
-                    ValueType::Base(b) if b.is_numeric() =>
-                        Ok(ValueType::Base(BaseType::U32)),
-                    x => Err(anyhow!("unsound type cast AsU32(_ : {x:?})")),
-                }
-            Expr::AsChar(x) =>
-                match x.infer_type(scope)? {
-                    ValueType::Base(b) if b.is_numeric() =>
-                        Ok(ValueType::Base(BaseType::Char)),
-                    x => Err(anyhow!("unsound type cast AsChar(_ : {x:?})")),
-                }
+            Expr::AsU8(x) => match x.infer_type(scope)? {
+                ValueType::Base(b) if b.is_numeric() => Ok(ValueType::Base(BaseType::U8)),
+                x => Err(anyhow!("unsound type cast AsU8(_ : {x:?})")),
+            },
+            Expr::AsU16(x) => match x.infer_type(scope)? {
+                ValueType::Base(b) if b.is_numeric() => Ok(ValueType::Base(BaseType::U16)),
+                x => Err(anyhow!("unsound type cast AsU16(_ : {x:?})")),
+            },
+            Expr::AsU32(x) => match x.infer_type(scope)? {
+                ValueType::Base(b) if b.is_numeric() => Ok(ValueType::Base(BaseType::U32)),
+                x => Err(anyhow!("unsound type cast AsU32(_ : {x:?})")),
+            },
+            Expr::AsChar(x) => match x.infer_type(scope)? {
+                ValueType::Base(b) if b.is_numeric() => Ok(ValueType::Base(BaseType::Char)),
+                x => Err(anyhow!("unsound type cast AsChar(_ : {x:?})")),
+            },
             Expr::U16Be(bytes) => {
                 let _t = bytes.infer_type(scope)?;
                 match _t.as_tuple_type() {
-                    [ValueType::Base(BaseType::U8), ValueType::Base(BaseType::U8)] =>
-                        Ok(ValueType::Base(BaseType::U16)),
+                    [ValueType::Base(BaseType::U8), ValueType::Base(BaseType::U8)] => {
+                        Ok(ValueType::Base(BaseType::U16))
+                    }
                     _ => Err(anyhow!("unsound byte-level type cast U16Be(_ : {_t:?})")),
                 }
             }
             Expr::U16Le(bytes) => {
                 let _t = bytes.infer_type(scope)?;
                 match _t.as_tuple_type() {
-                    [ValueType::Base(BaseType::U8), ValueType::Base(BaseType::U8)] =>
-                        Ok(ValueType::Base(BaseType::U16)),
+                    [ValueType::Base(BaseType::U8), ValueType::Base(BaseType::U8)] => {
+                        Ok(ValueType::Base(BaseType::U16))
+                    }
                     _ => Err(anyhow!("unsound byte-level type cast U16Le(_ : {_t:?})")),
                 }
             }
-            Expr::U32Be(bytes)  => {
+            Expr::U32Be(bytes) => {
                 let _t = bytes.infer_type(scope)?;
                 match _t.as_tuple_type() {
-                    [
-                        ValueType::Base(BaseType::U8),
-                        ValueType::Base(BaseType::U8),
-                        ValueType::Base(BaseType::U8),
-                        ValueType::Base(BaseType::U8),
-                    ] => Ok(ValueType::Base(BaseType::U32)),
+                    [ValueType::Base(BaseType::U8), ValueType::Base(BaseType::U8), ValueType::Base(BaseType::U8), ValueType::Base(BaseType::U8)] => {
+                        Ok(ValueType::Base(BaseType::U32))
+                    }
                     _ => Err(anyhow!("unsound byte-level type cast U32Be(_ : {_t:?})")),
                 }
             }
             Expr::U32Le(bytes) => {
                 let _t = bytes.infer_type(scope)?;
                 match _t.as_tuple_type() {
-                    [
-                        ValueType::Base(BaseType::U8),
-                        ValueType::Base(BaseType::U8),
-                        ValueType::Base(BaseType::U8),
-                        ValueType::Base(BaseType::U8),
-                    ] => Ok(ValueType::Base(BaseType::U32)),
+                    [ValueType::Base(BaseType::U8), ValueType::Base(BaseType::U8), ValueType::Base(BaseType::U8), ValueType::Base(BaseType::U8)] => {
+                        Ok(ValueType::Base(BaseType::U32))
+                    }
                     _ => Err(anyhow!("unsound byte-level type cast U32Le(_ : {_t:?})")),
                 }
             }
@@ -446,13 +444,13 @@ impl Expr {
                 let t = expr.infer_type(scope)?;
                 Ok(ValueType::Seq(Box::new(t)))
             }
-            Expr::Inflate(seq) =>
-                match seq.infer_type(scope)? {
-                    // FIXME should check values are appropriate variants
-                    ValueType::Seq(_values) =>
-                        Ok(ValueType::Seq(Box::new(ValueType::Base(BaseType::U8)))),
-                    other => Err(anyhow!("Inflate: expected Seq, found {other:?}")),
+            Expr::Inflate(seq) => match seq.infer_type(scope)? {
+                // FIXME should check values are appropriate variants
+                ValueType::Seq(_values) => {
+                    Ok(ValueType::Seq(Box::new(ValueType::Base(BaseType::U8))))
                 }
+                other => Err(anyhow!("Inflate: expected Seq, found {other:?}")),
+            },
         }
     }
 
@@ -514,8 +512,7 @@ pub enum DynFormat {
 /// formats no longer describe regular languages.
 ///
 /// [regular expressions]: https://en.wikipedia.org/wiki/Regular_expression#Formal_definition
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-#[derive(Serialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize)]
 #[serde(tag = "tag", content = "data")]
 pub enum Format {
     /// Reference to a top-level item
@@ -581,7 +578,7 @@ impl Format {
             fields
                 .into_iter()
                 .map(|(label, format)| Format::Variant(label.into(), Box::new(format)))
-                .collect()
+                .collect(),
         )
     }
 
@@ -590,7 +587,7 @@ impl Format {
             fields
                 .into_iter()
                 .map(|(label, format)| (label.into(), format))
-                .collect()
+                .collect(),
         )
     }
 }
@@ -633,12 +630,11 @@ impl Format {
             Format::Map(f, _expr) => f.match_bounds(module),
             Format::Compute(_) => Bounds::exact(0),
             Format::Let(_name, _expr, f) => f.match_bounds(module),
-            Format::Match(_, branches) =>
-                branches
-                    .iter()
-                    .map(|(_, f)| f.match_bounds(module))
-                    .reduce(Bounds::union)
-                    .unwrap(),
+            Format::Match(_, branches) => branches
+                .iter()
+                .map(|(_, f)| f.match_bounds(module))
+                .reduce(Bounds::union)
+                .unwrap(),
             Format::Dynamic(_name, _dynformat, f) => f.match_bounds(module),
             Format::Apply(_) => Bounds::new(1, None),
         }
@@ -718,7 +714,7 @@ impl Format {
             Format::Tuple(formats) => {
                 !formats.is_empty() && formats.iter().all(|f| f.is_ascii_char_format(module))
             }
-            | Format::Repeat(format)
+            Format::Repeat(format)
             | Format::Repeat1(format)
             | Format::RepeatCount(_, format)
             | Format::RepeatUntilLast(_, format)
@@ -773,7 +769,7 @@ impl FormatModule {
         &mut self,
         name: impl IntoLabel,
         args: Vec<(Label, ValueType)>,
-        format: Format
+        format: Format,
     ) -> FormatRef {
         let mut scope = TypeScope::new();
         for (arg_name, arg_type) in &args {
@@ -821,8 +817,10 @@ impl FormatModule {
             Format::EndOfInput => Ok(ValueType::Tuple(vec![])),
             Format::Align(_n) => Ok(ValueType::Tuple(vec![])),
             Format::Byte(_bs) => Ok(ValueType::Base(BaseType::U8)),
-            Format::Variant(label, f) =>
-                Ok(ValueType::Union(vec![(label.clone(), self.infer_format_type(scope, f)?)])),
+            Format::Variant(label, f) => Ok(ValueType::Union(vec![(
+                label.clone(),
+                self.infer_format_type(scope, f)?,
+            )])),
             Format::Union(branches) | Format::UnionNondet(branches) => {
                 let mut t = ValueType::Any;
                 for f in branches {
@@ -851,7 +849,7 @@ impl FormatModule {
                 let t = self.infer_format_type(scope, a)?;
                 Ok(ValueType::Seq(Box::new(t)))
             }
-            | Format::RepeatCount(_expr, a)
+            Format::RepeatCount(_expr, a)
             | Format::RepeatUntilLast(_expr, a)
             | Format::RepeatUntilSeq(_expr, a) => {
                 let t = self.infer_format_type(scope, a)?;
@@ -887,9 +885,12 @@ impl FormatModule {
                 let head_type = Rc::new(head.infer_type(scope)?);
                 let mut t = ValueType::Any;
                 for (pattern, branch) in branches {
-                    t = t.unify(
-                        &pattern.infer_format_branch_type(scope, head_type.clone(), self, branch)?
-                    )?;
+                    t = t.unify(&pattern.infer_format_branch_type(
+                        scope,
+                        head_type.clone(),
+                        self,
+                        branch,
+                    )?)?;
                 }
                 Ok(t)
             }
@@ -897,16 +898,14 @@ impl FormatModule {
                 match dynformat {
                     DynFormat::Huffman(lengths_expr, _opt_values_expr) => {
                         match lengths_expr.infer_type(scope)? {
-                            ValueType::Seq(t) =>
-                                match &*t {
-                                    | ValueType::Base(BaseType::U8)
-                                    | ValueType::Base(BaseType::U16) => {}
-                                    other => {
-                                        return Err(
-                                            anyhow!("Huffman: expected U8 or U16, found {other:?}")
-                                        );
-                                    }
+                            ValueType::Seq(t) => match &*t {
+                                ValueType::Base(BaseType::U8) | ValueType::Base(BaseType::U16) => {}
+                                other => {
+                                    return Err(anyhow!(
+                                        "Huffman: expected U8 or U16, found {other:?}"
+                                    ));
                                 }
+                            },
                             other => {
                                 return Err(anyhow!("Huffman: expected Seq, found {other:?}"));
                             }
@@ -918,11 +917,10 @@ impl FormatModule {
                 child_scope.push_format(name.clone(), ValueType::Base(BaseType::U16));
                 self.infer_format_type(&child_scope, format)
             }
-            Format::Apply(name) =>
-                match scope.get_type_by_name(name) {
-                    ValueKind::Format(t) => Ok(t.clone()),
-                    ValueKind::Value(t) => Err(anyhow!("Apply: expected format, found {t:?}")),
-                }
+            Format::Apply(name) => match scope.get_type_by_name(name) {
+                ValueKind::Format(t) => Ok(t.clone()),
+                ValueKind::Value(t) => Err(anyhow!("Apply: expected format, found {t:?}")),
+            },
         }
     }
 }
@@ -1082,7 +1080,7 @@ impl<'a> MatchTreeStep<'a> {
     fn from_tuple(
         module: &'a FormatModule,
         fields: &'a [Format],
-        next: Rc<Next<'a>>
+        next: Rc<Next<'a>>,
     ) -> MatchTreeStep<'a> {
         match fields.split_first() {
             None => Self::from_next(module, next),
@@ -1096,7 +1094,7 @@ impl<'a> MatchTreeStep<'a> {
     fn from_record(
         module: &'a FormatModule,
         fields: &'a [(Label, Format)],
-        next: Rc<Next<'a>>
+        next: Rc<Next<'a>>,
     ) -> MatchTreeStep<'a> {
         match fields.split_first() {
             None => Self::from_next(module, next),
@@ -1111,10 +1109,14 @@ impl<'a> MatchTreeStep<'a> {
         module: &'a FormatModule,
         n: usize,
         format: &'a Format,
-        next: Rc<Next<'a>>
+        next: Rc<Next<'a>>,
     ) -> MatchTreeStep<'a> {
         if n > 0 {
-            Self::from_format(module, format, Rc::new(Next::RepeatCount(n - 1, format, next)))
+            Self::from_format(
+                module,
+                format,
+                Rc::new(Next::RepeatCount(n - 1, format, next)),
+            )
         } else {
             Self::from_next(module, next)
         }
@@ -1125,7 +1127,7 @@ impl<'a> MatchTreeStep<'a> {
         module: &'a FormatModule,
         n: usize,
         inner: Rc<Next<'a>>,
-        next: Rc<Next<'a>>
+        next: Rc<Next<'a>>,
     ) -> MatchTreeStep<'a> {
         if n > 0 {
             let mut tree = Self::from_next(module, inner);
@@ -1181,7 +1183,7 @@ impl<'a> MatchTreeStep<'a> {
     pub fn from_format(
         module: &'a FormatModule,
         f: &'a Format,
-        next: Rc<Next<'a>>
+        next: Rc<Next<'a>>,
     ) -> MatchTreeStep<'a> {
         match f {
             Format::ItemVar(level, _args) => {
@@ -1205,7 +1207,11 @@ impl<'a> MatchTreeStep<'a> {
             Format::Record(fields) => Self::from_record(module, fields, next),
             Format::Repeat(a) => {
                 let tree = Self::from_next(module, next.clone());
-                tree.union(Self::from_format(module, a, Rc::new(Next::Repeat(a, next.clone()))))
+                tree.union(Self::from_format(
+                    module,
+                    a,
+                    Rc::new(Next::Repeat(a, next.clone())),
+                ))
             }
             Format::Repeat1(a) => {
                 Self::from_format(module, a, Rc::new(Next::Repeat(a, next.clone())))
@@ -1255,13 +1261,12 @@ impl<'a> MatchTreeStep<'a> {
                     Some(n) => {
                         let peek = match n {
                             0 => Self::from_format(module, a, Rc::new(Next::Empty)),
-                            _ =>
-                                Self::from_slice(
-                                    module,
-                                    n,
-                                    Rc::new(Next::Empty),
-                                    Rc::new(Next::Tuple(std::slice::from_ref(a.as_ref()), next))
-                                ),
+                            _ => Self::from_slice(
+                                module,
+                                n,
+                                Rc::new(Next::Empty),
+                                Rc::new(Next::Tuple(std::slice::from_ref(a.as_ref()), next)),
+                            ),
                         };
                         tree.peek(peek)
                     }
@@ -1342,7 +1347,7 @@ impl<'a> MatchTreeLevel<'a> {
     fn merge_step(
         mut self,
         index: usize,
-        step: MatchTreeStep<'a>
+        step: MatchTreeStep<'a>,
     ) -> Result<MatchTreeLevel<'a>, ()> {
         if step.accept {
             self.merge_accept(index)?;
