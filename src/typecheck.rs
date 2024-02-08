@@ -320,6 +320,7 @@ pub(crate) struct TypeChecker {
     constraints: Vec<Constraints>,
     aliases: Vec<Alias>, // set of non-identity metavariables that are aliased to ?ix
     varmaps: VarMapMap, // logically separate table of metacontext variant-maps for indirect aliasing
+    level_types: HashMap<usize, Rc<UType>>, // perma-cache of utypes for called itemvars
 }
 
 #[derive(Clone, Debug, Default)]
@@ -590,6 +591,7 @@ impl TypeChecker {
             constraints: Vec::new(),
             aliases: Vec::new(),
             varmaps: VarMapMap::new(),
+            level_types: HashMap::new(),
         }
     }
 
@@ -757,7 +759,18 @@ impl TypeChecker {
             _ => VType::Abstract(t),
         }
     }
+
+    fn infer_utype_format_level(&mut self, level: usize, ctxt: Ctxt<'_>) -> TCResult<Rc<UType>> {
+        if let Some(ret) = self.level_types.get(&level) {
+            return Ok(ret.clone());
+        } else {
+            let ret = self.infer_utype_format(ctxt.module.get_format(level), ctxt)?;
+            self.level_types.insert(level, ret.clone());
+            Ok(ret)
+        }
+    }
 }
+
 // !SECTION
 
 // SECTION - checks and maintenance of invariants of the metacontext
@@ -2174,18 +2187,20 @@ impl TypeChecker {
         Ok(newvar)
     }
 
-    /// Assigns new metavariables and simple constraints for a format, and returns the most specific UType possible,
-    /// which in many cases will be a Var pointing to a novel UVar.
+    /// Assigns new metavariables and simple constraints for a format, and returns the novel toplevel UVar
+    ///
     pub fn infer_var_format<'a>(&mut self, f: &Format, ctxt: Ctxt<'a>) -> TCResult<UVar> {
         match f {
             Format::ItemVar(level, args) => {
                 let newvar = self.get_new_uvar();
                 if !args.is_empty() {
-                    for arg in args.iter() {
-                        let _ = self.infer_var_expr(arg, ctxt.scope)?;
+                    let expected = ctxt.module.get_args(*level);
+                    for ((label, vt), arg) in Iterator::zip(expected.iter(), args.iter()) {
+                        let v_arg = self.infer_var_expr(arg, ctxt.scope)?;
+                        self.unify_var_valuetype(v_arg, vt)?;
                     }
                 }
-                let ut = self.infer_utype_format(ctxt.module.get_format(*level), ctxt)?;
+                let ut = self.infer_utype_format_level(*level, ctxt)?;
                 self.unify_var_utype(newvar, ut)?;
                 Ok(newvar.into())
             }
