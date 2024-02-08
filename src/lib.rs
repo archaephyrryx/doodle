@@ -23,9 +23,6 @@ mod precedence;
 pub mod prelude;
 pub mod read;
 
-mod extension;
-// use extension::{UD, TC, Extension, TotalExtension, HOInfo, MCInfo, NLInfo, MaybeCast};
-
 mod typecheck;
 use typecheck::UnificationError;
 
