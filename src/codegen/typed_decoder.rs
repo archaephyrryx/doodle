@@ -112,10 +112,10 @@ impl TypedProgram<GenType> {
     }
 }
 
-pub struct GTCompiler<'a> {
+pub struct GTCompiler<'a, S: std::hash::BuildHasher = std::hash::RandomState> {
     module: &'a FormatModule,
     program: TypedProgram<GenType>,
-    decoder_map: HashMap<(usize, Rc<Next<'a>>), usize>,
+    decoder_map: HashMap<(usize, Rc<Next<'a>>), usize, S>,
     compile_queue: Vec<(
         &'a GTFormat,
         Option<Vec<(Label, GenType)>>,
@@ -128,7 +128,7 @@ pub(crate) type GTDecoder = TypedDecoder<GenType>;
 pub(crate) type GTDecoderExt = TypedDecoderExt<GenType>;
 
 impl<'a> GTCompiler<'a> {
-    fn new(module: &'a FormatModule) -> Self {
+    fn new(module: &'a FormatModule) -> GTCompiler<'a> {
         let program = TypedProgram::new();
         let decoder_map = HashMap::new();
         let compile_queue = Vec::new();
@@ -145,6 +145,40 @@ impl<'a> GTCompiler<'a> {
         format: &GTFormat,
     ) -> AResult<TypedProgram<GenType>> {
         let mut compiler = GTCompiler::new(module);
+        // type
+        let t = match format.get_type() {
+            None => unreachable!("cannot compile program from Void top-level format-type"),
+            Some(t) => t.into_owned(),
+        };
+        // decoder
+        compiler.queue_compile(t, format, None, Rc::new(Next::Empty));
+        while let Some((f, args, next, n)) = compiler.compile_queue.pop() {
+            let d = compiler.compile_gt_format(f, args, next)?;
+            compiler.program.decoders[n].0 = d;
+        }
+        Ok(compiler.program)
+    }
+}
+
+impl<'a, S: std::hash::BuildHasher> GTCompiler<'a, S> {
+    fn new_with_hasher(module: &'a FormatModule, hasher: S) -> GTCompiler<'a, S> {
+        let program = TypedProgram::new();
+        let decoder_map = HashMap::with_hasher(hasher);
+        let compile_queue = Vec::new();
+        GTCompiler {
+            module,
+            program,
+            decoder_map,
+            compile_queue,
+        }
+    }
+
+    pub(crate) fn compile_program_with_hasher(
+        module: &FormatModule,
+        format: &GTFormat,
+        hasher: impl std::hash::BuildHasher,
+    ) -> AResult<TypedProgram<GenType>> {
+        let mut compiler = GTCompiler::new_with_hasher(module, hasher);
         // type
         let t = match format.get_type() {
             None => unreachable!("cannot compile program from Void top-level format-type"),

@@ -2395,13 +2395,30 @@ impl ToAst for DerivedLogic<GTExpr> {
     }
 }
 
+#[inline]
 pub fn generate_code(module: &FormatModule, top_format: &Format) -> impl ToFragment {
-    let mut items = Vec::new();
+    let generator = Generator::compile(module, top_format);
+    run_generator(generator)
+}
 
+/// Variant of `generate_code` that accepts an additional parameter that allows for custom hash-functions
+/// to be used as the backbone of work-saving during `TypedProgram`-generation, and thereby tune performance.
+#[inline]
+pub fn generate_code_with_hasher(
+    module: &FormatModule,
+    top_format: &Format,
+    hasher: impl std::hash::BuildHasher,
+) -> impl ToFragment {
+    let generator = Generator::compile_with_hasher(module, top_format, hasher);
+    run_generator(generator)
+}
+
+pub fn run_generator<'a>(generator: Generator<'a>) -> impl ToFragment {
+    let mut items = Vec::new();
     let Generator {
         sourcemap,
         elaborator,
-    } = Generator::compile(module, top_format);
+    } = generator;
     let mut tdefs = Vec::from_iter(elaborator.codegen.defined_types.iter().map(|tdef| {
         elaborator
             .codegen
@@ -2544,20 +2561,34 @@ pub struct Generator<'a> {
 
 impl<'a> Generator<'a> {
     pub fn compile(module: &'a FormatModule, top_format: &Format) -> Self {
-        let mut tc = TypeChecker::new();
-        let ctxt = crate::typecheck::Ctxt::new(module, &UScope::Empty);
-        let _ = tc
-            .infer_utype_format(top_format, ctxt)
-            .unwrap_or_else(|err| panic!("Failed to infer top-level format type: {err}"));
-        let mut gen = Self {
-            elaborator: Elaborator::new(module, tc, CodeGen::new()),
-            sourcemap: SourceMap::new(),
-        };
+        let mut gen = Self::mk_generator_elaborator(module, top_format);
         let elab = &mut gen.elaborator;
 
         let top = elab.elaborate_format(top_format, &TypedDynScope::Empty);
-        // assert_eq!(elab.next_index, elab.tc.size());
+        debug_assert_eq!(elab.next_index, elab.tc.size());
         let prog = GTCompiler::compile_program(module, &top).expect("failed to compile program");
+        Self::populate_sourcemap(prog, &mut gen);
+        gen
+    }
+
+    pub fn compile_with_hasher<S: std::hash::BuildHasher>(
+        module: &'a FormatModule,
+        top_format: &Format,
+        hasher: S,
+    ) -> Self {
+        let mut gen = Self::mk_generator_elaborator(module, top_format);
+        let elab = &mut gen.elaborator;
+
+        let top = elab.elaborate_format(top_format, &TypedDynScope::Empty);
+        debug_assert_eq!(elab.next_index, elab.tc.size());
+        let prog = GTCompiler::<'a, S>::compile_program_with_hasher(module, &top, hasher)
+            .expect("failed to compile program");
+        Self::populate_sourcemap(prog, &mut gen);
+        gen
+    }
+
+    fn populate_sourcemap(prog: typed_decoder::TypedProgram<GenType>, gen: &mut Generator<'a>) {
+        let elab = &mut gen.elaborator;
         for (ix, (dec_ext, t)) in prog.decoders.iter().enumerate() {
             let dec_fn = {
                 let dec = dec_ext.get_dec();
@@ -2572,6 +2603,18 @@ impl<'a> Generator<'a> {
             };
             gen.sourcemap.decoder_skels.push(dec_fn);
         }
+    }
+
+    fn mk_generator_elaborator(module: &'a FormatModule, top_format: &Format) -> Generator<'a> {
+        let mut tc = TypeChecker::new();
+        let ctxt = crate::typecheck::Ctxt::new(module, &UScope::Empty);
+        let _ = tc
+            .infer_utype_format(top_format, ctxt)
+            .unwrap_or_else(|err| panic!("Failed to infer top-level format type: {err}"));
+        let gen = Self {
+            elaborator: Elaborator::new(module, tc, CodeGen::new()),
+            sourcemap: SourceMap::new(),
+        };
         gen
     }
 }
