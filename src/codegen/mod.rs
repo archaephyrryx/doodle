@@ -39,7 +39,7 @@ use util::{BTree, MapLike, StableMap};
 
 use trace::get_and_increment_seed;
 use typed_decoder::{GTCompiler, GTDecoder, TypedDecoder};
-use typed_format::{GenType, TypedDynFormat, TypedExpr, TypedFormat, TypedPattern};
+use typed_format::{GenType, GenericL, Ident, NamedCapture, TypedDynFormat, TypedExpr, TypedFormat, TypedPattern};
 
 /// Produces a probabilistically unique TraceHash based on the value of a thread-local counter-state
 /// (and post-increments the counter).
@@ -169,7 +169,8 @@ impl CodeGen {
         }
     }
 
-    fn translate(&self, decoder: &GTDecoder) -> CaseLogic<GTExpr> {
+    // TODO[epic=nameless] - add alternate path for Nameless version (if deemed appropriate at this layer)
+    fn translate(&self, decoder: &GTDecoder<Label>) -> CaseLogic<GTExpr<Label>, Label> {
         match decoder {
             TypedDecoder::Call(_gt, ix, args) =>
                 CaseLogic::Simple(SimpleLogic::Invoke(*ix, args.clone())),
@@ -327,10 +328,12 @@ impl CodeGen {
                         Box::new(self.translate(single.get_dec()))
                     )
                 ),
-            TypedDecoder::ForEach(_gt, expr, lbl, single) => {
+            TypedDecoder::ForEach(_gt, expr, closure) => {
                 // REVIEW[epic=zealous-clone] - do we need to ensure this is cloned?
+                let (lbl, single) = closure.as_parts();
                 let cl_expr = embed_expr(expr, ExprInfo::EmbedCloned);
-                CaseLogic::Repeat(RepeatLogic::ForEach(cl_expr, lbl.clone(), Box::new(self.translate(single.get_dec()))))
+                let closure = NamedCapture::new(lbl.clone(), Box::new(self.translate(single.get_dec())));
+                CaseLogic::Repeat(RepeatLogic::ForEach(cl_expr, closure))
             }
             TypedDecoder::DecodeBytes(_gt, expr, inner) => {
                 let cl_expr = embed_expr_dft(expr);
@@ -407,25 +410,25 @@ impl CodeGen {
             TypedDecoder::Compute(_t, expr) =>
                 // REVIEW[epic=zealous-clone] - try to gate Clone when Move, Copy or reference is possible
                 CaseLogic::Simple(SimpleLogic::Eval(embed_expr(expr, ExprInfo::EmbedCloned))),
-            TypedDecoder::Let(_t, name, expr, inner) => {
+            TypedDecoder::LetBind(_t, expr, closure) => {
+                let (name, inner) = closure.as_parts();
                 let cl_inner = self.translate(inner.get_dec());
                 CaseLogic::Derived(
                     DerivedLogic::Let(
-                        name.clone(),
                         // REVIEW[epic=zealous-clone] - gate cloning when reference or Copy is possible
                         embed_expr(expr, ExprInfo::EmbedCloned),
-                        Box::new(cl_inner)
+                        NamedCapture::new(name.clone(), Box::new(cl_inner))
                     )
                 )
             }
-            TypedDecoder::LetFormat(_t, f0, name, f) => {
+            TypedDecoder::FormatBind(_t, f0, closure) => {
                 let cl_f0 = self.translate(f0.get_dec());
+                let (name, f) = closure.as_parts();
                 let cl_f = self.translate(f.get_dec());
                 CaseLogic::Other(
                     OtherLogic::LetFormat(
                         Box::new(cl_f0),
-                        name.clone(),
-                        Box::new(cl_f),
+                        NamedCapture::new(name.clone(), Box::new(cl_f)),
                     )
                 )
             }
@@ -463,17 +466,17 @@ impl CodeGen {
                 );
                 CaseLogic::Other(OtherLogic::ExprMatch(head, cl_cases, ck))
             }
-            TypedDecoder::Dynamic(
+            TypedDecoder::DynamicBind(
                 _t,
-                name,
                 TypedDynFormat::Huffman(lengths, opt_values),
-                inner,
+                closure,
             ) => {
+                let (name, inner) = closure.as_parts();
                 let cl_inner = self.translate(inner.get_dec());
                 CaseLogic::Derived(
                     DerivedLogic::Dynamic(
-                        DynamicLogic::Huffman(name.clone(), lengths.as_ref().clone(), opt_values.as_deref().cloned()),
-                        Box::new(cl_inner)
+                        DynamicLogic::Huffman(lengths.as_ref().clone(), opt_values.as_deref().cloned()),
+                        NamedCapture::new(name.clone(), Box::new(cl_inner))
                     )
                 )
             }
@@ -633,7 +636,7 @@ enum ExprInfo {
     EmbedCloned,
 }
 
-fn embed_expr(expr: &GTExpr, info: ExprInfo) -> RustExpr {
+fn embed_expr(expr: &GTExpr<Label>, info: ExprInfo) -> RustExpr {
     match expr {
         TypedExpr::Record(gt, fields) => {
             let tname = match gt {
@@ -975,7 +978,7 @@ fn embed_expr(expr: &GTExpr, info: ExprInfo) -> RustExpr {
         TypedExpr::U16(n) => RustExpr::u16lit(*n),
         TypedExpr::U32(n) => RustExpr::u32lit(*n),
         TypedExpr::U64(n) => RustExpr::u64lit(*n),
-        TypedExpr::Lambda(_, _, _) =>
+        TypedExpr::Lambda(_, ..) =>
             unreachable!(
                 "TypedExpr::Lambda unsupported as first-class embed (requires embed_lambda with proper ClosureKind argument)"
             ),
@@ -1205,121 +1208,108 @@ pub(crate) enum ClosureKind {
 ///
 /// Additionally takes an argument `info` that dictates how the body is to be transcribed, according to the
 /// implied semantics used in `embed_expr`
-fn embed_lambda(expr: &GTExpr, kind: ClosureKind, needs_ok: bool, info: ExprInfo) -> RustExpr {
+fn embed_lambda(expr: &GTExpr<Label>, kind: ClosureKind, needs_ok: bool, info: ExprInfo) -> RustExpr {
     match expr {
-        TypedExpr::Lambda((head_t, _), head, body) => match kind {
-            // REVIEW - while ExtractKind is very similar to Predicate semantics, we want to avoid hard-coding Predicate for cases where that descriptor is misleading
-            ClosureKind::Predicate | ClosureKind::ExtractKey => {
-                let expansion = embed_expr(body, info);
-                RustExpr::Closure(RustClosure::new_predicate(
-                    head.clone(),
-                    Some(head_t.clone().to_rust_type()),
-                    if needs_ok {
-                        expansion.wrap_ok(Some("PResult"))
-                    } else {
-                        expansion
-                    },
-                ))
+        TypedExpr::Lambda((head_t, _), named_lambda) => {
+            let (head, body) = named_lambda.as_parts();
+            match kind {
+                // REVIEW - while ExtractKind is very similar to Predicate semantics, we want to avoid hard-coding Predicate for cases where that descriptor is misleading
+                ClosureKind::Predicate | ClosureKind::ExtractKey => {
+                    let expansion = embed_expr(body, info);
+                    RustExpr::Closure(RustClosure::new_predicate(
+                        head.clone(),
+                        Some(head_t.clone().to_rust_type()),
+                        if needs_ok {
+                            expansion.wrap_ok(Some("PResult"))
+                        } else {
+                            expansion
+                        },
+                    ))
+                }
+                ClosureKind::Transform => {
+                    let expansion = embed_expr(body, info);
+                    RustExpr::Closure(RustClosure::new_transform(
+                        head.clone(),
+                        Some(head_t.clone().to_rust_type()),
+                        if needs_ok {
+                            expansion.wrap_ok(Some("PResult"))
+                        } else {
+                            expansion
+                        },
+                    ))
+                }
+                ClosureKind::PairBorrowOwned => {
+                    let RustType::AnonTuple(args) = head_t.clone().to_rust_type() else {
+                        panic!("type {head_t:?} does not look like a tuple...")
+                    };
+                    let point_t = match &args[..] {
+                        [fst, snd] => RustType::AnonTuple(vec![
+                            RustType::borrow_of(None, Mut::Immutable, fst.clone()),
+                            snd.clone(),
+                        ]),
+                        other => unreachable!("tuple is not a pair: {other:?}"),
+                    };
+                    let expansion = embed_expr(body, info);
+                    RustExpr::Closure(RustClosure::new_transform(
+                        head.clone(),
+                        Some(point_t),
+                        if needs_ok {
+                            expansion.wrap_ok(Some("PResult"))
+                        } else {
+                            expansion
+                        },
+                    ))
+                }
+                ClosureKind::PairOwnedBorrow => {
+                    let RustType::AnonTuple(args) = head_t.clone().to_rust_type() else {
+                        panic!("type {head_t:?} does not look like a tuple...")
+                    };
+                    let point_t = match &args[..] {
+                        [fst, snd] => RustType::AnonTuple(vec![
+                            fst.clone(),
+                            RustType::borrow_of(None, Mut::Immutable, snd.clone()),
+                        ]),
+                        other => unreachable!("tuple is not a pair: {other:?}"),
+                    };
+                    let expansion = embed_expr(body, info);
+                    RustExpr::Closure(RustClosure::new_transform(
+                        head.clone(),
+                        Some(point_t),
+                        if needs_ok {
+                            expansion.wrap_ok(Some("PResult"))
+                        } else {
+                            expansion
+                        },
+                    ))
+                }
             }
-            ClosureKind::Transform => {
-                let expansion = embed_expr(body, info);
-                RustExpr::Closure(RustClosure::new_transform(
-                    head.clone(),
-                    Some(head_t.clone().to_rust_type()),
-                    if needs_ok {
-                        expansion.wrap_ok(Some("PResult"))
-                    } else {
-                        expansion
-                    },
-                ))
-            }
-            ClosureKind::PairBorrowOwned => {
-                let RustType::AnonTuple(args) = head_t.clone().to_rust_type() else {
-                    panic!("type {head_t:?} does not look like a tuple...")
-                };
-                let point_t = match &args[..] {
-                    [fst, snd] => RustType::AnonTuple(vec![
-                        RustType::borrow_of(None, Mut::Immutable, fst.clone()),
-                        snd.clone(),
-                    ]),
-                    other => unreachable!("tuple is not a pair: {other:?}"),
-                };
-                let expansion = embed_expr(body, info);
-                RustExpr::Closure(RustClosure::new_transform(
-                    head.clone(),
-                    Some(point_t),
-                    if needs_ok {
-                        expansion.wrap_ok(Some("PResult"))
-                    } else {
-                        expansion
-                    },
-                ))
-            }
-            ClosureKind::PairOwnedBorrow => {
-                let RustType::AnonTuple(args) = head_t.clone().to_rust_type() else {
-                    panic!("type {head_t:?} does not look like a tuple...")
-                };
-                let point_t = match &args[..] {
-                    [fst, snd] => RustType::AnonTuple(vec![
-                        fst.clone(),
-                        RustType::borrow_of(None, Mut::Immutable, snd.clone()),
-                    ]),
-                    other => unreachable!("tuple is not a pair: {other:?}"),
-                };
-                let expansion = embed_expr(body, info);
-                RustExpr::Closure(RustClosure::new_transform(
-                    head.clone(),
-                    Some(point_t),
-                    if needs_ok {
-                        expansion.wrap_ok(Some("PResult"))
-                    } else {
-                        expansion
-                    },
-                ))
-            }
-        },
+        }
         _other => unreachable!("embed_lambda_t expects a lambda, found {_other:?}"),
     }
 }
 
 /// Version of [`embed_lambda`] that uses the implied-default `ExprInfo` argument.
-fn embed_lambda_dft(expr: &GTExpr, kind: ClosureKind, needs_ok: bool) -> RustExpr {
+fn embed_lambda_dft(expr: &GTExpr<Label>, kind: ClosureKind, needs_ok: bool) -> RustExpr {
     embed_lambda(expr, kind, needs_ok, ExprInfo::Natural)
 }
 
 #[derive(Debug, Clone)]
-struct TypedLambda<TypeRep> {
-    head: Label,
+struct TypedLambda<TypeRep, VarId: Ident = Label> {
+    head: VarId,
     head_type: TypeRep,
     kind: ClosureKind,
     // REVIEW - we might be able to deprecate this field and use is_short_circuiting instead
-    body: Rc<TypedExpr<TypeRep>>,
+    body: Rc<TypedExpr<TypeRep, VarId>>,
     __beta_reducible: OnceCell<bool>,
     __needs_ok: OnceCell<bool>,
 }
 
 /// REVIEW - consider how GenLambda nad GenBlock interoperate (or, possibly, fail to)
-type GenLambda = TypedLambda<GenType>;
+type GenLambda<VarId> = TypedLambda<GenType, VarId>;
 
-impl GenLambda {
-    pub fn get_head_var(&self) -> &Label {
-        &self.head
-    }
-
-    /// Fallibly constructs a `GenLambda` from a `TypedExpr<GenType>`, panicking if it is not a Lambda variant.
-    ///
-    /// Additionally takes in the `kind` and `needs_ok` parameters that would normally be
-    /// passed to [`GenLambda::new`] or [`embed_lambda_dft`].
-    pub fn from_expr(expr: GTExpr, kind: ClosureKind) -> Self {
-        let TypedExpr::Lambda((head_type, _), head, body) = expr else {
-            unreachable!("GenLambda::from_expr expects a lambda, found {expr:?}")
-        };
-        let body = Rc::new(*body);
-        Self::new(head, head_type, kind, body)
-    }
-
-    fn new(head: Label, head_type: GenType, kind: ClosureKind, body: Rc<GTExpr>) -> Self {
-        Self {
+impl<VarId: Ident> TypedLambda<GenType, VarId> {
+    fn named(head: Label, head_type: GenType, kind: ClosureKind, body: Rc<GTExpr<Label>>) -> TypedLambda<GenType, Label> {
+        TypedLambda {
             head,
             head_type,
             kind,
@@ -1327,6 +1317,48 @@ impl GenLambda {
             __beta_reducible: OnceCell::new(),
             __needs_ok: OnceCell::new(),
         }
+    }
+
+    fn nameless(head_type: GenType, kind: ClosureKind, body: Rc<GTExpr<u32>>) -> TypedLambda<GenType, u32> {
+        TypedLambda {
+            head: 0,
+            head_type,
+            kind,
+            body,
+            __beta_reducible: OnceCell::new(),
+            __needs_ok: OnceCell::new(),
+        }
+    }
+}
+
+impl TypedLambda<GenType, Label> {
+    /// Fallibly constructs a `GenLambda<VarId>` from a `TypedExpr<GenType, VarId>`, panicking if it is not a Lambda variant.
+    ///
+    /// Additionally takes in the `kind` and `needs_ok` parameters that would normally be
+    /// passed to [`GenLambda::new`] or [`embed_lambda_dft`].
+    pub fn from_expr(expr: GTExpr<Label>, kind: ClosureKind) -> Self {
+        let TypedExpr::Lambda((head_type, _), lambda) = expr else {
+            unreachable!("GenLambda::from_expr expects a lambda, found {expr:?}")
+        };
+        let (head, body) = lambda.into_parts();
+        let body = Rc::new(*body);
+        Self::named(head, head_type, kind, body)
+    }
+}
+
+impl TypedLambda<GenType, u32> {
+    pub fn from_expr_nameless(expr: GTExpr<u32>, kind: ClosureKind) -> Self {
+        let TypedExpr::Lambda((head_type, _), lambda) = expr else {
+            unreachable!("GenLambda::from_expr expects a lambda, found {expr:?}")
+        };
+        let body = Rc::new(*lambda.into_parts());
+        Self::nameless(head_type, kind, body)
+    }
+}
+
+impl GenLambda<Label> {
+    pub fn get_head_var(&self) -> &Label {
+        &self.head
     }
 
     fn try_alpha_convert(&self, new_head: &Label) -> Option<Self> {
@@ -2072,10 +2104,11 @@ impl<'a> Default for ProdCtxt<'a> {
     }
 }
 
+/// FIXME[epic=nameless] - decide whether names are required by this point, or if expansion should allow Nameless versions
 macro_rules! impl_toast_caselogic {
-    ($($t:ident),+) => {
+    ($($t:ty),+) => {
         $(
-        impl ToAst for CaseLogic<$t>
+        impl ToAst for CaseLogic<$t, Label>
         {
             type AstElem = GenBlock;
 
@@ -2103,9 +2136,9 @@ macro_rules! impl_toast_caselogic {
     };
 }
 
-impl_toast_caselogic!(GTExpr);
+impl_toast_caselogic!(GTExpr<Label>);
 
-impl ToAst for SimpleLogic<GTExpr> {
+impl ToAst for SimpleLogic<GTExpr<Label>, Label> {
     type AstElem = GenBlock;
 
     fn to_ast(&self, ctxt: ProdCtxt<'_>) -> GenBlock {
@@ -2411,29 +2444,29 @@ fn embed_matchtree(tree: &MatchTree, ctxt: ProdCtxt<'_>) -> GenBlock {
 /// is more resilient to changes both upstream (in the Decoder model)
 /// and downstream (in the API made available for generated code to use)
 #[derive(Clone, Debug)]
-enum CaseLogic<ExprT = Expr> {
-    Simple(SimpleLogic<ExprT>),
-    Derived(DerivedLogic<ExprT>),
-    Sequential(SequentialLogic<ExprT>),
-    Parallel(ParallelLogic<ExprT>),
-    Repeat(RepeatLogic<ExprT>),
-    Engine(EngineLogic<ExprT>),
-    Other(OtherLogic<ExprT>),
+enum CaseLogic<ExprT: 'static + Clone = Expr, VarId: Ident = Label> {
+    Simple(SimpleLogic<ExprT, VarId>),
+    Derived(DerivedLogic<ExprT, VarId>),
+    Sequential(SequentialLogic<ExprT, VarId>),
+    Parallel(ParallelLogic<ExprT, VarId>),
+    Repeat(RepeatLogic<ExprT, VarId>),
+    Engine(EngineLogic<ExprT, VarId>),
+    Other(OtherLogic<ExprT, VarId>),
 }
 
 #[derive(Clone, Debug)]
-enum EngineLogic<ExprT> {
-    Slice(RustExpr, Box<CaseLogic<ExprT>>),
-    Peek(Box<CaseLogic<ExprT>>),
-    Bits(Box<CaseLogic<ExprT>>),
-    PeekNot(Box<CaseLogic<ExprT>>),
+enum EngineLogic<ExprT: 'static + Clone, VarId: Ident> {
+    Slice(RustExpr, Box<CaseLogic<ExprT, VarId>>),
+    Peek(Box<CaseLogic<ExprT, VarId>>),
+    Bits(Box<CaseLogic<ExprT, VarId>>),
+    PeekNot(Box<CaseLogic<ExprT, VarId>>),
     /// OffsetPeek(BaseAddr, RelOffset, InnerLogic)
-    OffsetPeek(RustExpr, RustExpr, Box<CaseLogic<ExprT>>),
+    OffsetPeek(RustExpr, RustExpr, Box<CaseLogic<ExprT, VarId>>),
 }
 
-impl<ExprT> ToAst for EngineLogic<ExprT>
+impl<ExprT: 'static + Clone, VarId: Ident> ToAst for EngineLogic<ExprT, VarId>
 where
-    CaseLogic<ExprT>: ToAst<AstElem = GenBlock>,
+    CaseLogic<ExprT, VarId>: ToAst<AstElem = GenBlock>,
 {
     type AstElem = GenBlock;
 
@@ -2551,25 +2584,25 @@ where
 
 /// Cases where a constant block of logic is repeated (0 or more times)
 #[derive(Clone, Debug)]
-enum RepeatLogic<ExprT> {
+enum RepeatLogic<ExprT: 'static + Clone, VarId: Ident> {
     /// Evaluates a matchtree and continues if it is matched
-    Repeat0ContinueOnMatch(MatchTree, Box<CaseLogic<ExprT>>),
+    Repeat0ContinueOnMatch(MatchTree, Box<CaseLogic<ExprT, VarId>>),
     /// evaluates a matchtree and breaks if it is matched
-    Repeat1BreakOnMatch(MatchTree, Box<CaseLogic<ExprT>>),
+    Repeat1BreakOnMatch(MatchTree, Box<CaseLogic<ExprT, VarId>>),
     /// repeats a specific number of times
-    ExactCount(RustExpr, Box<CaseLogic<ExprT>>),
+    ExactCount(RustExpr, Box<CaseLogic<ExprT, VarId>>),
     /// Repeats between N and M times
-    BetweenCounts(MatchTree, RustExpr, RustExpr, Box<CaseLogic<ExprT>>),
+    BetweenCounts(MatchTree, RustExpr, RustExpr, Box<CaseLogic<ExprT, VarId>>),
     /// Repetition stops after a predicate for 'terminal element' is satisfied
-    ConditionTerminal(GenLambda, Box<CaseLogic<ExprT>>),
+    ConditionTerminal(GenLambda<VarId>, Box<CaseLogic<ExprT, VarId>>),
     /// Repetition stops after a predicate for 'complete sequence' is satisfied (post-append)
-    ConditionComplete(GenLambda, Box<CaseLogic<ExprT>>),
+    ConditionComplete(GenLambda<VarId>, Box<CaseLogic<ExprT, VarId>>),
     /// Lifts an Expr to a sequence of parameters to apply to a format, once per element
-    ForEach(RustExpr, Label, Box<CaseLogic<ExprT>>),
+    ForEach(RustExpr, VarId::WithCapture<CaseLogic<ExprT, VarId>, Box<CaseLogic<ExprT, VarId>>>),
     /// Fused logic for a left-fold that is updated on each repeat, and contributes to the condition for termination
     ///
     /// Lambda order: termination-predicate, then update-function
-    AccumUntil(GenLambda, GenLambda, RustExpr, Box<CaseLogic<ExprT>>),
+    AccumUntil(GenLambda<VarId>, GenLambda<VarId>, RustExpr, Box<CaseLogic<ExprT, VarId>>),
 }
 
 pub(crate) trait ToAst {
@@ -2578,9 +2611,9 @@ pub(crate) trait ToAst {
     fn to_ast(&self, ctxt: ProdCtxt<'_>) -> Self::AstElem;
 }
 
-impl<ExprT> ToAst for RepeatLogic<ExprT>
+impl<ExprT: 'static + Clone> ToAst for RepeatLogic<ExprT, Label>
 where
-    CaseLogic<ExprT>: ToAst<AstElem = GenBlock>,
+    CaseLogic<ExprT, Label>: ToAst<AstElem = GenBlock>,
 {
     type AstElem = GenBlock;
 
@@ -2595,7 +2628,7 @@ where
                 stmts.push(
                     RustStmt::Let(
                         Mut::Mutable,
-                        Label::from("accum"),
+                        Label::Borrowed("accum"),
                         None,
                         RustExpr::scoped(["Vec"], "new").call(),
                     )
@@ -2743,8 +2776,9 @@ where
                 // FIXME - internal is misleading here but currently accurate due to the lack of interoperability between RustControl and GenContext
                 GenBlock::lift_block(stmts, RustExpr::local("accum"))
             }
-            RepeatLogic::ForEach(seq, lbl, inner) => {
+            RepeatLogic::ForEach(seq, closure) => {
                 let mut stmts = Vec::new();
+                let (lbl, inner) = closure.as_parts();
 
                 // FIXME[epic=sigbind-missing] - We can't sigbind this due to GenStmt and RustControl being incompatible
                 let inner_expr = inner.to_ast(ctxt).into();
@@ -2934,16 +2968,16 @@ where
 
 /// Cases that apply other case-logic in sequence to an incrementally updated input
 #[derive(Clone, Debug)]
-enum SequentialLogic<ExprT> {
+enum SequentialLogic<ExprT: 'static + Clone, VarId: Ident> {
     AccumTuple {
         constructor: Option<Constructor>,
-        elements: Vec<CaseLogic<ExprT>>,
+        elements: Vec<CaseLogic<ExprT, VarId>>,
     },
 }
 
-impl<ExprT> ToAst for SequentialLogic<ExprT>
+impl<ExprT: 'static + Clone> ToAst for SequentialLogic<ExprT, Label>
 where
-    CaseLogic<ExprT>: ToAst<AstElem = GenBlock>,
+    CaseLogic<ExprT, Label>: ToAst<AstElem = GenBlock>,
 {
     type AstElem = GenBlock;
 
@@ -2991,21 +3025,21 @@ where
 
 /// Catch-all for hard-to-classify cases
 #[derive(Clone, Debug)]
-enum OtherLogic<ExprT> {
-    Descend(MatchTree, Vec<CaseLogic<ExprT>>),
+enum OtherLogic<ExprT: 'static + Clone, VarId: Ident> {
+    Descend(MatchTree, Vec<CaseLogic<ExprT, VarId>>),
     ExprMatch(
         RustExpr,
-        Vec<(MatchCaseLHS, CaseLogic<ExprT>)>,
+        Vec<(MatchCaseLHS, CaseLogic<ExprT, VarId>)>,
         Refutability,
     ),
-    LetFormat(Box<CaseLogic<ExprT>>, Label, Box<CaseLogic<ExprT>>),
-    MonadSeq(Box<CaseLogic<ExprT>>, Box<CaseLogic<ExprT>>),
-    Hint(StyleHint, Box<CaseLogic<ExprT>>),
+    LetFormat(Box<CaseLogic<ExprT, VarId>>, VarId::WithCapture<Box<CaseLogic<ExprT, VarId>>>),
+    MonadSeq(Box<CaseLogic<ExprT, VarId>>, Box<CaseLogic<ExprT, VarId>>),
+    Hint(StyleHint, Box<CaseLogic<ExprT, VarId>>),
 }
 
-impl<ExprT> ToAst for OtherLogic<ExprT>
+impl<ExprT: 'static + Clone> ToAst for OtherLogic<ExprT, Label>
 where
-    CaseLogic<ExprT>: ToAst<AstElem = GenBlock>,
+    CaseLogic<ExprT, Label>: ToAst<AstElem = GenBlock>,
 {
     type AstElem = GenBlock;
 
@@ -3061,7 +3095,8 @@ where
                 let match_expr = GenExpr::embed_match(expr.clone(), match_body);
                 GenBlock::single_expr(match_expr)
             }
-            OtherLogic::LetFormat(prior, name, inner) => {
+            OtherLogic::LetFormat(prior, closure) => {
+                let (name, inner) = closure.as_parts();
                 let prior_block = prior.to_ast(ctxt);
                 let mut inner_block = inner.to_ast(ctxt);
                 // REVIEW - indexing scheme must be resilient to prepend and append...
@@ -3098,13 +3133,13 @@ fn invoke_matchtree(tree: &MatchTree, ctxt: ProdCtxt<'_>) -> RustExpr {
 
 /// Cases that require processing of multiple cases in parallel (on the same input-state)
 #[derive(Clone, Debug)]
-enum ParallelLogic<ExprT> {
-    Alts(Vec<CaseLogic<ExprT>>),
+enum ParallelLogic<ExprT: 'static + Clone, VarId: Ident> {
+    Alts(Vec<CaseLogic<ExprT, VarId>>),
 }
 
-impl<ExprT> ToAst for ParallelLogic<ExprT>
+impl<ExprT: 'static + Clone, VarId: Ident> ToAst for ParallelLogic<ExprT, VarId>
 where
-    CaseLogic<ExprT>: ToAst<AstElem = GenBlock>,
+    CaseLogic<ExprT, VarId>: ToAst<AstElem = GenBlock>,
 {
     type AstElem = GenBlock;
 
@@ -3167,14 +3202,14 @@ where
 
 /// Cases that require no recursion into other case-logic
 #[derive(Clone, Debug)]
-enum SimpleLogic<ExprT> {
+enum SimpleLogic<ExprT: 'static + Clone, VarId: Ident> {
     Fail,
     ExpectEnd,
     Invoke(usize, Vec<(Label, ExprT)>),
     SkipToNextMultiple(usize),
     ByteIn(ByteSet),
     Eval(RustExpr),
-    CallDynamic(Label),
+    CallDynamic(VarId),
     YieldCurrentOffset,
     SkipRemainder,
     ConstNone,
@@ -3182,55 +3217,54 @@ enum SimpleLogic<ExprT> {
 
 /// Cases that recurse into other case-logic only once
 #[derive(Clone, Debug)]
-enum DerivedLogic<ExprT> {
-    WrapSome(Box<CaseLogic<ExprT>>),
-    VariantOf(Constructor, Box<CaseLogic<ExprT>>),
-    UnitVariantOf(Constructor, Box<CaseLogic<ExprT>>),
-    MapOf(GenLambda, Box<CaseLogic<ExprT>>),
-    Let(Label, RustExpr, Box<CaseLogic<ExprT>>),
-    Dynamic(DynamicLogic<ExprT>, Box<CaseLogic<ExprT>>),
-    Where(GenLambda, Box<CaseLogic<ExprT>>),
-    Maybe(RustExpr, Box<CaseLogic<ExprT>>),
-    DecodeBytes(RustExpr, Box<CaseLogic<ExprT>>),
+enum DerivedLogic<ExprT: 'static + Clone, VarId: Ident> {
+    WrapSome(Box<CaseLogic<ExprT, VarId>>),
+    VariantOf(Constructor, Box<CaseLogic<ExprT, VarId>>),
+    UnitVariantOf(Constructor, Box<CaseLogic<ExprT, VarId>>),
+    MapOf(GenLambda<VarId>, Box<CaseLogic<ExprT, VarId>>),
+    Let(RustExpr, VarId::WithCapture<Box<CaseLogic<ExprT, VarId>>>),
+    Dynamic(DynamicLogic<ExprT>, VarId::WithCapture<Box<CaseLogic<ExprT, VarId>>>),
+    Where(GenLambda<VarId>, Box<CaseLogic<ExprT, VarId>>),
+    Maybe(RustExpr, Box<CaseLogic<ExprT, VarId>>),
+    DecodeBytes(RustExpr, Box<CaseLogic<ExprT, VarId>>),
 }
 
 #[derive(Clone, Debug)]
-enum DynamicLogic<ExprT> {
-    Huffman(Label, ExprT, Option<ExprT>),
+enum DynamicLogic<ExprT: 'static + Clone> {
+    Huffman(ExprT, Option<ExprT>),
 }
 
-impl ToAst for DynamicLogic<GTExpr> {
-    type AstElem = RustStmt;
+impl ToAst for DynamicLogic<GTExpr<Label>> {
+    type AstElem = RustExpr;
 
     fn to_ast(&self, _ctxt: ProdCtxt<'_>) -> Self::AstElem {
         match self {
-            DynamicLogic::Huffman(lbl, code_lengths, opt_values_expr) => {
+            DynamicLogic::Huffman(code_lengths, opt_values_expr) => {
                 let info = ExprInfo::EmbedCloned;
-                let rhs = {
-                    let opt_values_lifted = match opt_values_expr {
-                        None => RustExpr::NONE,
-                        Some(x) => RustExpr::some(embed_expr(x, info)),
-                    };
-                    RustExpr::local("parse_huffman")
-                        .call_with([embed_expr(code_lengths, info), opt_values_lifted])
+                let opt_values_lifted = match opt_values_expr {
+                    None => RustExpr::NONE,
+                    Some(x) => RustExpr::some(embed_expr(x, info)),
                 };
-                RustStmt::Let(Mut::Immutable, lbl.clone(), None, rhs)
+                RustExpr::local("parse_huffman")
+                    .call_with([embed_expr(code_lengths, info), opt_values_lifted])
             }
         }
     }
 }
 
-impl ToAst for DerivedLogic<GTExpr> {
+impl ToAst for DerivedLogic<GTExpr<Label>, Label> {
     type AstElem = GenBlock;
 
     fn to_ast(&self, ctxt: ProdCtxt<'_>) -> GenBlock {
         match self {
-            DerivedLogic::Dynamic(dyn_logic, inner_cl) => {
+            DerivedLogic::Dynamic(dyn_logic, closure_cl) => {
+                let (dyn_name, inner_cl) = closure_cl.as_parts();
                 let GenBlock { mut stmts, ret } = inner_cl.to_ast(ctxt);
                 let _stmts = &mut stmts;
                 let mut stmts = Vec::with_capacity(_stmts.len() + 1);
                 // REVIEW - we need an indexing model that is prepend/append-stable, or an internal method to add GenStmts before/after
-                stmts.push(GenStmt::Embed(dyn_logic.to_ast(ctxt)));
+                let dyn_bind = GenStmt::BindOnce(dyn_name.clone(), GenBlock::simple_expr(dyn_logic.to_ast(ctxt)));
+                stmts.push(dyn_bind);
                 stmts.append(_stmts);
                 GenBlock { stmts, ret }
             }
@@ -3339,8 +3373,9 @@ impl ToAst for DerivedLogic<GTExpr> {
                 let stmts = vec![assign_inner, bind_cond];
                 GenBlock::from_parts(stmts, Some(GenExpr::Control(Box::new(ctrl))))
             }
-            DerivedLogic::Let(name, expr, inner) => {
+            DerivedLogic::Let(expr, closure) => {
                 let mut stmts = Vec::new();
+                let (name, inner) = closure.as_parts();
                 stmts.push(GenStmt::Embed(RustStmt::assign(name.clone(), expr.clone())));
                 let mut inner_block = inner.to_ast(ctxt);
                 // REVIEW - figure out indexing model that doesn't break on modification
@@ -3451,15 +3486,16 @@ pub fn generate_code(module: &FormatModule, top_format: &Format) -> impl ToFragm
 }
 
 #[derive(Clone, Debug)]
-pub struct DecoderFn<ExprT> {
+pub struct DecoderFn<ExprT: 'static + Clone> {
     adhoc_name: Option<Label>,
     ixlabel: IxLabel,
-    logic: CaseLogic<ExprT>,
+    // FIXME[epic=nameless] - allow nameless caselogic trees, or formalize decision to require names
+    logic: CaseLogic<ExprT, Label>,
     extra_args: Option<Vec<(Label, GenType)>>,
     ret_type: RustType,
 }
 
-impl<ExprT> Rebindable for DecoderFn<ExprT> {
+impl<ExprT: 'static + Clone> Rebindable for DecoderFn<ExprT> {
     fn rebind(&mut self, table: &impl MapLike<Label, Label>) {
         if let Some(ref mut name) = self.adhoc_name {
             if table.contains_key(&*name) {
@@ -3476,7 +3512,7 @@ fn decoder_fname(ixlabel: IxLabel) -> Label {
 impl<ExprT> ToAst for DecoderFn<ExprT>
 where
     CaseLogic<ExprT>: ToAst<AstElem = GenBlock>,
-    ExprT: std::fmt::Debug,
+    ExprT: std::fmt::Debug + 'static + Clone,
 {
     type AstElem = RustFn;
 
@@ -3546,21 +3582,21 @@ where
 }
 
 #[derive(Clone, Debug)]
-pub struct SourceMap<ExprT> {
+pub struct SourceMap<ExprT: 'static + Clone> {
     pub(crate) decoder_skels: Vec<DecoderFn<ExprT>>,
 }
 
-impl<TypeRep> SourceMap<TypeRep> {
-    pub const fn new() -> SourceMap<TypeRep> {
+impl<ExprT: 'static + Clone> SourceMap<ExprT> {
+    pub const fn new() -> SourceMap<ExprT> {
         SourceMap {
             decoder_skels: Vec::new(),
         }
     }
 }
 
-pub struct Generator<'a> {
-    pub(crate) elaborator: Elaborator<'a>,
-    pub(crate) sourcemap: SourceMap<GTExpr>,
+pub struct Generator<'a, VarId: Ident = Label> {
+    pub(crate) elaborator: Elaborator<'a, VarId>,
+    pub(crate) sourcemap: SourceMap<GTExpr<VarId>>,
 }
 
 impl<'a> Generator<'a> {
@@ -3604,15 +3640,26 @@ impl<'a> Generator<'a> {
     }
 }
 
-pub struct Elaborator<'a> {
+pub struct Elaborator<'a, VarId: Ident> {
     module: &'a FormatModule,
     next_index: usize,
-    t_formats: StableMap<usize, Rc<GTFormat>, BTree>,
+    t_formats: StableMap<usize, Rc<GTFormat<VarId>>, BTree>,
     tc: TypeChecker,
     codegen: CodeGen,
 }
 
-impl<'a> Elaborator<'a> {
+impl<'a, VarId: Ident> Elaborator<'a, VarId> {
+    /// Constructs a new Elaborator
+    pub fn new(module: &'a FormatModule, tc: TypeChecker, codegen: CodeGen) -> Self {
+        Self {
+            module,
+            next_index: 0,
+            t_formats: Default::default(),
+            tc,
+            codegen,
+        }
+    }
+
     /// Increment the current `next_index` by 1 and return its un-incremented value.
     pub fn get_and_increment_index(&mut self) -> usize {
         let ret = self.next_index;
@@ -3630,26 +3677,15 @@ impl<'a> Elaborator<'a> {
         self.next_index
     }
 
-    fn elaborate_dynamic_format(&mut self, dynf: &DynFormat) -> TypedDynFormat<GenType> {
-        match dynf {
-            DynFormat::Huffman(code_lengths, opt_values_expr) => {
-                // for dynf itself
-                self.increment_index();
-                let t_codes = self.elaborate_expr(code_lengths);
-                // for the element-type of code_lengths
-                self.increment_index();
-
-                let boxed_t_values_expr = opt_values_expr.as_ref().map(|values_expr| {
-                    let t_values = self.elaborate_expr(values_expr);
-                    // for the element-type of opt_values_expr
-                    self.increment_index();
-                    Box::new(t_values)
-                });
-                GTDynFormat::Huffman(Box::new(t_codes), boxed_t_values_expr)
-            }
-        }
+    fn get_gt_from_index(&mut self, index: usize) -> GenType {
+        let var = UVar::new(index);
+        let Some(vt) = self.tc.reify(var.into()) else {
+            unreachable!("unable to reify {var}")
+        };
+        self.codegen.lift_type(&vt)
     }
 
+    /// Elaborate a `Pattern` node into a `TypedPattern`.
     fn elaborate_pattern(&mut self, pat: &Pattern) -> TypedPattern<GenType> {
         let index = self.get_and_increment_index();
 
@@ -3706,14 +3742,28 @@ impl<'a> Elaborator<'a> {
             }
         }
     }
+}
 
-    pub fn new(module: &'a FormatModule, tc: TypeChecker, codegen: CodeGen) -> Self {
-        Self {
-            module,
-            next_index: 0,
-            t_formats: Default::default(),
-            tc,
-            codegen,
+// TODO - implement a parallel method-set for Elaborator<'a, u32>
+impl<'a> Elaborator<'a, Label> {
+    /// Elaborate a `DynFOrmat` into a `TypedDynFormat`
+    fn elaborate_dynamic_format(&mut self, dynf: &DynFormat) -> TypedDynFormat<GenType, Label> {
+        match dynf {
+            DynFormat::Huffman(code_lengths, opt_values_expr) => {
+                // for dynf itself
+                self.increment_index();
+                let t_codes = self.elaborate_expr(code_lengths);
+                // for the element-type of code_lengths
+                self.increment_index();
+
+                let boxed_t_values_expr = opt_values_expr.as_ref().map(|values_expr| {
+                    let t_values = self.elaborate_expr(values_expr);
+                    // for the element-type of opt_values_expr
+                    self.increment_index();
+                    Box::new(t_values)
+                });
+                GTDynFormat::Huffman(Box::new(t_codes), boxed_t_values_expr)
+            }
         }
     }
 
@@ -3722,7 +3772,7 @@ impl<'a> Elaborator<'a> {
         branches: &[Format],
         dyn_scope: &TypedDynScope<'_>,
         is_det: bool,
-    ) -> GTFormat {
+    ) -> GTFormat<Label> {
         let index = self.get_and_increment_index();
         let gt = self.get_gt_from_index(index);
 
@@ -3757,7 +3807,8 @@ impl<'a> Elaborator<'a> {
         }
     }
 
-    fn elaborate_format(&mut self, format: &Format, dyn_scope: &TypedDynScope<'_>) -> GTFormat {
+    // TODO[epic=nameless] - implement separate function for nameless format elaboration
+    fn elaborate_format(&mut self, format: &Format, dyn_scope: &TypedDynScope<'_>) -> GTFormat<Label> {
         match format {
             Format::ItemVar(level, args) => {
                 self.codegen
@@ -3796,7 +3847,8 @@ impl<'a> Elaborator<'a> {
                 self.increment_index();
                 let t_inner = self.elaborate_format(inner, dyn_scope);
                 let gt = self.get_gt_from_index(index);
-                TypedFormat::ForEach(gt, Box::new(t_expr), lbl.clone(), Box::new(t_inner))
+                let closure = NamedCapture::new(lbl.clone(), Box::new(t_inner));
+                TypedFormat::ForEach(gt, Box::new(t_expr), closure)
             }
             Format::DecodeBytes(expr, inner) => {
                 let index = self.get_and_increment_index();
@@ -4027,7 +4079,8 @@ impl<'a> Elaborator<'a> {
                 let t_expr = self.elaborate_expr(expr);
                 let t_inner = self.elaborate_format(inner, dyn_scope);
                 let gt = self.get_gt_from_index(index);
-                TypedFormat::Let(gt, lbl.clone(), Box::new(t_expr), Box::new(t_inner))
+                let closure = NamedCapture::new(lbl.clone(), Box::new(t_inner));
+                TypedFormat::LetBind(gt, Box::new(t_expr), closure)
             }
             Format::Match(x, branches) => {
                 let index = self.get_and_increment_index();
@@ -4079,7 +4132,8 @@ impl<'a> Elaborator<'a> {
                 self.codegen.name_gen.ctxt.escape();
                 let t_f = self.elaborate_format(f, dyn_scope);
                 let gt = self.get_gt_from_index(index);
-                TypedFormat::LetFormat(gt, Box::new(t_f0), name.clone(), Box::new(t_f))
+                let closure = NamedCapture::new(name.clone(), t_f);
+                TypedFormat::FormatBind(gt, Box::new(t_f0), closure)
             }
             Format::MonadSeq(f0, f) => {
                 // FIXME - adhoc types introduced in MonadSeq are not properly path-named
@@ -4087,7 +4141,7 @@ impl<'a> Elaborator<'a> {
                 self.codegen
                     .name_gen
                     .ctxt
-                    .push_atom(NameAtom::Derived(Derivation::Preimage));
+                    .push_atom(NameAtom::Bind(name.clone()));
                 let t_f0 = self.elaborate_format(f0, dyn_scope);
                 self.codegen.name_gen.ctxt.escape();
                 let t_f = self.elaborate_format(f, dyn_scope);
@@ -4132,15 +4186,9 @@ impl<'a> Elaborator<'a> {
         }
     }
 
-    fn get_gt_from_index(&mut self, index: usize) -> GenType {
-        let var = UVar::new(index);
-        let Some(vt) = self.tc.reify(var.into()) else {
-            unreachable!("unable to reify {var}")
-        };
-        self.codegen.lift_type(&vt)
-    }
 
-    fn elaborate_expr(&mut self, expr: &Expr) -> GTExpr {
+    // TODO[epic=nameless] - implement separate function for nameless expr elaboration
+    fn elaborate_expr(&mut self, expr: &Expr) -> GTExpr<Label> {
         let index = self.get_and_increment_index();
         match expr {
             Expr::Var(lbl) => {
@@ -4491,6 +4539,7 @@ impl<'a> Elaborator<'a> {
         }
     }
 
+    // TODO[epic=nameless] - implement alternate function for nameless lambda-elaboration
     fn elaborate_expr_lambda(&mut self, expr: &Expr) -> TypedExpr<GenType> {
         match expr {
             Expr::Lambda(head, body) => {
@@ -4505,15 +4554,16 @@ impl<'a> Elaborator<'a> {
                 self.codegen.name_gen.ctxt.escape();
 
                 let gt_body = self.get_gt_from_index(body_index);
-                TypedExpr::Lambda((gt_head, gt_body), head.clone(), Box::new(t_body))
+                let named_lambda = NamedCapture::new(head.clone(), Box::new(t_body));
+                TypedExpr::Lambda((gt_head, gt_body), named_lambda)
             }
             _ => unreachable!("elaborate_expr_lambda: unexpected non-lambda {expr:?}"),
         }
     }
 }
 
-type GTFormat = TypedFormat<GenType>;
-type GTExpr = TypedExpr<GenType>;
+type GTFormat<VarId> = TypedFormat<GenType, VarId>;
+type GTExpr<VarId> = TypedExpr<GenType, VarId>;
 type GTPattern = TypedPattern<GenType>;
 
 type GTDynFormat = TypedDynFormat<GenType>;

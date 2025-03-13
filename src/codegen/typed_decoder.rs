@@ -7,20 +7,21 @@ use std::rc::Rc;
 
 use crate::codegen::typed_format::{GenType, TypedPattern};
 
+use super::typed_format::NamedCapture;
 use super::{
-    typed_format::{TypedDynFormat, TypedExpr, TypedFormat},
+    typed_format::{TypedDynFormat, TypedExpr, TypedFormat, Ident},
     GTFormat,
 };
 use super::{PrimType, RustType};
 
 #[derive(Clone, Debug)]
-pub(crate) struct TypedDecoderExt<TypeRep> {
-    dec: TypedDecoder<TypeRep>,
+pub(crate) struct TypedDecoderExt<TypeRep, VarId = Label> where TypeRep: 'static + Clone, VarId: Ident {
+    dec: TypedDecoder<TypeRep, VarId>,
     args: Option<Vec<(Label, TypeRep)>>,
 }
 
-impl<TypeRep> TypedDecoderExt<TypeRep> {
-    pub fn new(dec: TypedDecoder<TypeRep>, args: Option<Vec<(Label, TypeRep)>>) -> Self {
+impl<TypeRep, VarId> TypedDecoderExt<TypeRep, VarId> where TypeRep: 'static + Clone, VarId: Ident {
+    pub fn new(dec: TypedDecoder<TypeRep, VarId>, args: Option<Vec<(Label, TypeRep)>>) -> Self {
         Self { dec, args }
     }
 
@@ -28,19 +29,19 @@ impl<TypeRep> TypedDecoderExt<TypeRep> {
         &self.args
     }
 
-    pub fn get_dec(&self) -> &TypedDecoder<TypeRep> {
+    pub fn get_dec(&self) -> &TypedDecoder<TypeRep, VarId> {
         &self.dec
     }
 }
 
-impl<TypeRep> AsRef<TypedDecoder<TypeRep>> for TypedDecoderExt<TypeRep> {
-    fn as_ref(&self) -> &TypedDecoder<TypeRep> {
+impl<TypeRep, VarId> AsRef<TypedDecoder<TypeRep, VarId>> for TypedDecoderExt<TypeRep, VarId> where TypeRep: Clone + 'static, VarId: Ident {
+    fn as_ref(&self) -> &TypedDecoder<TypeRep, VarId> {
         self.get_dec()
     }
 }
 
-impl<TypeRep> From<TypedDecoder<TypeRep>> for TypedDecoderExt<TypeRep> {
-    fn from(value: TypedDecoder<TypeRep>) -> Self {
+impl<TypeRep, VarId> From<TypedDecoder<TypeRep, VarId>> for TypedDecoderExt<TypeRep, VarId> where TypeRep: Clone + 'static, VarId: Ident {
+    fn from(value: TypedDecoder<TypeRep, VarId>) -> Self {
         Self {
             dec: value,
             args: None,
@@ -78,14 +79,14 @@ impl TypedDecoder<GenType> {
             | TypedDecoder::Map(t, ..)
             | TypedDecoder::Where(t, ..)
             | TypedDecoder::Compute(t, ..)
-            | TypedDecoder::Let(t, ..)
+            | TypedDecoder::LetBind(t, ..)
             | TypedDecoder::Match(t, ..)
-            | TypedDecoder::Dynamic(t, ..)
+            | TypedDecoder::DynamicBind(t, ..)
             | TypedDecoder::Apply(t, ..)
             | TypedDecoder::Maybe(t, ..)
             | TypedDecoder::ForEach(t, ..)
             | TypedDecoder::DecodeBytes(t, ..)
-            | TypedDecoder::LetFormat(t, ..)
+            | TypedDecoder::FormatBind(t, ..)
             | TypedDecoder::MonadSeq(t, ..)
             | TypedDecoder::Hint(t, ..)
             | TypedDecoder::LiftedOption(t, ..)
@@ -96,106 +97,102 @@ impl TypedDecoder<GenType> {
 
 /// Decoders with a fixed amount of lookahead
 #[derive(Clone, Debug)]
-pub(crate) enum TypedDecoder<TypeRep> {
-    Call(TypeRep, usize, Vec<(Label, TypedExpr<TypeRep>)>),
+pub(crate) enum TypedDecoder<TypeRep: 'static + Clone, VarId: Ident = Label> {
+    Call(TypeRep, usize, Vec<(Label, TypedExpr<TypeRep, VarId>)>),
     Fail,
     EndOfInput,
     Align(usize),
     Byte(ByteSet),
-    Variant(TypeRep, Label, Box<TypedDecoderExt<TypeRep>>),
-    Parallel(TypeRep, Vec<TypedDecoderExt<TypeRep>>),
-    Branch(TypeRep, MatchTree, Vec<TypedDecoderExt<TypeRep>>),
-    Tuple(TypeRep, Vec<TypedDecoderExt<TypeRep>>),
-    Repeat0While(TypeRep, MatchTree, Box<TypedDecoderExt<TypeRep>>),
-    Repeat1Until(TypeRep, MatchTree, Box<TypedDecoderExt<TypeRep>>),
+    Variant(TypeRep, Label, Box<TypedDecoderExt<TypeRep, VarId>>),
+    Parallel(TypeRep, Vec<TypedDecoderExt<TypeRep, VarId>>),
+    Branch(TypeRep, MatchTree, Vec<TypedDecoderExt<TypeRep, VarId>>),
+    Tuple(TypeRep, Vec<TypedDecoderExt<TypeRep, VarId>>),
+    Repeat0While(TypeRep, MatchTree, Box<TypedDecoderExt<TypeRep, VarId>>),
+    Repeat1Until(TypeRep, MatchTree, Box<TypedDecoderExt<TypeRep, VarId>>),
     RepeatCount(
         TypeRep,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedDecoderExt<TypeRep>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedDecoderExt<TypeRep, VarId>>,
     ),
     RepeatBetween(
         TypeRep,
         MatchTree,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedDecoderExt<TypeRep>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedDecoderExt<TypeRep, VarId>>,
     ),
     RepeatUntilLast(
         TypeRep,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedDecoderExt<TypeRep>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedDecoderExt<TypeRep, VarId>>,
     ),
     RepeatUntilSeq(
         TypeRep,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedDecoderExt<TypeRep>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedDecoderExt<TypeRep, VarId>>,
     ),
-    Peek(TypeRep, Box<TypedDecoderExt<TypeRep>>),
-    PeekNot(TypeRep, Box<TypedDecoderExt<TypeRep>>),
+    Peek(TypeRep, Box<TypedDecoderExt<TypeRep, VarId>>),
+    PeekNot(TypeRep, Box<TypedDecoderExt<TypeRep, VarId>>),
     Slice(
         TypeRep,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedDecoderExt<TypeRep>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedDecoderExt<TypeRep, VarId>>,
     ),
-    Bits(TypeRep, Box<TypedDecoderExt<TypeRep>>),
+    Bits(TypeRep, Box<TypedDecoderExt<TypeRep, VarId>>),
     WithRelativeOffset(
         TypeRep,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedDecoderExt<TypeRep>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedDecoderExt<TypeRep, VarId>>,
     ),
     Map(
         TypeRep,
-        Box<TypedDecoderExt<TypeRep>>,
-        Box<TypedExpr<TypeRep>>,
+        Box<TypedDecoderExt<TypeRep, VarId>>,
+        Box<TypedExpr<TypeRep, VarId>>,
     ),
     Where(
         TypeRep,
-        Box<TypedDecoderExt<TypeRep>>,
-        Box<TypedExpr<TypeRep>>,
+        Box<TypedDecoderExt<TypeRep, VarId>>,
+        Box<TypedExpr<TypeRep, VarId>>,
     ),
-    Compute(TypeRep, Box<TypedExpr<TypeRep>>),
-    Let(
+    Compute(TypeRep, Box<TypedExpr<TypeRep, VarId>>),
+    LetBind(
         TypeRep,
-        Label,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedDecoderExt<TypeRep>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        VarId::WithCapture<Box<TypedDecoderExt<TypeRep, VarId>>>,
     ),
     Match(
         TypeRep,
-        Box<TypedExpr<TypeRep>>,
-        Vec<(TypedPattern<TypeRep>, TypedDecoderExt<TypeRep>)>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Vec<(TypedPattern<TypeRep>, TypedDecoderExt<TypeRep, VarId>)>,
     ),
-    Dynamic(
+    DynamicBind(
         TypeRep,
-        Label,
-        TypedDynFormat<TypeRep>,
-        Box<TypedDecoderExt<TypeRep>>,
+        TypedDynFormat<TypeRep, VarId>,
+        VarId::WithCapture<Box<TypedDecoderExt<TypeRep, VarId>>>,
     ),
-    Apply(TypeRep, Label),
+    Apply(TypeRep, VarId),
     Maybe(
         TypeRep,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedDecoderExt<TypeRep>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedDecoderExt<TypeRep, VarId>>,
     ),
     Pos,
     ForEach(
         TypeRep,
         Box<TypedExpr<TypeRep>>,
-        Label,
-        Box<TypedDecoderExt<TypeRep>>,
+        VarId::WithCapture<Box<TypedDecoderExt<TypeRep, VarId>>>,
     ),
     SkipRemainder,
     DecodeBytes(
         TypeRep,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedDecoderExt<TypeRep>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedDecoderExt<TypeRep, VarId>>,
     ),
-    LetFormat(
+    FormatBind(
         TypeRep,
-        Box<TypedDecoderExt<TypeRep>>,
-        Label,
-        Box<TypedDecoderExt<TypeRep>>,
+        Box<TypedDecoderExt<TypeRep, VarId>>,
+        VarId::WithCapture<Box<TypedDecoderExt<TypeRep, VarId>>>,
     ),
     MonadSeq(
         TypeRep,
@@ -204,18 +201,22 @@ pub(crate) enum TypedDecoder<TypeRep> {
     ),
     AccumUntil(
         TypeRep,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedDecoderExt<TypeRep>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedDecoderExt<TypeRep, VarId>>,
     ),
     Hint(TypeRep, StyleHint, Box<TypedDecoderExt<TypeRep>>),
     LiftedOption(TypeRep, Option<Box<TypedDecoderExt<TypeRep>>>),
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct TypedProgram<TypeRep> {
-    pub decoders: Vec<(TypedDecoderExt<TypeRep>, TypeRep)>,
+pub(crate) struct TypedProgram<TypeRep, VarId = Label>
+where
+TypeRep: 'static + Clone,
+VarId: Ident
+{
+    pub decoders: Vec<(TypedDecoderExt<TypeRep, VarId>, TypeRep)>,
 }
 
 impl TypedProgram<GenType> {
@@ -226,7 +227,7 @@ impl TypedProgram<GenType> {
 }
 
 type QueueItem<'a> = (
-    &'a GTFormat,
+    &'a GTFormat<Label>,
     Option<Vec<(Label, GenType)>>,
     Rc<Next<'a>>,
     usize,
@@ -239,8 +240,8 @@ pub struct GTCompiler<'a> {
     compile_queue: Vec<QueueItem<'a>>,
 }
 
-pub(crate) type GTDecoder = TypedDecoder<GenType>;
-pub(crate) type GTDecoderExt = TypedDecoderExt<GenType>;
+pub(crate) type GTDecoder<VarId> = TypedDecoder<GenType, VarId>;
+pub(crate) type GTDecoderExt<VarId> = TypedDecoderExt<GenType, VarId>;
 
 impl<'a> GTCompiler<'a> {
     fn new(module: &'a FormatModule) -> Self {
@@ -257,8 +258,8 @@ impl<'a> GTCompiler<'a> {
 
     pub(crate) fn compile_program(
         module: &FormatModule,
-        format: &GTFormat,
-    ) -> AResult<TypedProgram<GenType>> {
+        format: &GTFormat<Label>,
+    ) -> AResult<TypedProgram<GenType, Label>> {
         let mut compiler = GTCompiler::new(module);
         // type
         let t = match format.get_type() {
@@ -277,7 +278,7 @@ impl<'a> GTCompiler<'a> {
     fn queue_compile(
         &mut self,
         t: GenType,
-        f: &'a GTFormat,
+        f: &'a GTFormat<Label>,
         args: Option<Vec<(Label, GenType)>>,
         next: Rc<Next<'a>>,
     ) -> usize {
@@ -289,10 +290,10 @@ impl<'a> GTCompiler<'a> {
 
     fn compile_gt_format(
         &mut self,
-        format: &'a GTFormat,
+        format: &'a GTFormat<Label>,
         args: Option<Vec<(Label, GenType)>>,
         next: Rc<Next<'a>>,
-    ) -> AResult<GTDecoderExt> {
+    ) -> AResult<GTDecoderExt<Label>> {
         let dec = match format {
             TypedFormat::FormatCall(gt, level, arg_exprs, deref) => {
                 let this_args = arg_exprs.to_vec();
@@ -334,12 +335,11 @@ impl<'a> GTCompiler<'a> {
                 let da = Box::new(self.compile_gt_format(f, None, next)?);
                 Ok(TypedDecoder::DecodeBytes(gt.clone(), expr.clone(), da))
             }
-            TypedFormat::ForEach(gt, expr, lbl, f) => {
+            TypedFormat::ForEach(gt, l_e, f) => {
                 let da = Box::new(self.compile_gt_format(f, None, next)?);
                 Ok(TypedDecoder::ForEach(
                     gt.clone(),
-                    expr.clone(),
-                    lbl.clone(),
+                    l_e.clone(),
                     da,
                 ))
             }
@@ -587,7 +587,27 @@ impl<'a> GTCompiler<'a> {
                 let a_next = Next::Cat(MaybeTyped::Typed(f.as_ref()), next.clone());
                 let d0 = Box::new(self.compile_gt_format(f0, None, Rc::new(a_next))?);
                 let d = Box::new(self.compile_gt_format(f, None, next)?);
-                Ok(TypedDecoder::LetFormat(gt.clone(), d0, name.clone(), d))
+                Ok(TypedDecoder::FormatBind(gt.clone(), d0, NamedCapture::new(name.clone(), d)))
+            }
+            TypedFormat::MonadSeq(gt, f0, f) => {
+                let a_next = Next::Cat(MaybeTyped::Typed(f.as_ref()), next.clone());
+                let d0 = Box::new(self.compile_gt_format(f0, None, Rc::new(a_next))?);
+                let d = Box::new(self.compile_gt_format(f, None, next)?);
+                Ok(TypedDecoder::MonadSeq(gt.clone(), d0, d))
+            }
+            TypedFormat::Hint(gt, hint, a) => {
+                let da = Box::new(self.compile_gt_format(a, None, next.clone())?);
+                Ok(TypedDecoder::Hint(gt.clone(), hint.clone(), da))
+            }
+            TypedFormat::LiftedOption(gt, opt_f) => {
+                let inner_dec = match opt_f {
+                    None => None,
+                    Some(a) => {
+                        let da = Box::new(self.compile_gt_format(a, None, next.clone())?);
+                        Some(da)
+                    }
+                };
+                Ok(TypedDecoder::LiftedOption(gt.clone(), inner_dec))
             }
             TypedFormat::MonadSeq(gt, f0, f) => {
                 let a_next = Next::Cat(MaybeTyped::Typed(f.as_ref()), next.clone());

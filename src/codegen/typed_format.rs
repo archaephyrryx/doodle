@@ -55,7 +55,10 @@ impl GenType {
     }
 }
 
-impl<TypeRep> std::hash::Hash for TypedFormat<TypeRep> {
+impl<TypeRep, VarId> std::hash::Hash for TypedFormat<TypeRep, VarId>
+where VarId: Ident,
+
+{
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let disc = core::mem::discriminant(self);
         disc.hash(state);
@@ -86,10 +89,9 @@ impl<TypeRep> std::hash::Hash for TypedFormat<TypeRep> {
                 n.hash(state);
                 inner.hash(state);
             }
-            TypedFormat::ForEach(_, expr, lbl, inner) => {
+            TypedFormat::ForEach(_, expr, c_inner) => {
                 expr.hash(state);
-                lbl.hash(state);
-                inner.hash(state);
+                c_inner.hash(state);
             }
             TypedFormat::RepeatBetween(_, lo, hi, inner) => {
                 lo.hash(state);
@@ -130,25 +132,22 @@ impl<TypeRep> std::hash::Hash for TypedFormat<TypeRep> {
                 f.hash(state);
             }
             TypedFormat::Compute(_, expr) => expr.hash(state),
-            TypedFormat::Let(_, lb, x, inner) => {
-                lb.hash(state);
+            TypedFormat::LetBind(_, x, closure) => {
                 x.hash(state);
-                inner.hash(state);
+                closure.hash(state);
             }
             TypedFormat::Match(_, head, cases) => {
                 head.hash(state);
                 cases.hash(state);
             }
-            TypedFormat::Dynamic(_, lb, dynf, inner) => {
-                lb.hash(state);
+            TypedFormat::DynamicBind(_, dynf, closure) => {
                 dynf.hash(state);
-                inner.hash(state);
+                closure.hash(state);
             }
             TypedFormat::Apply(_, lbl, _) => lbl.hash(state),
-            TypedFormat::LetFormat(_, f0, lbl, f) => {
+            TypedFormat::FormatBind(_, f0, closure) => {
                 f0.hash(state);
-                lbl.hash(state);
-                f.hash(state);
+                closure.hash(state);
             }
             TypedFormat::MonadSeq(_, f0, f) => {
                 f0.hash(state);
@@ -163,100 +162,96 @@ impl<TypeRep> std::hash::Hash for TypedFormat<TypeRep> {
     }
 }
 
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TypedFormat<TypeRep> {
+pub enum TypedFormat<TypeRep: 'static, VarId: Ident = Label> {
     FormatCall(
         TypeRep,
         usize,
-        Vec<(Label, TypedExpr<TypeRep>)>,
-        Rc<TypedFormat<TypeRep>>,
+        Vec<(Label, TypedExpr<TypeRep, VarId>)>,
+        Rc<TypedFormat<TypeRep, VarId>>,
     ),
     ForEach(
         TypeRep,
-        Box<TypedExpr<TypeRep>>,
-        Label,
-        Box<TypedFormat<TypeRep>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        FormatL<TypeRep, VarId>,
     ),
     Fail,
     EndOfInput,
     Align(usize),
     Byte(ByteSet),
-    Variant(TypeRep, Label, Box<TypedFormat<TypeRep>>),
-    Union(TypeRep, Vec<TypedFormat<TypeRep>>),
-    UnionNondet(TypeRep, Vec<TypedFormat<TypeRep>>),
-    Tuple(TypeRep, Vec<TypedFormat<TypeRep>>),
-    // Record(TypeRep, Vec<(Label, TypedFormat<TypeRep>)>),
-    Repeat(TypeRep, Box<TypedFormat<TypeRep>>),
-    Repeat1(TypeRep, Box<TypedFormat<TypeRep>>),
-    RepeatCount(TypeRep, Box<TypedExpr<TypeRep>>, Box<TypedFormat<TypeRep>>),
+    Variant(TypeRep, Label, Box<TypedFormat<TypeRep, VarId>>),
+    Union(TypeRep, Vec<TypedFormat<TypeRep, VarId>>),
+    UnionNondet(TypeRep, Vec<TypedFormat<TypeRep, VarId>>),
+    Tuple(TypeRep, Vec<TypedFormat<TypeRep, VarId>>),
+    Repeat(TypeRep, Box<TypedFormat<TypeRep, VarId>>),
+    Repeat1(TypeRep, Box<TypedFormat<TypeRep, VarId>>),
+    RepeatCount(TypeRep, Box<TypedExpr<TypeRep, VarId>>, Box<TypedFormat<TypeRep, VarId>>),
     RepeatBetween(
         TypeRep,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedFormat<TypeRep>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedFormat<TypeRep, VarId>>,
     ),
-    RepeatUntilLast(TypeRep, Box<TypedExpr<TypeRep>>, Box<TypedFormat<TypeRep>>),
-    RepeatUntilSeq(TypeRep, Box<TypedExpr<TypeRep>>, Box<TypedFormat<TypeRep>>),
-    Maybe(TypeRep, Box<TypedExpr<TypeRep>>, Box<TypedFormat<TypeRep>>),
-    Peek(TypeRep, Box<TypedFormat<TypeRep>>),
-    PeekNot(TypeRep, Box<TypedFormat<TypeRep>>),
-    Slice(TypeRep, Box<TypedExpr<TypeRep>>, Box<TypedFormat<TypeRep>>),
-    Bits(TypeRep, Box<TypedFormat<TypeRep>>),
+    RepeatUntilLast(TypeRep, Box<TypedExpr<TypeRep, VarId>>, Box<TypedFormat<TypeRep, VarId>>),
+    RepeatUntilSeq(TypeRep, Box<TypedExpr<TypeRep, VarId>>, Box<TypedFormat<TypeRep, VarId>>),
+    Maybe(TypeRep, Box<TypedExpr<TypeRep, VarId>>, Box<TypedFormat<TypeRep, VarId>>),
+    Peek(TypeRep, Box<TypedFormat<TypeRep, VarId>>),
+    PeekNot(TypeRep, Box<TypedFormat<TypeRep, VarId>>),
+    Slice(TypeRep, Box<TypedExpr<TypeRep, VarId>>, Box<TypedFormat<TypeRep, VarId>>),
+    Bits(TypeRep, Box<TypedFormat<TypeRep, VarId>>),
     WithRelativeOffset(
         TypeRep,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedFormat<TypeRep>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedFormat<TypeRep, VarId>>,
     ),
-    Map(TypeRep, Box<TypedFormat<TypeRep>>, Box<TypedExpr<TypeRep>>),
-    Where(TypeRep, Box<TypedFormat<TypeRep>>, Box<TypedExpr<TypeRep>>),
-    Compute(TypeRep, Box<TypedExpr<TypeRep>>),
-    Let(
+    Map(TypeRep, Box<TypedFormat<TypeRep, VarId>>, Box<TypedExpr<TypeRep, VarId>>),
+    Where(TypeRep, Box<TypedFormat<TypeRep, VarId>>, Box<TypedExpr<TypeRep, VarId>>),
+    Compute(TypeRep, Box<TypedExpr<TypeRep, VarId>>),
+    LetBind(
         TypeRep,
-        Label,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedFormat<TypeRep>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        FormatL<TypeRep, VarId>,
+    ),
+    DynamicBind(
+        TypeRep,
+        TypedDynFormat<TypeRep, VarId>,
+        FormatL<TypeRep, VarId>,
     ),
     Match(
         TypeRep,
-        Box<TypedExpr<TypeRep>>,
-        Vec<(TypedPattern<TypeRep>, TypedFormat<TypeRep>)>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Vec<(TypedPattern<TypeRep>, TypedFormat<TypeRep, VarId>)>,
     ),
-    Dynamic(
-        TypeRep,
-        Label,
-        TypedDynFormat<TypeRep>,
-        Box<TypedFormat<TypeRep>>,
-    ),
-    Apply(TypeRep, Label, Rc<TypedDynFormat<TypeRep>>),
+    Apply(TypeRep, VarId, Rc<TypedDynFormat<TypeRep>>),
     Pos,
     SkipRemainder,
-    DecodeBytes(TypeRep, Box<TypedExpr<TypeRep>>, Box<TypedFormat<TypeRep>>),
-    LetFormat(
+    DecodeBytes(TypeRep, Box<TypedExpr<TypeRep, VarId>>, Box<TypedFormat<TypeRep, VarId>>),
+    FormatBind(
         TypeRep,
-        Box<TypedFormat<TypeRep>>,
-        Label,
-        Box<TypedFormat<TypeRep>>,
+        Box<TypedFormat<TypeRep, VarId>>,
+        FormatL<TypeRep, VarId>,
     ),
     MonadSeq(
         TypeRep,
-        Box<TypedFormat<TypeRep>>,
-        Box<TypedFormat<TypeRep>>,
+        Box<TypedFormat<TypeRep, VarId>>,
+        Box<TypedFormat<TypeRep, VarId>>,
     ),
-    Hint(TypeRep, StyleHint, Box<TypedFormat<TypeRep>>),
+    Hint(TypeRep, StyleHint, Box<TypedFormat<TypeRep, VarId>>),
     AccumUntil(
         TypeRep,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedExpr<TypeRep>>,
-        Box<TypedExpr<TypeRep>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedExpr<TypeRep, VarId>>,
+        Box<TypedExpr<TypeRep, VarId>>,
         TypeHint,
-        Box<TypedFormat<TypeRep>>,
+        Box<TypedFormat<TypeRep, VarId>>,
     ),
     LiftedOption(TypeRep, Option<Box<TypedFormat<TypeRep>>>),
 }
 
-impl TypedFormat<GenType> {
-    pub const EMPTY: Self = TypedFormat::Tuple(GenType::Inline(RustType::UNIT), Vec::new());
+impl<VarId: Ident> TypedFormat<GenType, VarId> {
+    pub const EMPTY: TypedFormat<GenType, VarId> = TypedFormat::Tuple(GenType::Inline(RustType::UNIT), Vec::new());
 
     pub(crate) fn lookahead_bounds(&self) -> Bounds {
         match self {
@@ -299,7 +294,7 @@ impl TypedFormat<GenType> {
             | TypedFormat::RepeatUntilSeq(_, _, _f)
             | TypedFormat::AccumUntil(.., _f) => Bounds::any(),
             // REVIEW - can we do any better than this?
-            TypedFormat::ForEach(_, _expr, _lbl, _f) => Bounds::any(),
+            TypedFormat::ForEach(_, _expr, _c) => Bounds::any(),
             TypedFormat::Maybe(_, _, f) => Bounds::union(Bounds::exact(0), f.lookahead_bounds()),
 
             TypedFormat::Slice(_, t_expr, _) => t_expr.bounds(),
@@ -312,8 +307,8 @@ impl TypedFormat<GenType> {
 
             TypedFormat::Map(_, f, _)
             | TypedFormat::Where(_, f, _)
-            | TypedFormat::Dynamic(_, _, _, f)
-            | TypedFormat::Let(_, _, _, f) => f.lookahead_bounds(),
+            | TypedFormat::DynamicBind(_, _, f)
+            | TypedFormat::LetBind(_, _, f) => f.lookahead_bounds(),
 
             TypedFormat::Match(_, _, branches) => branches
                 .iter()
@@ -322,9 +317,9 @@ impl TypedFormat<GenType> {
                 .unwrap(),
 
             TypedFormat::Apply(_, _, _) => Bounds::at_least(1),
-            TypedFormat::LetFormat(_, f0, _, f) | TypedFormat::MonadSeq(_, f0, f) => Bounds::union(
+            TypedFormat::FormatBind(_, f0, c) => Bounds::union(
                 f0.lookahead_bounds(),
-                f0.match_bounds() + f.lookahead_bounds(),
+                f0.match_bounds() + c.get_format().lookahead_bounds(),
             ),
             TypedFormat::Hint(.., inner) => inner.lookahead_bounds(),
             TypedFormat::LiftedOption(_, f) => f
@@ -371,7 +366,7 @@ impl TypedFormat<GenType> {
             | TypedFormat::RepeatUntilSeq(_, _, _f)
             | TypedFormat::AccumUntil(.., _f) => Bounds::any(),
             // REVIEW - can we do any better than this?
-            TypedFormat::ForEach(_, _expr, _lbl, _f) => Bounds::any(),
+            TypedFormat::ForEach(_, _expr, _c) => Bounds::any(),
             TypedFormat::Maybe(_, _, f) => Bounds::union(Bounds::exact(0), f.match_bounds()),
 
             TypedFormat::SkipRemainder => Bounds::any(),
@@ -466,11 +461,11 @@ impl TypedFormat<GenType> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TypedDynFormat<TypeRep> {
-    Huffman(Box<TypedExpr<TypeRep>>, Option<Box<TypedExpr<TypeRep>>>),
+pub enum TypedDynFormat<TypeRep, VarId: Ident = Label> {
+    Huffman(Box<TypedExpr<TypeRep, VarId>>, Option<Box<TypedExpr<TypeRep, VarId>>>),
 }
 
-impl<TypeRep> std::hash::Hash for TypedDynFormat<TypeRep> {
+impl<TypeRep, VarId: Ident> std::hash::Hash for TypedDynFormat<TypeRep, VarId> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         core::mem::discriminant(self).hash(state);
         match self {
@@ -482,7 +477,7 @@ impl<TypeRep> std::hash::Hash for TypedDynFormat<TypeRep> {
     }
 }
 
-mod private {
+mod sealed {
     pub trait Sealed {}
 
     impl Sealed for crate::Label {}
@@ -498,12 +493,162 @@ pub trait Ident:
     + Ord
     + std::hash::Hash
     + 'static
-    + private::Sealed
+    + sealed::Sealed
 {
+    type WithCapture<T: 'static, U: 'static + Clone + std::ops::Deref<Target = T>>: GenericL<Self, T, U>;
 }
 
-impl Ident for Label {}
-impl Ident for u32 {}
+pub trait GenericL<Id: Ident, T, U: 'static>
+where
+    Self: 'static + Clone + std::fmt::Debug,
+    U: std::ops::Deref<Target = T> + 'static,
+    T: 'static
+{
+    type Parts;
+    type RefParts<'a>;
+
+    fn get_id(&self) -> &Id;
+    fn get_inner_raw(&self) -> &U;
+
+    fn get_inner(&self) -> &T {
+        self.get_inner_raw().deref()
+    }
+
+    fn as_parts(&self) -> Self::RefParts<'_>;
+    fn into_parts(self) -> Self::Parts;
+}
+
+impl Ident for Label {
+    type WithCapture<T: 'static, U: 'static + Clone + std::ops::Deref<Target = T>> = NamedCapture<T, U>;
+}
+
+impl Ident for u32 {
+    type WithCapture<T: 'static, U: 'static + Clone + std::ops::Deref<Target = T>> = NamelessCapture<T, U>;
+}
+
+mod capture_impls {
+    use crate::Label;
+    use super::{NamedCapture, NamelessCapture, GenericL};
+
+    impl<T, U> GenericL<Label, T, U> for NamedCapture<T, U>
+    where
+        T: 'static,
+        U: std::ops::Deref<Target = T> + Clone + 'static + std::hash::Hash
+    {
+        type Parts = (Label, U);
+        type RefParts<'a> = (&'a Label, &'a T);
+
+        fn get_id(&self) -> &Label {
+            &self.0
+        }
+
+        fn get_inner_raw(&self) -> &U {
+            &self.1
+        }
+
+        fn as_parts(&self) -> Self::RefParts<'_> {
+            (&self.0, &self.1)
+        }
+
+        fn into_parts(self) -> Self::Parts {
+            (self.0, self.1)
+        }
+    }
+
+    impl<T, U> GenericL<u32, T, U> for NamelessCapture<T, U>
+    where
+        T: 'static,
+        U: std::ops::Deref<Target = T> + Clone + 'static + std::hash::Hash
+    {
+        type Parts = U;
+        type RefParts<'a> = &'a T;
+
+        fn get_id(&self) -> &u32 {
+            &0
+        }
+
+        fn get_inner_raw(&self) -> &U {
+            &self.0
+        }
+
+        fn as_parts(&self) -> Self::RefParts<'_> {
+            &self.0
+        }
+
+        fn into_parts(self) -> Self::Parts {
+            self.0
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct NamedCapture<T: 'static, U: Clone = Box<T>>(Label, U, std::marker::PhantomData<T>);
+
+impl<T, U> Clone for NamedCapture<T, U>
+where
+    U: Clone
+{
+    fn clone(&self) -> Self {
+        Self(self.0.clone(), self.1.clone(), std::marker::PhantomData)
+    }
+}
+
+impl<T: 'static, U: Clone> NamedCapture<T, U> {
+    pub fn new(label: Label, inner: U) -> Self {
+        Self(label, inner, std::marker::PhantomData)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct NamelessCapture<T: 'static, U = Box<T>>(U, std::marker::PhantomData<T>);
+
+impl<T: 'static, U: 'static + Clone> NamelessCapture<T, U> {
+    pub fn new(inner: U) -> Self {
+        Self(inner, std::marker::PhantomData)
+    }
+}
+
+impl<T, U> Clone for NamelessCapture<T, U>
+where
+    U: Clone
+{
+    fn clone(&self) -> Self {
+        Self(self.0.clone(), std::marker::PhantomData)
+    }
+}
+
+impl<TypeRep, VarId: Ident> std::hash::Hash for NamelessCapture<TypedFormat<TypeRep, VarId>> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl<TypeRep, VarId: Ident> std::hash::Hash for NamelessCapture<TypedExpr<TypeRep, VarId>> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl<TypeRep, VarId: Ident> std::hash::Hash for NamedCapture<TypedFormat<TypeRep, VarId>> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+        self.1.hash(state);
+    }
+}
+
+impl<TypeRep, VarId: Ident> std::hash::Hash for NamedCapture<TypedExpr<TypeRep, VarId>> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+        self.1.hash(state);
+    }
+}
+
+
+pub type ExprL<TypeRep, Id> = <Id as Ident>::WithCapture<TypedExpr<TypeRep, Id>, Box<TypedExpr<TypeRep, Id>>>;
+pub type FormatL<TypeRep, Id> = <Id as Ident>::WithCapture<TypedFormat<TypeRep, Id>, Box<TypedFormat<TypeRep, Id>>>;
+
+pub type GTExprL<Id> = ExprL<GenType, Id>;
+pub type GTFormatL<Id> = FormatL<GenType, Id>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TypedExpr<TypeRep, VarId = Label>
@@ -527,7 +672,7 @@ where
         Box<TypedExpr<TypeRep, VarId>>,
         Vec<(TypedPattern<TypeRep>, TypedExpr<TypeRep, VarId>)>,
     ),
-    Lambda((TypeRep, TypeRep), Label, Box<TypedExpr<TypeRep, VarId>>),
+    Lambda((TypeRep, TypeRep), <VarId as Ident>::ExprLambda<TypeRep>),
     IntRel(
         TypeRep,
         IntRel,
@@ -618,7 +763,7 @@ where
     Unary(TypeRep, UnaryOp, Box<TypedExpr<TypeRep, VarId>>),
 }
 
-impl<TypeRep> std::hash::Hash for TypedExpr<TypeRep> {
+impl<TypeRep, VarId: Ident> std::hash::Hash for TypedExpr<TypeRep, VarId> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         core::mem::discriminant(self).hash(state);
         match self {
@@ -647,9 +792,8 @@ impl<TypeRep> std::hash::Hash for TypedExpr<TypeRep> {
                 head.hash(state);
                 cases.hash(state);
             }
-            TypedExpr::Lambda(_, var, body) => {
-                var.hash(state);
-                body.hash(state);
+            TypedExpr::Lambda(_, inner) => {
+                inner.hash(state);
             }
             TypedExpr::IntRel(_, rel, lhs, rhs) => {
                 rel.hash(state);
@@ -922,7 +1066,10 @@ mod __impls {
                 TypedExpr::Match(_, head, branches) => {
                     Expr::Match(rebox(head), revec_pair(branches))
                 }
-                TypedExpr::Lambda(_, name, inner) => Expr::Lambda(name, rebox(inner)),
+                TypedExpr::Lambda(_, lambda) => {
+                    let (name, inner) = lambda.into_parts();
+                    Expr::Lambda(name, rebox(inner))
+                }
                 TypedExpr::IntRel(_, rel, x, y) => Expr::IntRel(rel, rebox(x), rebox(y)),
                 TypedExpr::Arith(_, op, x, y) => Expr::Arith(op, rebox(x), rebox(y)),
                 TypedExpr::Unary(_, op, x) => Expr::Unary(op, rebox(x)),
@@ -968,7 +1115,7 @@ mod __impls {
         }
     }
 
-    impl<TypeRep> From<TypedFormat<TypeRep>> for Format {
+    impl<TypeRep: 'static + Clone> From<TypedFormat<TypeRep>> for Format {
         fn from(value: TypedFormat<TypeRep>) -> Self {
             match value {
                 TypedFormat::FormatCall(_gt, level, t_args, _) => {
@@ -1020,7 +1167,8 @@ mod __impls {
                 TypedFormat::Maybe(_, is_present, inner) => {
                     Format::Maybe(rebox(is_present), rebox(inner))
                 }
-                TypedFormat::ForEach(_, expr, lbl, inner) => {
+                TypedFormat::ForEach(_, expr, closure) => {
+                    let (lbl, inner) = closure.into_parts();
                     Format::ForEach(rebox(expr), lbl, rebox(inner))
                 }
                 TypedFormat::Peek(_, inner) => Format::Peek(rebox(inner)),
@@ -1030,10 +1178,17 @@ mod __impls {
                 TypedFormat::WithRelativeOffset(_, base_addr, ofs, inner) => {
                     Format::WithRelativeOffset(rebox(base_addr), rebox(ofs), rebox(inner))
                 }
-                TypedFormat::Map(_, inner, lambda) => Format::Map(rebox(inner), rebox(lambda)),
-                TypedFormat::Where(_, inner, lambda) => Format::Where(rebox(inner), rebox(lambda)),
+                TypedFormat::Map(_, inner, named) => {
+                    let (name, body) = named.into_parts();
+                    Format::Map(rebox(inner), Box::new(Expr::Lambda(name, rebox(body))))
+                }
+                TypedFormat::Where(_, inner, named) => {
+                    let (name, body) = named.into_parts();
+                    Format::Where(rebox(inner), Box::new(Expr::Lambda(name, rebox(body))))
+                }
                 TypedFormat::Compute(_, expr) => Format::Compute(rebox(expr)),
-                TypedFormat::Let(_, name, val, inner) => {
+                TypedFormat::LetBind(_, val, closure) => {
+                    let (name, inner) = closure.into_parts();
                     Format::Let(name, rebox(val), rebox(inner))
                 }
                 TypedFormat::Match(_, head, t_branches) => {
@@ -1043,7 +1198,8 @@ mod __impls {
                         .collect();
                     Format::Match(rebox(head), branches)
                 }
-                TypedFormat::Dynamic(_, name, dynf, inner) => {
+                TypedFormat::DynamicBind(_, dynf, closure) => {
+                    let (name, inner) = closure.into_parts();
                     Format::Dynamic(name, DynFormat::from(dynf), rebox(inner))
                 }
                 TypedFormat::Apply(_, name, _) => Format::Apply(name),
