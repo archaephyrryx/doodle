@@ -1,6 +1,7 @@
 pub mod codegen;
 pub mod decoder;
 pub(crate) mod matchtree;
+pub mod typecheck;
 pub use matchtree::determinations;
 pub mod helper;
 pub(crate) use matchtree::{MatchTree, Next};
@@ -374,7 +375,7 @@ pub enum Format {
 impl Format {
     pub const EMPTY: Self = Format::Tuple(vec![]);
 
-    fn infer_type<'ctx>(
+    pub(crate) fn infer_type<'ctx>(
         &'ctx self,
         visited: &mut HashSet<FormatId>,
         module: &'ctx FormatModule,
@@ -669,7 +670,7 @@ pub enum Expr {
 }
 
 impl Expr {
-    fn infer_type(&self) -> AResult<FormatType> {
+    pub(crate) fn infer_type(&self) -> AResult<FormatType> {
         match self {
             Expr::U8(_) => Ok(FormatType::Base(BaseType::U8)),
             Expr::U16(_) => Ok(FormatType::Base(BaseType::U16)),
