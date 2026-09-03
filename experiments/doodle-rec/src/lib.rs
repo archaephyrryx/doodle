@@ -1,5 +1,6 @@
 pub mod codegen;
 pub mod decoder;
+pub mod elaborate;
 pub(crate) mod matchtree;
 pub mod typecheck;
 pub use matchtree::determinations;

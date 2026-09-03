@@ -343,7 +343,7 @@ fn rust_type(batch: &CompiledBatch<'_>, ty: &FormatType) -> AResult<String> {
 /// PascalCase Rust type identifier derived from a declared format name (e.g. "test.peano" ->
 /// "TestPeano"). Prototype-grade sanitization: splits on any non-alphanumeric byte, capitalizes
 /// each piece.
-fn type_name(label: &Label) -> String {
+pub(crate) fn type_name(label: &Label) -> String {
     let mut out = String::new();
     for word in label.split(|c: char| !c.is_alphanumeric()) {
         let mut chars = word.chars();
@@ -374,7 +374,7 @@ fn fn_name(label: &Label) -> String {
     out
 }
 
-fn variant_name(label: &Label) -> String {
+pub(crate) fn variant_name(label: &Label) -> String {
     type_name(label)
 }
 

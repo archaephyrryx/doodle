@@ -124,7 +124,7 @@ impl<'a> TypeChecker<'a> {
         v
     }
 
-    fn find(&mut self, v: UVar) -> UVar {
+    pub(crate) fn find(&mut self, v: UVar) -> UVar {
         match self.parent[v] {
             None => v,
             Some(p) => {
@@ -283,7 +283,7 @@ impl<'a> TypeChecker<'a> {
     /// whatever the body actually infers to - any reference to `level` reached WHILE that body is
     /// still being solved (a genuine cycle) sees the placeholder and is occurs-checked against it
     /// in [`Self::unify_var_pair`] once the recursive call returns.
-    fn infer_level(&mut self, level: FormatId) -> AResult<UVar> {
+    pub(crate) fn infer_level(&mut self, level: FormatId) -> AResult<UVar> {
         if let Some(v) = self.level_vars.get(&level) {
             return Ok(*v);
         }
