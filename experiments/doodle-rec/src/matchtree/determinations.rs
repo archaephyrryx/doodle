@@ -850,6 +850,16 @@ impl<'a> PartialFormat<'a> {
                     let mut det_seq = Determinations::zero();
                     for format in *formats {
                         let det_format = format.solve_determinations(module, visited, ctx)?;
+                        if !det_format.is_nullable {
+                            // Same reasoning as `Format::Tuple`/`Format::Seq`'s own arm: every
+                            // level still open at this point (however it was reached) has now had
+                            // real progress made since it was opened, so re-entering any of them
+                            // later in this sequence - or in `remnant`, below - is no longer left
+                            // recursion. `formats` here is always a definite, always-executed list
+                            // (unlike `PartialFormat::Repeat`'s target, which may run zero times
+                            // and so must NOT guard before its own remnant).
+                            visited.guard();
+                        }
                         det_seq = det_seq
                             .merge_seq(det_format)
                             .map_err(|e| e.add_context(self.clone()))?;
@@ -962,7 +972,54 @@ impl std::error::Error for InterpError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Label;
 
     #[test]
     fn test_follow_set() {}
+
+    /// Regression test for `PartialFormat::Sequence`'s missing `visited.guard()` call (a leftover
+    /// from the original punch list, predating the recursion extension plan). Drives a hand-built
+    /// `PartialFormat::Sequence` directly, bypassing `Format::Tuple`'s own (already-correct) arm
+    /// entirely, to isolate `PartialFormat::solve_determinations`'s own handling: a non-nullable
+    /// `Byte` followed by a `RecVar` back to the very level this `Traversal` is anchored to
+    /// (`orig_level`) - since real progress (the `Byte`) was made first, this must NOT be flagged
+    /// as left-recursion.
+    #[test]
+    fn partial_format_sequence_guards_after_non_nullable_element() -> Result<(), anyhow::Error> {
+        // Minimal valid self-recursive batch, only to obtain a real ctx/module pair - its own
+        // body is irrelevant to what's being tested here.
+        let peano = Format::Union(vec![
+            Format::Variant(
+                Label::Borrowed("Z"),
+                Box::new(Format::Byte(ByteSet::from([b'Z']))),
+            ),
+            Format::Variant(
+                Label::Borrowed("S"),
+                Box::new(Format::Tuple(vec![
+                    Format::Byte(ByteSet::from([b'S'])),
+                    Format::RecVar(0),
+                ])),
+            ),
+        ]);
+        let mut module = FormatModule::new();
+        let frefs = module.declare_rec_formats(vec![(Label::Borrowed("test.peano"), peano)]);
+        let level = frefs[0].get_level();
+        let ctx = module.get_ctx(level);
+
+        let formats = vec![Format::Byte(ByteSet::from([b'a'])), Format::RecVar(0)];
+        let seq: Rc<PartialFormat> = Rc::new(PartialFormat::Sequence(
+            &formats,
+            Rc::new(PartialFormat::Empty),
+        ));
+
+        let mut traversal = Traversal::new(level);
+        let result = seq.solve_determinations(&module, &mut traversal, ctx);
+        assert!(
+            result.is_ok(),
+            "RecVar(0) is reached AFTER a non-nullable Byte in the same Sequence - guard() \
+             should have marked orig_level guarded by then, so this must not be flagged as \
+             left-recursion: {result:?}"
+        );
+        Ok(())
+    }
 }
