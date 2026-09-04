@@ -228,30 +228,30 @@ impl FormatType {
         match (self, other) {
             (FormatType::Any, _) => Ok(other.clone()),
             (_, FormatType::Any) => Ok(self.clone()),
-            (FormatType::Ref(id0), FormatType::Ref(id1)) => {
-                if id0 == id1 {
-                    Ok(FormatType::Ref(*id0))
-                } else {
-                    // Two *different* levels are both still mid-computation (open on the
-                    // call stack) at this point, and their eventual types can't yet be
-                    // compared - there's no principled way to pick a winner between two
-                    // still-unresolved cycles without real equi-recursive type unification,
-                    // which this doesn't attempt. Erring here (rather than silently picking
-                    // one) is deliberate.
-                    Err(anyhow!(
-                        "cannot unify distinct recursive type placeholders Ref({id0}) and Ref({id1}): \
-                         both are still being computed, so their eventual types can't yet be compared"
-                    ))
-                }
-            }
+            (FormatType::Ref(id0), FormatType::Ref(id1)) if id0 == id1 => Ok(FormatType::Ref(*id0)),
             // A Ref is a placeholder for a level whose type is still being computed - unifying
-            // it against a concrete type (or a different Ref, handled above) can't fail here for
-            // the same reason `Any` can't: there isn't enough information yet to contradict
-            // `other`. This is a pragmatic simplification, not full equi-recursive unification:
-            // it doesn't verify that the referenced level's *eventual* type is actually
-            // compatible with `other`, including when `other` itself contains a reference back
-            // to this same level (e.g. two sibling Tuple/Seq positions independently reaching
-            // the same open cycle via different, differently-shaped paths).
+            // it against anything else (a concrete type, or a *different* still-open Ref) can't
+            // fail here for the same reason `Any` can't: there isn't enough information yet to
+            // contradict `other`. This is a pragmatic simplification, not full equi-recursive
+            // unification: it doesn't verify that the referenced level's *eventual* type is
+            // actually compatible with `other`, including when `other` itself contains a
+            // reference back to this same level, or is itself a *different* still-open cycle
+            // (e.g. two sibling `Tuple`/`Seq`/`Union` positions independently reaching two
+            // distinct open ancestors, only reachable via 3-or-more-level mutual recursion -
+            // confirmed empirically reachable through ordinary `declare_rec_formats` use, not
+            // just hypothetical). Originally the distinct-Ref case was a hard `Err` here, on the
+            // reasoning that there's no principled way to pick a winner between two still-open
+            // cycles - but that's exactly as true of a Ref-vs-concrete-type unification too, and
+            // this file already accepts that imprecision there; singling out distinct-Ref as a
+            // harder error than the rest of this already-permissive design was an unjustified
+            // asymmetry, not a meaningfully stronger guarantee - downstream consumers (e.g.
+            // `codegen.rs`) never inspect a `Ref`'s own further structure beyond `Box`-wrapping
+            // it, so which of the two ambiguous placeholders gets returned here doesn't change
+            // what they do with it. `experiments/doodle-rec/src/typecheck.rs`'s UVar/occurs-check
+            // engine is the sound alternative for callers that need this resolved precisely - two
+            // distinct open `UVar`s there just get merged like anything else via ordinary
+            // union-find aliasing, with the occurs-check (not a special case here) providing the
+            // real soundness guarantee.
             (FormatType::Ref(_), _) => Ok(other.clone()),
             (_, FormatType::Ref(_)) => Ok(self.clone()),
             (FormatType::Void, _) | (_, FormatType::Void) => Ok(FormatType::Void),
@@ -972,5 +972,36 @@ mod tests {
         }
         eprintln!("cons_list_any_byte :: {actual:?}");
         Ok(())
+    }
+
+    /// Regression test for the original punch list's `FormatType::unify` `(Ref, Ref)` leftover:
+    /// a 3-level mutual recursion (`a` -> `b` -> `c`) where `c`'s body is
+    /// `Seq([RecVar(0)/*->a*/, RecVar(1)/*->b*/])` - by the time `c` is reached (nested inside
+    /// resolving `a`, which nests into `b`), both `a` and `b` are still open/mid-computation, so
+    /// `c`'s two `Seq` elements resolve to `FormatType::Ref(a)` and `FormatType::Ref(b)`
+    /// respectively - two *different* still-open cycles combined via the same `elem_type.unify`
+    /// call. Confirmed (before this fix) to panic `declare_rec_formats` outright via this exact
+    /// grammar, not just hypothetically - `declare_rec_formats`'s own eager per-member type-check
+    /// runs before any other consumer (including `typecheck.rs`'s newer, actually-sound engine)
+    /// ever gets a `FormatModule` handle to work with, so this was a hard gate blocking the
+    /// pattern entirely, not merely an imprecise-but-usable result.
+    #[test]
+    fn distinct_open_refs_unify_permissively_instead_of_erroring() {
+        let a = Format::Tuple(vec![Format::Byte(ByteSet::from([b'A'])), Format::RecVar(1)]);
+        let b = Format::Tuple(vec![Format::Byte(ByteSet::from([b'B'])), Format::RecVar(2)]);
+        let c = Format::Seq(vec![Format::RecVar(0), Format::RecVar(1)]);
+        let mut module = FormatModule::new();
+        let frefs = module.declare_rec_formats(vec![
+            (Label::Borrowed("a"), a),
+            (Label::Borrowed("b"), b),
+            (Label::Borrowed("c"), c),
+        ]);
+        // Reaching this line at all (declare_rec_formats didn't panic) is the actual assertion -
+        // confirm the resulting type is at least some Ref, for a concrete sanity check.
+        let actual = module.get_format_type(frefs[2].get_level());
+        assert!(
+            matches!(actual, FormatType::Shape(TypeShape::Seq(elem)) if matches!(**elem, FormatType::Ref(_))),
+            "expected c's element type to resolve to some Ref placeholder: {actual:?}"
+        );
     }
 }
