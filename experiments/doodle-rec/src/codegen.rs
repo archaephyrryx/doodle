@@ -36,10 +36,10 @@ use crate::{
 /// member's declared name / solved type / compiled decoder, all in span order (so member `ix`'s
 /// entry corresponds to `Format::RecVar(ix)` within the batch).
 pub struct CompiledBatch<'a> {
-    span: Span<FormatId>,
-    names: Vec<&'a Label>,
-    types: Vec<FormatType>,
-    decoders: Vec<Decoder>,
+    pub(crate) span: Span<FormatId>,
+    pub(crate) names: Vec<&'a Label>,
+    pub(crate) types: Vec<FormatType>,
+    pub(crate) decoders: Vec<Decoder>,
 }
 
 /// Compiles every member of the recursive batch containing `entry_level`, in one pass -
@@ -262,7 +262,7 @@ fn gen_decoder(
 /// `Result<usize, String>`, mirroring `MatchTree::matches`'s own recursive logic exactly - a
 /// `match` on `input.get(depth)` (peeking, not consuming) at each level, falling back to
 /// `tree.accept()` once the input is exhausted or no branch's byte-set contains the next byte.
-fn gen_match_tree(tree: &MatchTree, depth: usize) -> String {
+pub(crate) fn gen_match_tree(tree: &MatchTree, depth: usize) -> String {
     let fallback = match tree.accept() {
         Some(ix) => format!("Ok({ix})"),
         None => "Err(\"no valid branch\".to_string())".to_string(),
@@ -283,7 +283,7 @@ fn gen_match_tree(tree: &MatchTree, depth: usize) -> String {
     format!("match input.get({depth}) {{ {arms}_ => {fallback} }}")
 }
 
-fn value_to_rust_literal(v: &Value) -> AResult<String> {
+pub(crate) fn value_to_rust_literal(v: &Value) -> AResult<String> {
     match v {
         Value::U8(n) => Ok(format!("{n}u8")),
         Value::U16(n) => Ok(format!("{n}u16")),
@@ -359,7 +359,7 @@ pub(crate) fn type_name(label: &Label) -> String {
     }
 }
 
-fn fn_name(label: &Label) -> String {
+pub(crate) fn fn_name(label: &Label) -> String {
     let mut out = String::from("decode_");
     for (i, word) in label
         .split(|c: char| !c.is_alphanumeric())
