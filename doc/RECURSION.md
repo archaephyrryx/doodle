@@ -105,6 +105,50 @@ let [peano_ref] = module.define_batch_with(
 );
 ```
 
+### `FormatModule::define_batch_with_args`
+
+`define_batch_with` is the parameterless form of `define_batch_with_args`, which takes a parameter
+list for each member, in the same form `define_format_args` takes, alongside its name. A member
+with no parameters passes an empty `Vec`:
+
+```rust
+let mut module = FormatModule::new();
+let [down] = module.define_batch_with_args(
+    [("down", vec![(Label::Borrowed("n"), ValueType::U8)])],
+    [Box::new(|&[down]: &[FormatRef; 1]| {
+        // down(n) := 'a'{n} ~ ('Z' | 'S' ~ down(n + 1))
+        Format::Tuple(vec![
+            repeat_count(var("n"), is_byte(b'a')),
+            Format::Union(vec![
+                Format::Variant(Label::Borrowed("Z"), Box::new(is_byte(b'Z'))),
+                Format::Variant(
+                    Label::Borrowed("S"),
+                    Box::new(Format::Tuple(vec![
+                        is_byte(b'S'),
+                        down.call_args(vec![add(var("n"), Expr::U8(1))]),
+                    ])),
+                ),
+            ]),
+        ])
+    })],
+);
+```
+
+Each member's parameters are recorded when its level is reserved, before any builder runs, so a
+self- or sibling call made with `call_args` is checked against the callee's parameter count and
+types at registration, like a call to any other level. `define_batch_recvar` has no
+parameterized form: a `RecVar` carries no arguments.
+
+Parameters play no part in the base-case check
+([mechanism 0](#0-reachable-base-case-check-at-batch-registration)), which looks only at the
+structure of each body. Recursion that ends because of an argument value passes it only if the
+exit is also a structural alternative on the cycle (a `Match` arm on the argument, a `Maybe`, a
+`Union` branch); recursion whose only exit is a `Where` on an argument is rejected. Nothing else
+downstream treats a parameterized batch member differently from a parameterized non-recursive
+format: the interpreter's decoder cache is keyed on `(level, next)`, not on argument values, so
+recursive calls with different arguments share one decoder, and generated code passes the
+arguments to the callee's decoder function as it does for any other call.
+
 There is no lower-level public constructor for an auto-recursive-by-value (viz. as opposed to auto-recursive-through-`Phantom`)
 format; all format-registration methods of `FormatModule` that were not designed for recursive formats,
 infer the type of a to-be-registered format before its level is occupied. Even `FormatModule::define_format_phantom_rec_args`
@@ -499,6 +543,14 @@ checks only that a consistent typing exists: it skips `check_unique_solutions`, 
 codegen's elaboration cannot fail, and clears `nominal_cycles_only` (see
 [mechanism 2](#2-typecheckeroccurs_in-generalization)).
 
+Both passes bind a member's parameters (see
+[`define_batch_with_args`](#formatmoduledefine_batch_with_args)) while inferring its body. The
+`TypeChecker` otherwise binds a level's parameters only in its `Format::ItemVar` arm, to the
+arguments of whichever call first reaches the level, and caches the body's type from then on.
+`solve_batch_types` starts from each member in turn, so a member it reaches through an earlier
+member's call keeps that call's arguments; one not yet reached through any call (always including
+the first member) gets its parameters bound to fresh variables of their declared types instead.
+
 The solved types are then installed as the members' registered types, which needs a way to write a
 recursive `ValueType`. `ValueType::Rec(level)` is a reference to a level's registered type, occurring
 only where a batch member's type closes a cycle; a registered type's head is always structural. For
@@ -584,10 +636,9 @@ the other types they cannot convert.
   preferring a named `Format::record` over a raw multi-field `Tuple` for anything that both
   participates in a recursive cycle *and* is referenced from more than one place, since `Record` is
   always cached and doesn't have this problem.
-- **Parametric `ItemVar` references** (an `Expr::Var` + named-parameter mechanism for a recursive
-  call) — confirmed to be a general language feature with nothing structurally recursion-specific
-  about it (`Expr::Var`/`define_format_args` already exist independent of recursion); not attempted
-  as part of this work, nothing to build here specifically.
+- **Batch members taking views.** `define_batch_with_args` supports expression arguments only;
+  every batch member is reserved with no view parameters. A views form would also need
+  `solve_batch_types` to bind each unreached member's view names, as it binds its parameters.
 - **`ViewFormat::ReadArray`/`fixed.rs`'s fixed-shape analysis** and **`Pattern`** — confirmed *not*
   recursion-sensitive. Fixed-shape analysis requires a statically-known byte-width, definitionally
   incompatible with unbounded recursion, so it already excludes recursive formats for the same reason
@@ -613,6 +664,10 @@ the other types they cannot convert.
     `match_tree_compile_errors_report_the_reason`;
   - `RecVar` misuse: `define_batch_recvar_rejects_out_of_range_rec_var`,
     `define_format_rejects_rec_var`, `define_batch_with_rejects_rec_var`;
+  - parameterized batch members: `define_batch_with_args_self_recursive_decodes`,
+    `define_batch_with_args_mutual_recursion_decodes` (only the first member takes an argument,
+    so it is never reached through a call while the batch is type-checked), and
+    `define_batch_with_args_rejects_ill_typed_self_call_argument`;
   - continuation keys (mechanism 4): `next_dependence_is_decided_by_reachable_lookahead`,
     `interpreter_compiles_and_decodes_repeat_of_recursive_item`,
     `continuation_dependent_recursion_compiles_to_bounded_decoders`;
@@ -653,6 +708,10 @@ the other types they cannot convert.
 - `tests/recursive_maybe/` and `tests/recursive_repeat/` — fixtures of the same kind, for a
   self-reference under a conditional `Maybe` (the `Option<RecBox<T>>` record field of mechanism 3)
   and one in `RepeatCount` element position, respectively.
+- `tests/recursive_args/` — a fixture of the same kind for a parameterized batch member
+  (`down(n)` above, as records), whose generated decoder passes `n + 1` through its own recursive
+  call; it decodes nesting that reads one more `'a'` per level and rejects a level with too few.
+  Regenerated by `fixture_gen::recursive_args_behavior_test` in `src/codegen/tests.rs`.
 
 ## Further reading
 

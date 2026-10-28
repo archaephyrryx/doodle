@@ -1140,7 +1140,7 @@ impl FormatModule {
             bodies.push(format);
         }
 
-        let start = self.reserve_batch_levels(names);
+        let start = self.reserve_batch_levels(names.into_iter().map(|name| (name, Vec::new())));
         for (ix, format) in bodies.into_iter().enumerate() {
             self.formats[start + ix] = format.substitute_rec_var(start, n);
         }
@@ -1222,7 +1222,36 @@ impl FormatModule {
         names: [L; N],
         formats: [Box<dyn FnOnce(&[FormatRef; N]) -> Format>; N],
     ) -> [FormatRef; N] {
-        let start = self.reserve_batch_levels(names.into_iter().map(Into::into));
+        self.define_batch_with_args(names.map(|name| (name, Vec::new())), formats)
+    }
+
+    /// Registers a batch of `N` co-referential formats, any of which may take arguments.
+    ///
+    /// Behaves exactly like [`Self::define_batch_with`], except that each member is given a
+    /// parameter list alongside its name, in the same form [`Self::define_format_args`] takes. A
+    /// member with no parameters passes an empty `Vec`. Every member's parameters are recorded
+    /// when its level is reserved, before any builder runs, so a builder can already call itself
+    /// or any sibling with `.call_args(..)`, and the arguments of each such call are checked
+    /// against the callee's declared parameter types at registration.
+    ///
+    /// Arguments do not affect [`Self::check_batch_has_base_case`], which only looks at the
+    /// structure of each body: recursion that ends because of an argument value must still have a
+    /// non-recursive alternative on its cycle (e.g. a `Match` arm on that argument), and recursion
+    /// whose only exit is a `Where` on an argument is rejected.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::define_batch_with`].
+    pub fn define_batch_with_args<L: IntoLabel, const N: usize>(
+        &mut self,
+        signatures: [(L, Vec<(Label, ValueType)>); N],
+        formats: [Box<dyn FnOnce(&[FormatRef; N]) -> Format>; N],
+    ) -> [FormatRef; N] {
+        let start = self.reserve_batch_levels(
+            signatures
+                .into_iter()
+                .map(|(name, args)| (name.into(), args)),
+        );
         let refs: [FormatRef; N] = std::array::from_fn(|ix| FormatRef(start + ix));
 
         for (ix, build) in formats.into_iter().enumerate() {
@@ -1237,18 +1266,22 @@ impl FormatModule {
         refs
     }
 
-    /// Reserves `names.len()` contiguous levels, starting at the module's current length, each with
-    /// a placeholder (`Format::EMPTY`/`ValueType::Any`) body - so that a self- or forward-reference
-    /// to any reserved level (including one still awaiting its real body) resolves to a real, if
-    /// still type-provisional, slot rather than indexing out of bounds. Shared by
-    /// [`Self::define_batch_recvar`] and [`Self::define_batch_with`]; returns the starting
-    /// level.
-    fn reserve_batch_levels(&mut self, names: impl IntoIterator<Item = Label>) -> usize {
+    /// Reserves one level per `(name, args)` signature, contiguously from the module's current
+    /// length, each with its real parameter list but a placeholder (`Format::EMPTY`/`ValueType::Any`)
+    /// body - so that a self- or forward-reference to any reserved level (including one still
+    /// awaiting its real body) resolves to a real, if still type-provisional, slot rather than
+    /// indexing out of bounds, and is checked against the right number and types of arguments.
+    /// Shared by [`Self::define_batch_recvar`] and [`Self::define_batch_with_args`]; returns the
+    /// starting level.
+    fn reserve_batch_levels(
+        &mut self,
+        signatures: impl IntoIterator<Item = (Label, Vec<(Label, ValueType)>)>,
+    ) -> usize {
         let start = self.names.len();
-        for name in names {
+        for (name, args) in signatures {
             self.recursive_levels.insert(self.names.len());
             self.names.push(name);
-            self.args.push(Vec::new());
+            self.args.push(args);
             self.views.push(Vec::new());
             self.formats.push(Format::EMPTY);
             self.format_types.push(ValueType::Any);
@@ -1314,7 +1347,10 @@ impl FormatModule {
     /// Shared by [`Self::define_batch_recvar`] and [`Self::define_batch_with`].
     fn infer_batch_types(&mut self, start: usize, n: usize) {
         for ix in start..start + n {
-            let scope = TypeScope::with_rec_types(&self.format_types);
+            let mut scope = TypeScope::with_rec_types(&self.format_types);
+            for (arg_name, arg_type) in &self.args[ix] {
+                scope.push(arg_name.clone(), arg_type.clone());
+            }
             let format_type = match self.infer_format_type(&scope, &self.formats[ix]) {
                 Ok(t) => t,
                 Err(msg) => panic!("Failed to solve type for {}: {msg}", self.names[ix]),
@@ -4408,6 +4444,106 @@ mod test {
                     Format::Variant(
                         Label::Borrowed("S"),
                         Box::new(Format::Tuple(vec![is_byte(b'S'), Format::RecVar(0)])),
+                    ),
+                ])
+            })],
+        );
+    }
+
+    /// `down(n) := 'a'{n} ~ ('Z' | 'S' ~ down(n + 1))`: each level reads one more `'a'` than the
+    /// last, so whether an input decodes depends on the argument each recursive call passes.
+    /// The parameterized member is batch index 0, never reached through a call while the batch
+    /// is type-checked.
+    fn define_down(module: &mut FormatModule) -> FormatRef {
+        use crate::helper::{add, is_byte, repeat_count, tuple, var};
+
+        let [down] = module.define_batch_with_args(
+            [("test.down", vec![(Label::Borrowed("n"), ValueType::U8)])],
+            [Box::new(|&[down]: &[FormatRef; 1]| {
+                tuple([
+                    repeat_count(var("n"), is_byte(b'a')),
+                    Format::Union(vec![
+                        Format::Variant(Label::Borrowed("Z"), Box::new(is_byte(b'Z'))),
+                        Format::Variant(
+                            Label::Borrowed("S"),
+                            Box::new(tuple([
+                                is_byte(b'S'),
+                                down.call_args(vec![add(var("n"), Expr::U8(1))]),
+                            ])),
+                        ),
+                    ]),
+                ])
+            })],
+        );
+        down
+    }
+
+    #[test]
+    fn define_batch_with_args_self_recursive_decodes() {
+        let mut module = FormatModule::new();
+        let down = define_down(&mut module);
+
+        let prog =
+            super::decoder::Compiler::compile_program(&module, &down.call_args(vec![Expr::U8(0)]))
+                .unwrap();
+        assert!(prog.run(ReadCtxt::new(b"SaSaaZ")).is_ok());
+        // Same shape, but the innermost level reads one `'a'` where `n = 2` requires two.
+        assert!(prog.run(ReadCtxt::new(b"SaSaZ")).is_err());
+    }
+
+    /// Mutual recursion where only one member takes an argument: `ping` (no parameters) passes
+    /// `pong` how many `'b'`s to read. `pong` comes first in the batch, so it is not reached
+    /// through a call while the batch is type-checked.
+    #[test]
+    fn define_batch_with_args_mutual_recursion_decodes() {
+        use crate::helper::{is_byte, repeat_count, tuple, var};
+
+        let mut module = FormatModule::new();
+        let [_pong, ping] = module.define_batch_with_args(
+            [
+                ("test.pong", vec![(Label::Borrowed("k"), ValueType::U8)]),
+                ("test.ping", vec![]),
+            ],
+            [
+                Box::new(|&[_pong, ping]: &[FormatRef; 2]| {
+                    tuple([repeat_count(var("k"), is_byte(b'b')), ping.call()])
+                }),
+                Box::new(|&[pong, _ping]: &[FormatRef; 2]| {
+                    Format::Union(vec![
+                        Format::Variant(Label::Borrowed("Z"), Box::new(is_byte(b'Z'))),
+                        Format::Variant(
+                            Label::Borrowed("A"),
+                            Box::new(tuple([is_byte(b'A'), pong.call_args(vec![Expr::U8(2)])])),
+                        ),
+                    ])
+                }),
+            ],
+        );
+
+        let prog = super::decoder::Compiler::compile_program(&module, &ping.call()).unwrap();
+        assert!(prog.run(ReadCtxt::new(b"AbbAbbZ")).is_ok());
+        assert!(prog.run(ReadCtxt::new(b"AbbAbZ")).is_err());
+    }
+
+    /// A batch member calling itself with an argument of the wrong type is rejected at
+    /// registration.
+    #[test]
+    #[should_panic(expected = "Failed to solve type for test.bad_arg")]
+    fn define_batch_with_args_rejects_ill_typed_self_call_argument() {
+        use crate::helper::is_byte;
+
+        let mut module = FormatModule::new();
+        let _ = module.define_batch_with_args(
+            [("test.bad_arg", vec![(Label::Borrowed("n"), ValueType::U8)])],
+            [Box::new(|&[bad]: &[FormatRef; 1]| {
+                Format::Union(vec![
+                    Format::Variant(Label::Borrowed("Z"), Box::new(is_byte(b'Z'))),
+                    Format::Variant(
+                        Label::Borrowed("S"),
+                        Box::new(Format::Tuple(vec![
+                            is_byte(b'S'),
+                            bad.call_args(vec![Expr::Tuple(vec![])]),
+                        ])),
                     ),
                 ])
             })],

@@ -1171,6 +1171,41 @@ mod fixture_gen {
         write!(f, "{}", frag).unwrap();
     }
 
+    /// A recursive batch member taking an argument (`down(n)`, which reads `n` `'a'`s and then
+    /// either stops or calls `down(n + 1)`): the generated decoder must pass the argument through
+    /// its own recursive call, or `tests/recursive_args/mod.rs` fails to compile or to decode.
+    #[test]
+    fn recursive_args_behavior_test() {
+        let mut module = FormatModule::new();
+        let [down] = module.define_batch_with_args(
+            [("test.down", vec![(Label::Borrowed("n"), ValueType::U8)])],
+            [Box::new(|&[down]: &[FormatRef; 1]| {
+                record([
+                    ("pad", repeat_count(var("n"), is_byte(b'a'))),
+                    (
+                        "rest",
+                        Format::Union(vec![
+                            Format::Variant(Label::Borrowed("Z"), Box::new(is_byte(b'Z'))),
+                            Format::Variant(
+                                Label::Borrowed("S"),
+                                Box::new(record([
+                                    ("tag", is_byte(b'S')),
+                                    ("next", down.call_args(vec![add(var("n"), Expr::U8(1))])),
+                                ])),
+                            ),
+                        ]),
+                    ),
+                ])
+            })],
+        );
+        let main = module.define_format("test.main", down.call_args(vec![Expr::U8(0)]));
+        let top = main.call();
+        let frag = generate_code(&module, &top).to_fragment();
+        const TEST_PATH: &str = "tests/recursive_args/mod.rs";
+        let mut f = File::create(TEST_PATH).unwrap();
+        write!(f, "{}", frag).unwrap();
+    }
+
     #[test]
     #[ignore = "running this test clobbers the manually-edited test file for permit_state_error"]
     /// Test to pre-generate a Permit-parse of a slice we will peek within and manually remove the 'close_peek' within to cause a state-error we want to see

@@ -4012,7 +4012,21 @@ impl TypeChecker {
         let scope = UScope::Empty;
         let ctxt = Ctxt::new(module, &scope);
         for level in levels.clone() {
-            this.infer_var_format_level(level, ctxt, None)?;
+            if this.level_vars.contains_key(&level) {
+                // Already inferred, as the callee of an earlier member, with that call's
+                // arguments bound to its parameters.
+                continue;
+            }
+            // Not reached through any call yet, so its parameters are bound here, to their
+            // declared types, as the `Format::ItemVar` arm would bind them to a call's arguments.
+            let mut arg_scope = UMultiScope::new(&scope);
+            for (lbl, vt) in module.get_args(level) {
+                let v_arg = this.get_new_uvar();
+                this.unify_var_valuetype(v_arg, vt)?;
+                arg_scope.push(lbl.clone(), v_arg);
+            }
+            let level_scope = UScope::Multi(&arg_scope);
+            this.infer_var_format_level(level, ctxt.with_scope(&level_scope), None)?;
         }
 
         let mut level_of: HashMap<UVar, Vec<usize>> = HashMap::new();

@@ -30,6 +30,11 @@ name = "recursive_maybe"
 path = "tests/recursive_maybe/mod.rs"
 
 [[test]]
+name = "recursive_args"
+path = "tests/recursive_args/mod.rs"
+test = true
+
+[[test]]
 name = "permit_state_error"
 path = "tests/permit_state_error/mod.rs"
 test = true
