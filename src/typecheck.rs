@@ -1954,7 +1954,8 @@ impl TypeChecker {
                 let ret = bs.unify(BaseSet::Single(*b))?.to_constraint();
                 Ok(ret)
             }
-            UType::Hole => Ok(bs.to_constraint()),
+            // `Empty` (the type of `Format::Fail`) is bottom, as in `unify_utype`.
+            UType::Hole | UType::Empty => Ok(bs.to_constraint()),
             _other => Err(UnificationError::Unsatisfiable(
                 Constraint::Equiv(ut),
                 bs.to_constraint(),
@@ -1989,7 +1990,8 @@ impl TypeChecker {
                 Ok(ret.to_constraint())
             }
             UType::Base(b) => Self::unify_basetype_intset(*b, ints),
-            UType::Hole => Ok(ints.to_constraint()),
+            // `Empty` (the type of `Format::Fail`) is bottom, as in `unify_utype`.
+            UType::Hole | UType::Empty => Ok(ints.to_constraint()),
             _other => Err(UnificationError::Unsatisfiable(
                 Constraint::Equiv(ut),
                 ints.to_constraint(),
@@ -2203,6 +2205,8 @@ impl TypeChecker {
                     (proj, UType::Var(var)) => {
                         self.unify_var_constraint(*var, Constraint::Proj(proj.clone()))
                     }
+                    // `Empty` (the type of `Format::Fail`) is bottom, as in `unify_utype`.
+                    (proj, UType::Empty) => Ok(Constraint::Proj(proj.clone())),
                     (ProjShape::RecordWith(fld_p), typ) => match typ {
                         UType::Record(fld_ut) => {
                             let keys_p = fld_p.keys().cloned().collect::<HashSet<_>>();
@@ -5398,5 +5402,68 @@ mod tests {
 
         TypeChecker::infer_module(&module, &peano_ref.call())
             .expect("a self-recursive format indirected through a union arm must typecheck");
+    }
+
+    /// The value of `Format::Fail` (`UType::Empty`) is used as `kind` requires: an arithmetic
+    /// operand (`Constraint::Elem`) or a comparison operand (`Constraint::NumTree`). `Empty` is
+    /// bottom, so each must typecheck. (Using it directly as a sequence is rejected earlier, by
+    /// registration's own inference; `fail_branch_of_flattened_sequence_typechecks` covers the
+    /// `ProjShape::SeqOf` case.)
+    fn typecheck_use_of_fail_value(kind: &str) -> TCResult<()> {
+        use crate::helper::{add, chain, expr_eq, var};
+
+        let body = match kind {
+            "arith" => compute(add(var("v"), Expr::U8(1))),
+            "intrel" => compute(expr_eq(var("v"), Expr::U8(1))),
+            _ => unreachable!(),
+        };
+        let mut module = FormatModule::new();
+        let f = module.define_format("test.fail_value", chain(Format::Fail, "v", body));
+        TypeChecker::infer_module(&module, &f.call()).map(|_| ())
+    }
+
+    #[test]
+    fn fail_value_unifies_with_arith_operand() {
+        typecheck_use_of_fail_value("arith").expect("Empty is bottom");
+    }
+
+    #[test]
+    fn fail_value_unifies_with_intrel_operand() {
+        typecheck_use_of_fail_value("intrel").expect("Empty is bottom");
+    }
+
+    /// The shape that found the `SeqOf` case: a `Fail` branch of an `if_then_else` whose
+    /// sequence-valued result is appended to and flattened (from the PDF prototype's
+    /// `string_in_parens`/`string_chars`).
+    #[test]
+    fn fail_branch_of_flattened_sequence_typechecks() {
+        use crate::helper::{
+            byte_in, cons, expr_eq, flat_map, if_then_else, is_byte, lambda, map, repeat, snoc, var,
+        };
+
+        let lim = || vec![(Label::from("lim"), ValueType::Base(BaseType::U64))];
+        let mut module = FormatModule::new();
+        let inner = module.define_format_args(
+            "test.inner",
+            lim(),
+            if_then_else(
+                expr_eq(var("lim"), Expr::U64(0)),
+                Format::Fail,
+                cons(
+                    is_byte(b'('),
+                    snoc(repeat(byte_in(b'a'..=b'z')), is_byte(b')')),
+                ),
+            ),
+        );
+        let chars = module.define_format_args(
+            "test.chars",
+            lim(),
+            map(
+                repeat(inner.call_args(vec![var("lim")])),
+                lambda("xs", flat_map(lambda("x", var("x")), var("xs"))),
+            ),
+        );
+        TypeChecker::infer_module(&module, &chars.call_args(vec![Expr::U64(2)]))
+            .expect("a Fail branch is bottom");
     }
 }
