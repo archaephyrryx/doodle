@@ -1,14 +1,26 @@
-use std::ops::Range;
+use std::ops::RangeInclusive;
 
 use doodle::{
     BaseType, Expr, Format, FormatModule, FormatRef, IntoLabel, Label, Pattern, ValueType,
     helper::*, prelude::ByteSet,
 };
+use doodle_numexpr_macro::numexpr;
 
+// SECTION - DaeDaLus-PDF-specific helpers
+/// Format that parses nothing and returns a byte-sequence meant to be an ascii string
+fn const_str(str: &[u8]) -> Format {
+    compute(
+        Expr::Seq(
+            str.iter().copied().map(Expr::U8).collect()
+        )
+    )
+}
+
+/// Parses a single case-insensitive ASCII hex-digit into the numeric value of that digit: '0' goes to `0u8`, 'F' and 'f' go to `15u8`
 fn hex_val() -> Format {
-    const HEX09: Range<u8> = b'0'..b'9';
-    const HEX_MAJ: Range<u8> = b'A'..b'F';
-    const HEX_MIN: Range<u8> = b'a'..b'f';
+    const HEX09: RangeInclusive<u8> = b'0'..=b'9';
+    const HEX_MAJ: RangeInclusive<u8> = b'A'..=b'F';
+    const HEX_MIN: RangeInclusive<u8> = b'a'..=b'f';
 
     union([
         map(byte_in(HEX09), lambda("b", sub(var("b"), Expr::U8(b'0')))),
@@ -23,6 +35,49 @@ fn hex_val() -> Format {
     ])
 }
 
+/// Reads `len` bytes of hex-digits and returns the u32-value with that hexstring-representation
+fn hex_num_u32(len: usize) -> Format {
+    let raw = repeat_count(Expr::U32(len as u32), hex_val());
+    map(
+        raw,
+        lambda(
+            "raw",
+            left_fold(
+                lambda_tuple(["acc", "b"], add(var("b"), mul(var("acc"), Expr::U32(16)))),
+                Expr::U32(0),
+                ValueType::Base(BaseType::U32),
+                var("raw"),
+            ),
+        ),
+    )
+}
+
+fn octal_val() -> Format {
+    const OCTAL: RangeInclusive<u8> = b'0'..=b'7';
+
+    map(byte_in(OCTAL), lambda("b", sub(var("b"), Expr::U8(b'0'))))
+}
+
+fn octal_num_u8(len_min: u32, len_max: u32) -> Format {
+    let raw = repeat_between(len_min, len_max, octal_val());
+
+    map(
+        raw,
+        lambda(
+            "raw",
+            left_fold(
+                lambda_tuple(["acc", "b"], as_u8(numeric(numexpr!("acc" * 8 + "b")))),
+                Expr::U8(0),
+                ValueType::Base(BaseType::U8),
+                var("raw"),
+            ),
+        ),
+    )
+}
+
+/// Daedalus style record
+///
+/// Treat `$$` as a singleton-specifier, otherwise equivalent to record-auto
 fn record_daedalus<Name: IntoLabel + AsRef<str>>(
     fields: impl IntoIterator<Item = (Name, Format), IntoIter: DoubleEndedIterator>,
 ) -> Format {
@@ -55,22 +110,12 @@ fn record_daedalus<Name: IntoLabel + AsRef<str>>(
     record_ext(fields_ext, true)
 }
 
-fn hex_num_u32(len: usize) -> Format {
-    let raw = repeat_count(Expr::U32(len as u32), hex_val());
-    map(
-        raw,
-        lambda(
-            "raw",
-            left_fold(
-                lambda_tuple(["acc", "b"], add(var("b"), mul(var("acc"), Expr::U32(16)))),
-                Expr::U32(0),
-                ValueType::Base(BaseType::U32),
-                var("raw"),
-            ),
-        ),
-    )
-}
 
+/// Given a sequence of `(f -> e)` mappings, produces a union whose parse-tree is built
+/// using `f` but whose parse-output is the computation of `e` for the chosen branch.
+///
+/// Useful for turning raw byte-parses into meaningful value-level data, e.g. converting
+/// byte-strings to interpreted values.
 fn interpret(assocs: impl IntoIterator<Item = (Format, Expr)>) -> Format {
     union(assocs.into_iter().map(|(f, e)| monad_seq(f, compute(e))))
 }
@@ -96,10 +141,19 @@ fn void(f: Format) -> Format {
 }
 
 /// Matches a string (as bytes) exactly, and returns it as a Seq(u8)
+#[inline(always)]
 fn match_str(bytes: &[u8]) -> Format {
     byte_seq(bytes)
 }
 
+/// Parses `format` and silently consumes an EOL token (failing if not the EOL token is not found)
+fn then_eol(format: Format, eol: FormatRef) -> Format {
+    chain(format, "ret", monad_seq(eol.call(), compute(var("ret"))))
+}
+// !SECTION
+
+
+// SECTION - ASCII value and group consts
 const ASCII_LF: u8 = b'\n';
 const ASCII_CR: u8 = b'\r';
 
@@ -109,43 +163,56 @@ const ASCII_FF: u8 = b'\x0c';
 const ASCII_SPACE: u8 = b' ';
 
 const __WS_MASK: u64 = 1u64 | 1 << ASCII_TAB | 1 << ASCII_FF | 1 << ASCII_SPACE;
-const SIMPLE_WS: ByteSet = ByteSet::from_bits([__WS_MASK, 0, 0, 0]);
 
-const DIGIT: ByteSet = ByteSet::from_bits([0b11_1111_1111 << b'0', 0, 0, 0]);
+/// Const ByteSet for daedalus `$simpleWS`
+///
+/// ```
+/// # use doodle::prelude::ByteSet;
+/// # use doodle_pdf::pdf::SIMPLE_WS;
+/// let simple_ws = ByteSet::from([b'\0', b'\t', 0x0C, b' ']);
+/// assert_eq!(simple_ws, SIMPLE_WS);
+/// ```
+pub const SIMPLE_WS: ByteSet = ByteSet::from_bits([__WS_MASK, 0, 0, 0]);
 
-pub fn main(module: &mut FormatModule) -> FormatRef {
-    {
-        let _simple_ws = ByteSet::from([b'\0', b'\t', 0x0C, b' ']);
-        debug_assert_eq!(_simple_ws, SIMPLE_WS);
+/// Const ByteSet for daedalus Digit
+///
+/// ```
+/// # use doodle::prelude::ByteSet;
+/// # use doodle_pdf::pdf::DIGIT;
+/// let digit = ByteSet::from(b'0'..=b'9');
+/// debug_assert_eq!(digit, DIGIT);
+/// ```
+pub const DIGIT: ByteSet = ByteSet::from_bits([0b11_1111_1111 << b'0', 0, 0, 0]);
+// !SECTION
 
-        let _digit = ByteSet::from(b'0'..=b'9');
-        debug_assert_eq!(_digit, DIGIT);
-    }
-
-    let inline_char = Format::Byte(ByteSet::from([ASCII_LF, ASCII_CR]).complement());
-
-
-    let simple_eol = module.define_format(
+fn simple_eol(module: &mut FormatModule) -> FormatRef {
+    module.define_format(
         "pdf.util.simple_eol",
         Format::UnionNondet(vec![
             void(is_bytes(&[ASCII_CR, ASCII_LF])),
             void(is_byte(ASCII_LF)),
         ]),
-    );
+    )
+}
 
-    let eol = module.define_format(
+fn eol(module: &mut FormatModule, simple_eol: FormatRef) -> FormatRef {
+    module.define_format(
         "pdf.util.eol",
         Format::UnionNondet(vec![simple_eol.call(), void(is_byte(ASCII_CR))]),
-    );
+    )
+}
 
-    let then_eol =
-        |format: Format| chain(format, "ret", monad_seq(eol.call(), compute(var("ret"))));
 
-    let comment = module.define_format(
+
+fn comment(module: &mut FormatModule, eol: FormatRef) -> FormatRef {
+    let inline_char = Format::Byte(ByteSet::from([ASCII_LF, ASCII_CR]).complement());
+    module.define_format(
         "pdf.util.comment",
         monad_seq(is_byte(b'%'), monad_seq(repeat(inline_char), eol.call())),
-    );
+    )
+}
 
+fn any_ws(module: &mut FormatModule, eol: FormatRef, comment: FormatRef) -> FormatRef {
     let any_ws = module.define_format(
         "pdf.util.any_ws",
         Format::UnionNondet(vec![
@@ -154,26 +221,68 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
             eol.call(),               // EOL
         ]),
     );
+    any_ws
+}
 
-    let token = |f: Format| {
-        chain(
-            f,
-            "tok",
-            monad_seq(repeat(any_ws.call()), compute(var("tok"))),
-        )
-    };
+/// Daedalus `HexString`: hex digits between `<` and `>`, with whitespace allowed between
+/// digits, read pairwise into bytes; an odd final digit is read as if followed by `0`.
+fn v_hex_string(any_ws: FormatRef) -> Format {
+    // The digits are parsed as a flat sequence of nibbles and paired up afterwards. Parsing
+    // pairs directly would need unbounded lookahead (past whitespace and comments) to decide
+    // whether a digit starts another pair or is the odd final one.
+    let nibbles = repeat(token(hex_val(), any_ws));
 
-    let kw = |b: &[u8]| token(match_str(b));
+    // Fold state: (bytes so far, whether a high nibble is pending, the pending high nibble)
+    let acc_type = ValueType::Tuple(vec![
+        ValueType::Seq(Box::new(ValueType::Base(BaseType::U8))),
+        ValueType::Base(BaseType::Bool),
+        ValueType::Base(BaseType::U8),
+    ]);
+    let bytes = || tuple_proj(var("acc"), 0);
+    let has_hi = || tuple_proj(var("acc"), 1);
+    let hi = || tuple_proj(var("acc"), 2);
+    let step = lambda_tuple(
+        ["acc", "nib"],
+        expr_if_else(
+            has_hi(),
+            Expr::Tuple(vec![
+                append(
+                    bytes(),
+                    Expr::Seq(vec![add(mul(hi(), Expr::U8(16)), var("nib"))]),
+                ),
+                Expr::Bool(false),
+                Expr::U8(0),
+            ]),
+            Expr::Tuple(vec![bytes(), Expr::Bool(true), var("nib")]),
+        ),
+    );
+    let init = Expr::Tuple(vec![Expr::Seq(vec![]), Expr::Bool(false), Expr::U8(0)]);
+    let finish = expr_if_else(
+        has_hi(),
+        append(bytes(), Expr::Seq(vec![mul(hi(), Expr::U8(16))])),
+        bytes(),
+    );
 
-    let between = |open: &[u8], close: &[u8], f: Format| {
-        monad_seq(
-            kw(open),
-            chain(f, "val", monad_seq(kw(close), compute(var("val")))),
-        )
-    };
+    between(
+        b"<",
+        b">",
+        map(
+            map(
+                nibbles,
+                lambda("nibs", left_fold(step, init, acc_type, var("nibs"))),
+            ),
+            lambda("acc", finish),
+        ),
+        any_ws,
+    )
+}
 
-    let natural = module.define_format("pdf.util.natural", repeat1(Format::Byte(DIGIT)));
+fn natural(module: &mut FormatModule) -> FormatRef {
+    module.define_format("pdf.util.natural", repeat1(Format::Byte(DIGIT)))
+}
 
+// TODO: add support to allow de-stringification of numbers
+fn number(module: &mut FormatModule, natural: FormatRef) -> FormatRef {
     let unsigned_lead_digits = chain(
         natural.call(),
         "n",
@@ -196,8 +305,7 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
         ]),
     );
 
-    // TODO: add support to allow de-stringification of numbers
-    let number = module.define_format(
+    module.define_format(
         "pdf.util.number",
         union([
             monad_seq(
@@ -215,18 +323,87 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
             ),
             monad_seq(optional(is_byte(b'+')), unsigned_number.call()),
         ]),
+    )
+}
+
+fn v_string(module: &mut FormatModule, any_ws: FormatRef, eol: FormatRef) -> Format {
+    // TODO - octal escapes (`\ddd`, up to three digits, read greedily). `MatchTree` rejects
+    // `map(octal_num_u8(1, 3), lambda("c", Expr::Seq(vec![var("c")])))` here as ambiguous: after
+    // `\10`, a following digit could be the escape's third digit or the start of a plain chunk,
+    // and there is no greedy repetition to settle it.
+    let string_esc = monad_seq(
+        is_byte(b'\\'),
+        interpret([
+            (is_byte(b'n'), Expr::Seq(vec![Expr::U8(b'\n')])),
+            (is_byte(b'r'), Expr::Seq(vec![Expr::U8(b'\r')])),
+            (is_byte(b't'), Expr::Seq(vec![Expr::U8(b'\t')])),
+            (is_byte(b'b'), Expr::Seq(vec![Expr::U8(b'\x08')])),
+            (is_byte(b'f'), Expr::Seq(vec![Expr::U8(b'\x0c')])),
+            (is_byte(b'('), Expr::Seq(vec![Expr::U8(b'(')])),
+            (is_byte(b')'), Expr::Seq(vec![Expr::U8(b')')])),
+            (is_byte(b'\\'), Expr::Seq(vec![Expr::U8(b'\\')])),
+            // A backslash before an end-of-line continues the string onto the next line
+            (eol.call(), Expr::Seq(vec![])),
+        ]),
     );
 
-    let v_null = void(kw(b"null"));
-    let v_bool = interpret([
-        (kw(b"true"), Expr::Bool(true)),
-        (kw(b"false"), Expr::Bool(false)),
-    ]);
-    let v_ref = record_auto([
-        ("obj", token(natural.call())),
-        ("gen", token(natural.call())),
-        ("__kw", kw(b"R")),
-    ]);
+    let lim = || vec![(Label::Borrowed("lim"), ValueType::Base(BaseType::U64))];
+    // Registration types a call to a *later* batch member as `Any`, which `snoc`'s `Append` and
+    // `flat_map` reject, so each member that appends to or flattens a sibling's result comes
+    // after that sibling.
+    let [_string_chunk, string_chars, _string_in_parens] = module.define_batch_with_args(
+        [
+            ("pdf.value.string_chunk", lim()),
+            ("pdf.value.string_chars", lim()),
+            ("pdf.value.string_in_parens", lim()),
+        ],
+        [
+            Box::new(move |&[_, _, string_in_parens]: &[FormatRef; 3]| {
+                Format::UnionNondet(vec![
+                    string_in_parens.call_args(vec![var("lim")]),
+                    string_esc,
+                    // One byte per chunk: a `repeat1` here would make `string_chars`'s `repeat`
+                    // ambiguous (`aa` is one chunk or two). The flattened result is the same.
+                    map(
+                        byte_in(ByteSet::from(*b"\\()").complement()),
+                        lambda("b", Expr::Seq(vec![var("b")])),
+                    ),
+                ])
+            }),
+            Box::new(|&[string_chunk, _, _]: &[FormatRef; 3]| {
+                map(
+                    repeat(string_chunk.call_args(vec![var("lim")])),
+                    lambda("xs", flat_map(lambda("x", var("x")), var("xs"))),
+                )
+            }),
+            Box::new(|&[_, string_chars, _]: &[FormatRef; 3]| {
+                // The nesting check follows the '(' rather than preceding it, so that this
+                // member always consumes a byte: a leading `Fail` branch counts as matching
+                // nothing, which makes `string_chars`'s `repeat` of it a nullable repeat.
+                cons(
+                    is_byte(b'('),
+                    if_then_else(
+                        expr_eq(var("lim"), Expr::U64(0)),
+                        Format::Fail, // "string nesting limit exceeded"
+                        snoc(
+                            string_chars.call_args(vec![sub(var("lim"), Expr::U64(1))]),
+                            is_byte(b')'),
+                        ),
+                    ),
+                )
+            }),
+        ],
+    );
+
+    record_daedalus([
+        ("__open", is_byte(b'(')),
+        ("$$", string_chars.call_args(vec![Expr::U64(16)])),
+        ("__close", is_byte(b')')),
+        ("__skipWS", repeat(any_ws.call())),
+    ])
+}
+
+fn v_name(module: &mut FormatModule, any_ws: FormatRef) -> FormatRef {
     let name_char = {
         let ok_raw = ByteSet::from(*b"\0\t\n\x0C\r ()<>[]{}/%#").complement();
         let name_esc = monad_seq(
@@ -235,50 +412,27 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
         );
         union([Format::Byte(ok_raw), name_esc])
     };
-    let v_name = module.define_format(
+    module.define_format(
         "pdf.value.name",
-        token(cons(is_byte(b'/'), repeat(name_char))),
-    );
-    let v_string = {
-        let string_in_parens = module.define_format_args(
-            "pdf.value.string_in_parens",
-            vec![(Label::Borrowed("lim"), ValueType::Base(BaseType::U64))],
-            if_then_else(
-                expr_eq(var("lim"), Expr::U64(0)),
-                Format::Fail, // "string nesting limit exceeded"
-                snoc(cons(match_str(b"("), todo!()), match_str(b")")), // TODO: support mutual recursion
-            ),
-        );
+        token(cons(is_byte(b'/'), repeat(name_char)), any_ws),
+    )
+}
 
-        let string_esc = todo!();
 
-        let string_chunk = module.define_format_args(
-            "pdf.value.string_chunk",
-            vec![(Label::Borrowed("lim"), ValueType::Base(BaseType::U64))],
-            Format::UnionNondet(vec![
-                string_in_parens.call_args(vec![var("lim")]),
-                string_esc,
-                repeat1(byte_in(ByteSet::from(*b"\\()").complement())),
-            ]),
-        );
+fn pdf_value(module: &mut FormatModule, any_ws: FormatRef, eol: FormatRef, natural: FormatRef, v_name: FormatRef) -> FormatRef {
+    let v_null = void(kw(b"null", any_ws));
+    let v_bool = interpret([
+        (kw(b"true", any_ws), Expr::Bool(true)),
+        (kw(b"false", any_ws), Expr::Bool(false)),
+    ]);
+    let v_ref = record_auto([
+        ("obj", token(natural.call(), any_ws)),
+        ("gen", token(natural.call(), any_ws)),
+        ("__kw", kw(b"R", any_ws)),
+    ]);
 
-        let string_chars = module.define_format_args(
-            "pdf.value.string_chars",
-            vec![(Label::Borrowed("lim"), ValueType::Base(BaseType::U64))],
-            map(
-                repeat(string_chunk.call_args(vec![var("lim")])),
-                lambda("xs", flat_map(lambda("x", var("x")), var("xs"))),
-            ),
-        );
-
-        record_daedalus([
-            ("__open", is_byte(b'(')),
-            ("$$", string_chars.call_args(vec![Expr::U64(16)])),
-            ("__close", is_byte(b')')),
-            ("__skipWS", repeat(any_ws.call())),
-        ])
-    };
-    let v_hex_string = { todo!() };
+    let v_string = v_string(module, any_ws, eol);
+    let v_hex_string = v_hex_string(any_ws);
     let pdf_value = module.define_format(
         "pdf.value",
         alts_nondet([
@@ -290,6 +444,43 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
             ("string", v_hex_string),
         ]),
     );
+    pdf_value
+}
+
+
+fn token(f: Format, any_ws: FormatRef) -> Format {
+    chain(
+        f,
+        "tok",
+        monad_seq(repeat(any_ws.call()), compute(var("tok"))),
+    )
+}
+
+fn kw(b: &[u8], any_ws: FormatRef) -> Format {
+    token(match_str(b), any_ws)
+}
+
+fn between(open: &[u8], close: &[u8], f: Format, any_ws: FormatRef) -> Format {
+    monad_seq(
+        kw(open, any_ws),
+        chain(f, "val", monad_seq(kw(close, any_ws), compute(var("val")))),
+    )
+}
+
+pub fn main(module: &mut FormatModule) -> FormatRef {
+    let simple_eol = simple_eol(module);
+    let eol = eol(module, simple_eol);
+    let comment = comment(module, eol);
+
+    let any_ws = any_ws(module, eol, comment);
+
+    let v_name = v_name(module, any_ws);
+
+
+    let natural = natural(module);
+    let number = number(module, natural);
+
+    let pdf_value = pdf_value(module, any_ws, eol, natural, v_name);
     let pdf_value_type = module.get_format_type(pdf_value.get_level()).clone();
     let stream: FormatRef = todo!("implement Stream (val : Value)");
     let top_decl_def = module.define_format_args(
@@ -303,12 +494,12 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
     let obj_decl = module.define_format(
         "pdf.object",
         record_auto([
-            ("id", token(natural.call())),
-            ("gen", token(natural.call())),
-            ("__kw_obj", kw(b"obj")),
+            ("id", token(natural.call(), any_ws)),
+            ("gen", token(natural.call(), any_ws)),
+            ("__kw_obj", kw(b"obj", any_ws)),
             ("_val", pdf_value.call()),
             ("obj", top_decl_def.call_args(vec![var("_val")])),
-            ("__kw_end", kw(b"endobj")),
+            ("__kw_end", kw(b"endobj", any_ws)),
         ]),
     );
     let cross_ref_section: FormatRef = todo!();
@@ -323,13 +514,14 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
                     ("key", v_name.call()),
                     ("value", pdf_value.call_args(vec![var("lim")])),
                 ])),
+                any_ws,
             ),
         );
 
         module.define_format("pdf.util.pdf-dict", dict.call_args(vec![Expr::U64(32)]))
     };
 
-    let trailer = module.define_format("pdf.trailer", monad_seq(kw(b"trailer"), pdf_dict.call()));
+    let trailer = module.define_format("pdf.trailer", monad_seq(kw(b"trailer", any_ws), pdf_dict.call()));
 
     let pdf_chunk = module.define_format(
         "pdf.chunk",
@@ -337,21 +529,21 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
             ("objects", repeat(obj_decl.call())),
             ("xref", cross_ref_section.call()),
             ("trailer", trailer.call()),
-            ("__start_xref", then_eol(match_str(b"startxref"))),
-            ("declared_start_xref", then_eol(natural.call())),
-            ("__kw_eof", kw(b"%%EOF")),
+            ("__start_xref", then_eol(match_str(b"startxref"), eol)),
+            ("declared_start_xref", then_eol(natural.call(), eol)),
+            ("__kw_eof", kw(b"%%EOF", any_ws)),
         ]),
     );
 
     module.define_format(
-        "pdf.main",
-        only(record_auto([
-            (
-                "version",
-                skip_to(monad_seq(is_bytes(b"%PDF-"), number.call())),
-            ),
-            ("chunks", repeat(pdf_chunk.call())),
-            ("__rem", repeat(any_ws.call())),
-        ])),
-    )
+    "pdf.main",
+    only(record_auto([
+        (
+            "version",
+            skip_to(monad_seq(is_bytes(b"%PDF-"), number.call())),
+        ),
+        ("chunks", repeat(pdf_chunk.call())),
+        ("__rem", repeat(any_ws.call())),
+    ])),
+)
 }
