@@ -331,21 +331,25 @@ fn v_string(module: &mut FormatModule, any_ws: FormatRef, eol: FormatRef) -> For
     // `map(octal_num_u8(1, 3), lambda("c", Expr::Seq(vec![var("c")])))` here as ambiguous: after
     // `\10`, a following digit could be the escape's third digit or the start of a plain chunk,
     // and there is no greedy repetition to settle it.
-    let string_esc = monad_seq(
-        is_byte(b'\\'),
-        interpret([
-            (is_byte(b'n'), Expr::Seq(vec![Expr::U8(b'\n')])),
-            (is_byte(b'r'), Expr::Seq(vec![Expr::U8(b'\r')])),
-            (is_byte(b't'), Expr::Seq(vec![Expr::U8(b'\t')])),
-            (is_byte(b'b'), Expr::Seq(vec![Expr::U8(b'\x08')])),
-            (is_byte(b'f'), Expr::Seq(vec![Expr::U8(b'\x0c')])),
-            (is_byte(b'('), Expr::Seq(vec![Expr::U8(b'(')])),
-            (is_byte(b')'), Expr::Seq(vec![Expr::U8(b')')])),
-            (is_byte(b'\\'), Expr::Seq(vec![Expr::U8(b'\\')])),
-            // A backslash before an end-of-line continues the string onto the next line
-            (eol.call(), Expr::Seq(vec![])),
-        ]),
+    let known_esc = interpret([
+        (is_byte(b'n'), Expr::Seq(vec![Expr::U8(b'\n')])),
+        (is_byte(b'r'), Expr::Seq(vec![Expr::U8(b'\r')])),
+        (is_byte(b't'), Expr::Seq(vec![Expr::U8(b'\t')])),
+        (is_byte(b'b'), Expr::Seq(vec![Expr::U8(b'\x08')])),
+        (is_byte(b'f'), Expr::Seq(vec![Expr::U8(b'\x0c')])),
+        (is_byte(b'('), Expr::Seq(vec![Expr::U8(b'(')])),
+        (is_byte(b')'), Expr::Seq(vec![Expr::U8(b')')])),
+        (is_byte(b'\\'), Expr::Seq(vec![Expr::U8(b'\\')])),
+        // A backslash before an end-of-line continues the string onto the next line
+        (eol.call(), Expr::Seq(vec![])),
+    ]);
+    // Any other escaped byte stands for itself (the backslash is ignored). Octal digits are
+    // excluded so that an octal escape fails rather than silently decoding as its digits.
+    let unknown_esc = map(
+        byte_in(ByteSet::from(*b"nrtbf()\\\r\n01234567").complement()),
+        lambda("b", Expr::Seq(vec![var("b")])),
     );
+    let string_esc = monad_seq(is_byte(b'\\'), union([known_esc, unknown_esc]));
 
     let lim = || vec![(Label::Borrowed("lim"), ValueType::Base(BaseType::U64))];
     // Registration types a call to a *later* batch member as `Any`, which `snoc`'s `Append` and
