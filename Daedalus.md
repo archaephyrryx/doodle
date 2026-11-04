@@ -55,8 +55,8 @@ a decent amount of work (e.g. `UnionMultidet`).
 
 ## 3.4 (Repetition)
 
-* Kleene Star - `Many <P>` is just `Repeat`, while `Many (1..) <P>` is `Repeat`
-* Kleene Star with State - At least some cases of `many (x = s) <P>` can be emulated with `Map(Repeat, LeftFold)`, while `AccumUntil` might be usable in other cases; there may be cases where neither are applicable, in which case a more bespoke `Format` may be required.
+* Kleene Star - `Many <P>` is just `Repeat`, while `Many (1..) <P>` is `Repeat1`; bounded repetition `Many (n..m) <P>` is `RepeatBetween` (or `RepeatRange`)
+* Kleene Star with State - At least some cases of `many (x = s) <P>` can be emulated with `Map(Repeat, LeftFold)`, while `AccumUntil` might be usable in other cases. There is no generic `many (x = s) <P>` combinator, and implementing one would require a bespoke `Format`. Any particular instance can instead be written as a self-recursive format that takes the state as an argument (`FormatModule::define_batch_with_args`) and calls itself with the updated state, but this monomorphizes to a specific `P`: since formats cannot be parameterized over other formats, each choice of `P` needs its own recursive definition.
 * `map (k,v in c) <P>` and `for (x = s; k,v in c) <P>` could be emulated with `ForEach`, at least in certain instances.
 
 ## 3.5 (Branching)
@@ -66,7 +66,8 @@ a decent amount of work (e.g. `UnionMultidet`).
 ## 3.6 (Coercions)
 
 * There are no format-level types per-se, but various `Expr`s like `AsU64` and family accomplish much-the-same, albeit in a closed class rather with a constructive syntax.
-  * `as?` (dynamic safe coercion) is closest to what we have, since `AsU{8,16,32,64}`/`AsChar` are runtime-checked; we currently have nothing of the sort of `as` (static safe) or `as!` (static lossy) coercion
+  * `as?` (dynamic safe coercion) is closest to what `AsU{8,16,32,64}`/`AsChar` provide, since they are runtime-checked
+  * The numeric layer (`Expr::Cast`) supports Rust-style `as` casts, including truncating ones, which covers `as!` (static lossy) coercion; whether its arithmetic casts amount to `as` (static safe) coercion has not been checked
 
 ## 5.1 (Bitdata)
 
@@ -96,7 +97,7 @@ bitdata Uni where
 ```rust
 use doodle::helper::BitFieldKind::*;
 
-let packed = bit_fields_u32([ // <- this is not yet defined
+let packed = bit_fields_u32([
     BitsField { field_name: "x", bit_width: 8 },
     Reserved { bit_width: 16, check_zero: false },
     BitsField { field_name: "y", bit_width: 8 },
@@ -258,10 +259,12 @@ than a feature of the processing model, and aside from performance concerns,
 nothing would change if it were eliminated.
 
 Multiple paths cannot be explored in parallel, both for unbounded/indefinite-length
-repetitions as well as for more explicit alternations over N branches. There are currently only two places where nondeterministic unions are used:
+repetitions as well as for more explicit alternations over N branches. Nondeterministic unions
+(tried in order, falling back to the next branch on failure) are used in `doodle-formats` in three places:
 
 * At the top-level, for alternating between distinct data-formats (e.g. png, OpenType, gzip);
-* To allow fallback to uninterpreted bytes during speculative parsing of zlib-compressed UTF-8 in an `iTXt` PNG-chunk.
+* To allow fallback to uninterpreted bytes during speculative parsing of zlib-compressed UTF-8 in an `iTXt` PNG-chunk;
+* In `text.maybe_gzip`, to try gzip-compressed text before plain text.
 
-The latter usage is more of a band-aid against unwanted parse-failure, and is similar in usage
-to `Format::Permit`.
+The last two usages are more of a band-aid against unwanted parse-failure, and are similar in usage
+to `Format::Permit`. The PDF prototype (`experiments/doodle-pdf`) also uses them.
