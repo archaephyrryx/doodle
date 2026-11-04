@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 doodle = { path = "../../" }
+doodle-numexpr-macro = { path = "../../doodle-numexpr-macro" }
 doodle-formats = { path = "../../doodle-formats/" }
