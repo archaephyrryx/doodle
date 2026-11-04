@@ -4,13 +4,13 @@
 
 * `^<value>` is achievable through `compute`
 * `Fail <msg>` requires a refactor we have discussed but never implemented
-  * This could be a modification of `Fail` itself, or a wrapper using `StyleHint`
+  * This could be a modification of `Fail` itself, or a wrapper using `StyleHint` (see [#329](https://github.com/yeslogic/doodle/issues/329))
 * We don't have a notion of character classes for the parser `$[c]`, but we could emulate this with `ByteSet` constants
-* The closest thing to `Match <string>` is `is_bytes`, which stores an N-Tuple ([issue #260](https://github.com/yeslogic/doodle/issues/260) discusses this)
+* `Match <string>` is achievable through `byte_seq`
 
 ## 3.2 (Sequential Composition)
 
-The syntax `{ P1; ...; Pn }` can be emulated with `LetFormat`/`MonadSeq`.
+The syntax `{ P1; ...; Pn }` can be emulated with `LetFormat`/`MonadSeq`; `pseudo_record` in particular makes this trivial.
 
 ### Example Translations
 
@@ -29,13 +29,9 @@ def StatementSemi =
 
 ```rust
 let add2 =
-    chain(
-        base.u64be(), "x",
-        chain(
-            base.u64be(),
-            "y",
-            compute(add(var("x"), var("y")))
-        )
+    pseudo_record(
+        [("x", u64be()), ("y", u64be())],
+        compute(add(var("x"), var("y")))
     );
 
 let statement_semi =
@@ -54,7 +50,8 @@ let statement_semi =
 There is currently no way of performing *unbiased* composition in `doodle`; all parallel compositions
 are first-come-first-served and will bias towards the first non-error result.
 
-`<|` is therefore supported, while `|` is not.
+`First` (`<|`) is therefore supported, while `Choose` (`|`) is not. Adding support for `Choose` is possible but would require
+a decent amount of work (e.g. `UnionMultidet`).
 
 ## 3.4 (Repetition)
 
@@ -164,25 +161,54 @@ alias `type PointX = Point` as would be synthesized by the corresponding
 Daedalus declarations; instead, whichever type-name is preferred would win, and
 both formats would receive verbatim-identical type-ascriptions.
 
-While tagged unions in general are supportable, the example given for tagged
-unions cannot be constructed in `doodle` because of a lack of support for
-auto-recursive and mutually-recursive format-constructs. Implementing these is
-not *a priori* impossible, but would require a noticeable investment of effort
-into a design to support this, which would most notably require a
-termination-rule for otherwise infinitely-recursive type-checking.
+Through recursion support, the parsers as written are possible to express monomorphically,
+but cannot be polymorphic over parses due to the lack of format-dependent-format support.
+
+```ddl
+def List P =
+    First
+      Cons = Node P
+      Nil = Accept
+
+def Node P =
+    block
+      head = P
+      tail = List P
+```
+
+would end up as
+
+```rust
+let p: FormatRef = /* some monomorphic format */;
+let [list_p, node_p] = module.define_batch_with(
+    ["list_p", "node_p"],
+    [
+        Box::new(|list_node|
+            alts_nondet([
+                ("cons", list_node[1].call()),
+                ("nil", Format::EMPTY),
+            ])
+        ),
+        Box::new(|list_node|
+            record([
+                ("head", p.call()),
+                ("tail", list_node[0].call())
+            ])
+        ),
+    ]
+);
+```
 
 ## 6 (Lookahead and Stream Manipulation)
 
-The concept of a `Stream` is not first-class within the `Format` model of `doodle`,
-though there are various combinators that interact with it.
+The concept of a `Stream` is effectively one-to-one with `View`s within the `Format` model.
 
-* `GetStream` does not obviously have a one-to-one equivalent in `doodle`, though constructs that use it may be replicable in other ways
-* `Drop n s` does not properly exist as a first-class construction but can be emulated with some degree of ingenuity
-* `Take n s` itself is not quite analogous to anything in `doodle`
-* `SetStream` does not properly exist as a first-class construction but can be emulated with some degree of ingenuity
-* `Chunk n P` is equivalent to `Slice`
-* `Lookahead P` is equivalent to `Peek`
-* `WithStream` can be emulated using `DecodeBytes` up to a certain degree, where if the parser itself is responsible for determining where the stream ends, there may be issues in capturing the stream into a suitable buffer.
+* `GetStream` can be approached with `LetView(<ident>, /* ... */ vvar(<ident>) /* ... */)`
+* `Drop n s` is `s.offset(n)` (where `s :~ ViewExpr`)
+* `Take n s` has no direct equivalent but `Slice` within `ParseFromView` can simulate it
+* `SetStream` has no direct equivalent, but `WithStream` is analogous to `WithView` or `ParseFromView`
+* `Chunk n P` is equivalent to `Slice(n, P)`
+* `Lookahead P` is equivalent to `Peek(P)`
 
 ### Example
 
@@ -202,10 +228,24 @@ chain(
     Format::Pos,
     "base",
     repeat(
-        chain(base.u64be(), "offset",
+        chain(u64be(), "offset",
             with_relative_offset(Some(var("base")), var("offset"), parse_object)
         )
     )
+)
+```
+
+or
+
+```rust
+let_view(
+    "here",
+    repeat(
+        pseudo_record(
+            [("offset", u64be())],
+            parse_from_view(vvar("here").offset(var("offset")), parse_object),
+        ),
+    ),
 )
 ```
 
@@ -220,47 +260,8 @@ nothing would change if it were eliminated.
 Multiple paths cannot be explored in parallel, both for unbounded/indefinite-length
 repetitions as well as for more explicit alternations over N branches. There are currently only two places where nondeterministic unions are used:
 
-* At the top-level, for alternating between distinct data-formats (e.g. png, OpenType, gzip); and secondly, to allow fallback to uninterpreted bytes during speculative
-parsing of zlib-compressed UTF-8 in an `iTXt` PNG-chunk.
+* At the top-level, for alternating between distinct data-formats (e.g. png, OpenType, gzip);
+* To allow fallback to uninterpreted bytes during speculative parsing of zlib-compressed UTF-8 in an `iTXt` PNG-chunk.
 
-The latter usage is more of a band-aid against unwanted parse-failure, and due
-to the limitations of the error-propagation model whereby high-confidence
-partial-parses of a given top-format are nevertheless rejected altogether when
-even a single, possibly trivial component encounters uncaught parse-failure.
-Aside from mitigation within the operational model that would allow
-determinations such as 'correct format, malformed data', there are ways to get
-around this locally without adjusting the model, by using a separate construct
-from `UnionNondet` to avoid coupling one form of speculative parsing to the only
-version of something like that in the current implementation of `doodle`:
-
-```rust
-fn try_with_fallback(f0: Format, f1: Format) -> Format {
-    TryWithFallback(Box::new(f0), Box::new(f1))
-}
-
-/* .. */
-
-let zlib_utf8txt_or_raw =
-    try_with_fallback(
-        fmt_variant("valid", zlib_utf8text),
-        fmt_variant("invalid", repeat(base.u8())),
-    );
-```
-
-This can be used in a broader sense, as a more generic 'permit local failure gracefully'
-construct:
-
-```rust
-fn permit_fail(f: Format, dummy: Expr) -> Format {
-    TryWithFallback(Box::new(f), Box::new(compute(dummy)))
-}
-
-// vvv Usage Patterns vvv
-fn opt_success(f: Format) -> Format {
-    permit_fail(fmt_some(f), expr_none())
-}
-
-fn try_or_invalid(f: Format) -> Format {
-    permit_fail(fmt_variant("valid", f), Expr::Variant("invalid".into(), Expr::UNIT))
-}
-```
+The latter usage is more of a band-aid against unwanted parse-failure, and is similar in usage
+to `Format::Permit`.
