@@ -1732,10 +1732,6 @@ where
 {
     let nodes = mk_nodes(seed);
 
-    if nodes.is_empty() {
-        unreachable!("balance_merge: mk_nodes(seed) yielded empty vector");
-    }
-
     let mut stratum = nodes;
     loop {
         match stratum.len() {
