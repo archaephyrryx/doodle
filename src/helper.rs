@@ -627,17 +627,14 @@ pub fn record_ext<Name: IntoLabel>(
     >,
     specialize_singletons: bool,
 ) -> Format {
-    let (n_persist, mut rev_fields) = {
-        let mut tmp = fields_persist.into_iter();
-        let n_persist = tmp
-            .by_ref()
-            .filter(|(l, _)| l.as_ref().is_some_and(|(_, is_persist)| *is_persist))
-            .count();
-        (
-            n_persist,
-            tmp.rev().collect::<Vec<(Option<(Name, bool)>, Format)>>(),
-        )
-    };
+    let mut rev_fields = fields_persist
+        .into_iter()
+        .rev()
+        .collect::<Vec<(Option<(Name, bool)>, Format)>>();
+    let n_persist = rev_fields
+        .iter()
+        .filter(|(l, _)| l.as_ref().is_some_and(|(_, is_persist)| *is_persist))
+        .count();
     if n_persist == 1 && specialize_singletons {
         let accum = None;
         Format::__chain_record_mono(accum, &mut rev_fields)
@@ -2409,5 +2406,39 @@ mod tests {
         assert!(ascii_char().is_ascii_char_format(&module));
         assert!(ascii_alpha().is_ascii_char_format(&module));
         assert!(!u8().is_ascii_char_format(&module));
+    }
+
+    fn decode_record_helper(f: &Format, input: &[u8]) -> crate::decoder::Value {
+        let module = FormatModule::new();
+        let program = crate::decoder::Compiler::compile_program(&module, f).unwrap();
+        program.run(crate::read::ReadCtxt::new(input)).unwrap().0
+    }
+
+    /// `record_auto` keeps every persisted field (counting the persisted fields must not consume them).
+    #[test]
+    fn record_auto_keeps_persisted_fields() {
+        let f = record_auto([("a", u8()), ("_tmp", u8()), ("__skip", u8()), ("b", u8())]);
+        let expected = crate::decoder::Value::Record(vec![
+            (Label::Borrowed("a"), crate::decoder::Value::U8(1)),
+            (Label::Borrowed("b"), crate::decoder::Value::U8(4)),
+        ]);
+        assert_eq!(decode_record_helper(&f, &[1, 2, 3, 4]), expected);
+    }
+
+    /// With `specialize_singletons`, a record with exactly one persisted field yields that field's value.
+    #[test]
+    fn record_ext_singleton_yields_its_field() {
+        let f = record_ext(
+            [
+                (None, is_byte(b'(')),
+                (Some((Label::Borrowed("x"), true)), u8()),
+                (None, is_byte(b')')),
+            ],
+            true,
+        );
+        assert_eq!(
+            decode_record_helper(&f, b"(A)"),
+            crate::decoder::Value::U8(b'A')
+        );
     }
 }
