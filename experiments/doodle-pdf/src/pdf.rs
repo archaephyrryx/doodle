@@ -9,11 +9,7 @@ use doodle_numexpr_macro::numexpr;
 // SECTION - DaeDaLus-PDF-specific helpers
 /// Format that parses nothing and returns a byte-sequence meant to be an ascii string
 fn const_str(str: &[u8]) -> Format {
-    compute(
-        Expr::Seq(
-            str.iter().copied().map(Expr::U8).collect()
-        )
-    )
+    compute(Expr::Seq(str.iter().copied().map(Expr::U8).collect()))
 }
 
 /// Parses a single case-insensitive ASCII hex-digit into the numeric value of that digit: '0' goes to `0u8`, 'F' and 'f' go to `15u8`
@@ -110,7 +106,6 @@ fn record_daedalus<Name: IntoLabel + AsRef<str>>(
     record_ext(fields_ext, true)
 }
 
-
 /// Given a sequence of `(f -> e)` mappings, produces a union whose parse-tree is built
 /// using `f` but whose parse-output is the computation of `e` for the chosen branch.
 ///
@@ -151,7 +146,6 @@ fn then_eol(format: Format, eol: FormatRef) -> Format {
     chain(format, "ret", monad_seq(eol.call(), compute(var("ret"))))
 }
 // !SECTION
-
 
 // SECTION - ASCII value and group consts
 const ASCII_LF: u8 = b'\n';
@@ -201,8 +195,6 @@ fn eol(module: &mut FormatModule, simple_eol: FormatRef) -> FormatRef {
         Format::UnionNondet(vec![simple_eol.call(), void(is_byte(ASCII_CR))]),
     )
 }
-
-
 
 fn comment(module: &mut FormatModule, eol: FormatRef) -> FormatRef {
     let inline_char = Format::Byte(ByteSet::from([ASCII_LF, ASCII_CR]).complement());
@@ -422,8 +414,13 @@ fn v_name(module: &mut FormatModule, any_ws: FormatRef) -> FormatRef {
     )
 }
 
-
-fn pdf_value(module: &mut FormatModule, any_ws: FormatRef, eol: FormatRef, natural: FormatRef, v_name: FormatRef) -> FormatRef {
+fn pdf_value(
+    module: &mut FormatModule,
+    any_ws: FormatRef,
+    eol: FormatRef,
+    natural: FormatRef,
+    v_name: FormatRef,
+) -> FormatRef {
     let v_null = void(kw(b"null", any_ws));
     let v_bool = interpret([
         (kw(b"true", any_ws), Expr::Bool(true)),
@@ -450,7 +447,6 @@ fn pdf_value(module: &mut FormatModule, any_ws: FormatRef, eol: FormatRef, natur
     );
     pdf_value
 }
-
 
 fn token(f: Format, any_ws: FormatRef) -> Format {
     chain(
@@ -479,7 +475,6 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
     let any_ws = any_ws(module, eol, comment);
 
     let v_name = v_name(module, any_ws);
-
 
     let natural = natural(module);
     let number = number(module, natural);
@@ -525,7 +520,10 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
         module.define_format("pdf.util.pdf-dict", dict.call_args(vec![Expr::U64(32)]))
     };
 
-    let trailer = module.define_format("pdf.trailer", monad_seq(kw(b"trailer", any_ws), pdf_dict.call()));
+    let trailer = module.define_format(
+        "pdf.trailer",
+        monad_seq(kw(b"trailer", any_ws), pdf_dict.call()),
+    );
 
     let pdf_chunk = module.define_format(
         "pdf.chunk",
@@ -540,14 +538,14 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
     );
 
     module.define_format(
-    "pdf.main",
-    only(record_auto([
-        (
-            "version",
-            skip_to(monad_seq(is_bytes(b"%PDF-"), number.call())),
-        ),
-        ("chunks", repeat(pdf_chunk.call())),
-        ("__rem", repeat(any_ws.call())),
-    ])),
-)
+        "pdf.main",
+        only(record_auto([
+            (
+                "version",
+                skip_to(monad_seq(is_bytes(b"%PDF-"), number.call())),
+            ),
+            ("chunks", repeat(pdf_chunk.call())),
+            ("__rem", repeat(any_ws.call())),
+        ])),
+    )
 }
