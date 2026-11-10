@@ -443,11 +443,37 @@ bound this, both in `src/lib.rs` and used by both compilers:
   answer that relied on that assumption for a level further out is not cached. `Maybe`, whose inner
   format codegen compiles against the outer continuation and the interpreter against `Next::Empty`,
   is analysed as the former, so the answer covers both backends.
-- **`Next::truncated`** cuts a continuation, at a call, once its minimum length reaches
-  `MATCH_TREE_MAX_DEPTH` (80 bytes). No decision inside the level can look that far, so the compiled
-  decoder is unchanged, and a recursive level that *does* depend on its continuation is compiled for
-  a bounded set of continuations rather than an unbounded one, provided each nesting level adds at
-  least a byte.
+- **`NextDependence::call_continuation`** cuts the continuation of a call to a level that does
+  depend on it down to the bytes of it the level consults, using `Next::truncated`. A cut at
+  `MATCH_TREE_MAX_DEPTH` (80 bytes) would already leave the decoder unchanged, since no decision inside
+  the level can look that far, and would bound the continuations a recursive level is compiled for,
+  provided each nesting level adds at least a byte. Bounded is not small, though: in
+  `value := 'n' ws | '[' ws value* ']' ws | '(' ws value* ')' ws` (with `ws := ' '*`), each trailing
+  `ws` looks one byte into its continuation, and the continuations of nested calls differ by which
+  brackets enclose them, so 80 bytes of them leave exponentially many keys in the nesting depth.
+
+  `NextDependence::lookahead_budget` cuts the continuation at 1, 2, 4, …, 64 bytes in turn, measures
+  what the level consults of each cut, and returns the first measurement no larger than its cut (or
+  80, if none is). That measurement is exact for the uncut continuation too: two continuations that
+  agree on their first `k` bytes, and on whether they can end before then, give the same `MatchTree`
+  wherever it consults at most `k` bytes of them, and a cut agrees with the original in this way.
+  Measuring cuts, rather than the continuation as given, keeps the analysis itself from meeting the
+  exponentially many keys.
+
+  Measuring follows the same walk as the dependence check (`NextDependence::format_lookahead`), but
+  builds each decision point's tree against the real cut continuation, which it passes as the
+  *trailer*: the part of the tree's continuation that follows the level being measured. The
+  `CycleGuard` recognizes the trailer by `Rc` address, and `MatchTreeLevel::try_grow` counts, along
+  each path through the tree, the bytes read from the layer at which the path first reaches it
+  (`MatchTree::lookahead_into`, recorded in a `NextUsage`; a failed build counts as 80). A call within
+  the level counts what its callee consults of its own continuation, which ends in the trailer, as if
+  it were all trailer, which over-approximates. `(level, cut continuation)` pairs are cached and
+  resolved recursively in the same way as the dependence answers, both through `LevelAnalytics`, with
+  a pair reached again while its own answer is being worked out assumed to consult nothing. No such
+  answer is final in the way a `true` dependence answer is, so one that relied on that assumption for
+  a pair further out is never cached. That this single pass reaches the least fixpoint of the
+  measurement has been argued, not proven, and no test compares a decoder compiled against a cut
+  continuation with one compiled against the original.
 
 That leaves levels that depend on their continuation but are called with continuations that happen
 not to differ in anything they consult: these compile to identical decoders. Once compilation
@@ -456,6 +482,11 @@ that are equal along with their types into the first of them, renumbers every `C
 repeats until nothing more merges, since merging two decoders' callees can make their callers
 identical too. Index 0, the entry point, keeps its index. Merging is by exact equality, so it also
 merges identical decoders of distinct levels, which is equally safe.
+
+Merging also covers calls nested inside a level compiled against a cut continuation. Such a call's
+own continuation can cut to a different key than it would under the original continuation, since its
+own search through the cut lengths may look past the bytes it ends up consulting; but it consults only
+bytes on which the two agree, so both keys compile to the same decoder.
 
 #### `TypedFormat`'s own cycle-safe traversals
 

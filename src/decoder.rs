@@ -14,9 +14,8 @@ use crate::util::{EResult, WithErr};
 use crate::util::{ErrTrace as _, try_downgrade_error_with};
 use crate::validation::Condition;
 use crate::{
-    BaseKind, DynFormat, Endian, Expr, Format, FormatModule, Label, MATCH_TREE_MAX_DEPTH,
-    MatchTree, MaybeTyped, Next, NextDependence, Pattern, RepeatRange, TypeHint, TypeScope,
-    ValueType, ViewExpr, ViewFormat,
+    BaseKind, DynFormat, Endian, Expr, Format, FormatModule, Label, MatchTree, MaybeTyped, Next,
+    NextDependence, Pattern, RepeatRange, TypeHint, TypeScope, ValueType, ViewExpr, ViewFormat,
 };
 use crate::{FixedReadKind, try_with};
 
@@ -456,7 +455,7 @@ pub struct Compiler<'a> {
     module: &'a FormatModule,
     program: Program,
     /// The decoder compiled for each call to a level, keyed on the level and the continuation the
-    /// call is compiled against: that continuation, truncated to `MATCH_TREE_MAX_DEPTH` bytes, if
+    /// call is compiled against: that continuation, truncated to the minimum required byte-depth, if
     /// the level's decoder can depend on it (see `NextDependence`), and `Next::Empty` otherwise.
     /// Continuations are compared structurally, so a dependent level called with continuations
     /// that differ, but not in anything its decisions consult, gets identical decoders; those are
@@ -466,7 +465,7 @@ pub struct Compiler<'a> {
     /// its decoder, and the name of its level if that level is recursive (see
     /// [`FormatModule::is_recursive_level`]), in which case its decoder is a `Decoder::Recursive`.
     compile_queue: Vec<(&'a Format, Rc<Next<'a>>, usize, Option<Label>)>,
-    next_dependence: NextDependence,
+    next_dependence: NextDependence<'a>,
 }
 
 impl<'a> Compiler<'a> {
@@ -552,14 +551,9 @@ impl<'a> Compiler<'a> {
         match format {
             Format::ItemVar(level, arg_exprs, arg_views) => {
                 let f = self.module.get_format(*level);
-                let next = if self
+                let next = self
                     .next_dependence
-                    .level_depends_on_next(self.module, *level)
-                {
-                    Next::truncated(&next, self.module, MATCH_TREE_MAX_DEPTH)
-                } else {
-                    Rc::new(Next::Empty)
-                };
+                    .call_continuation(self.module, *level, &next);
                 let n = if let Some(n) = self.decoder_map.get(&(*level, next.clone())) {
                     *n
                 } else {

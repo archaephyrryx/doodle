@@ -2,8 +2,8 @@ use crate::byte_set::ByteSet;
 use crate::decoder::{CallIndices, merge_identical_decoders};
 use crate::validation::TypedCondition;
 use crate::{
-    Format, FormatModule, Label, MATCH_TREE_MAX_DEPTH, MatchTree, MaybeTyped, Next, NextDependence,
-    RepeatRange, StyleHint,
+    Format, FormatModule, Label, MatchTree, MaybeTyped, Next, NextDependence, RepeatRange,
+    StyleHint,
 };
 use anyhow::{Result as AResult, anyhow};
 use std::borrow::Cow;
@@ -358,7 +358,7 @@ pub struct GTCompiler<'a> {
     /// call is compiled against.
     decoder_map: HashMap<(usize, Rc<Next<'a>>), usize>,
     compile_queue: Vec<QueueItem<'a>>,
-    next_dependence: NextDependence,
+    next_dependence: NextDependence<'a>,
 }
 
 pub(crate) type GTDecoder = TypedDecoder<GenType>;
@@ -468,14 +468,9 @@ impl<'a> GTCompiler<'a> {
                             .collect(),
                     )
                 };
-                let next = if self
+                let next = self
                     .next_dependence
-                    .level_depends_on_next(self.module, *level)
-                {
-                    Next::truncated(&next, self.module, MATCH_TREE_MAX_DEPTH)
-                } else {
-                    Rc::new(Next::Empty)
-                };
+                    .call_continuation(self.module, *level, &next);
                 let n = if let Some(n) = self.decoder_map.get(&(*level, next.clone())) {
                     *n
                 } else {

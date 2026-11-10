@@ -1843,6 +1843,14 @@ enum Next<'a> {
     Probe,
 }
 
+impl Next<'_> {
+    /// Obtains a unique identifier for `next` based on its `Rc` pointer-address, to use as a discriminator
+    /// when tracking particular continuations for [`CycleGuard`].
+    fn as_ptr_addr(next: &Rc<Next<'_>>) -> NextPtrAddr {
+        Rc::as_ptr(next) as *const () as usize
+    }
+}
+
 impl<'a> Next<'a> {
     /// Smart constructor for [`Next::Cat`]. When `content` is transparent to lookahead (it neither
     /// consumes bytes nor constrains what may follow, e.g. a trailing `Format::Compute`), wrapping
@@ -1891,8 +1899,9 @@ impl<'a> Next<'a> {
     ///
     /// A `MatchTree` never looks more than [`MATCH_TREE_MAX_DEPTH`] bytes past its decision
     /// point, and a level's decision points all precede the continuation it is compiled against,
-    /// so truncating that continuation at that many bytes cannot change the compiled decoder. It
-    /// does bound the continuations a recursive level is compiled against, each of which would
+    /// so truncating that continuation at that many bytes cannot change the compiled decoder; nor
+    /// can truncating it at fewer bytes than the level consults of it (see
+    /// [`NextDependence::lookahead_budget`]). It does bound the continuations a recursive level is compiled against, each of which would
     /// otherwise be a new `(level, next)` decoder-cache key, with no end to the keys when every
     /// level of nesting extends the continuation.
     fn truncated(next: &Rc<Next<'a>>, module: &FormatModule, budget: usize) -> Rc<Next<'a>> {
@@ -1975,10 +1984,17 @@ impl<'a> Next<'a> {
     }
 }
 
-/// Per-level answers to whether a level's compiled decoder depends on the continuation it is
-/// compiled against. Both compilers (`decoder::Compiler` and codegen's `GTCompiler`) consult it
-/// to decide whether a call's `(level, next)` decoder-cache key keeps `next` or uses
-/// [`Next::Empty`].
+/// Global (per FormatModule) cache structure recording 'depends-on-next' judgements for each level.
+///
+/// [`Compiler`](decoder::Compiler) and [`GTCompiler`](codegen::GTCompiler) use `(level, next)`
+/// keying to store the converted `Decoder`/`TypedDecoder` for the format at a given level, for
+/// each meaningfully distinct continuation that can appear after it in the format call-graph.
+/// For any level whose format is continuation-agnostic, [`Next::Empty`] is always used, and thus
+/// only one decoder is stored for that level. Otherwise, `(level, next)` is stored for each
+/// distinct `next` (post-truncation) that is seen to follow a call to the format at `level`
+/// within the format call-graph.
+///
+/// # Notes
 ///
 /// A level depends on its continuation if some `MatchTree` built while compiling it can consult
 /// that continuation (see [`MatchTree::reaches_probe`]), directly or within a level it calls
@@ -1992,47 +2008,207 @@ impl<'a> Next<'a> {
 /// that relied on that assumption for a level further out is not recorded, and is worked out
 /// again if asked for later.
 #[derive(Default)]
-pub(crate) struct NextDependence {
-    known: HashMap<usize, bool>,
-    in_progress: Vec<usize>,
-    /// The lowest position in `in_progress` assumed independent while working out the answer
-    /// for the innermost level in progress.
+pub(crate) struct NextDependence<'a> {
+    /// Analysis-cache for 'depends-on-next' as a raw boolean
+    depends: LevelAnalytics,
+    /// Analysis-cache for lookahead byte-depth
+    lookahead: LevelAnalytics<(usize, Rc<Next<'a>>), usize>,
+}
+
+/// Helper-struct for consolidating the design of 'depends-on-next' and 'lookahead byte-depth' caching
+struct LevelAnalytics<K = usize, V = bool> {
+    /// Lookup table of finished judgments mapping level-based `K` to the analysis-value `V`
+    finished: HashMap<K, V>,
+    /// Frontier of levels currently being analyzed (outermost first)
+    frontier: Vec<K>,
+    /// Index of the earliest element in `frontier` we are assuming to be an analytical fixed-point
+    /// while working out the answer for the innermost (final-index) level
     lowest_assumed: Option<usize>,
 }
 
-impl NextDependence {
-    pub(crate) fn level_depends_on_next(&mut self, module: &FormatModule, level: usize) -> bool {
-        if let Some(&known) = self.known.get(&level) {
-            return known;
+impl<K, V> std::default::Default for LevelAnalytics<K, V> {
+    fn default() -> Self {
+        Self {
+            finished: Default::default(),
+            frontier: Default::default(),
+            lowest_assumed: Default::default(),
         }
-        if let Some(pos) = self.in_progress.iter().position(|&l| l == level) {
+    }
+}
+
+/// The state [`LevelAnalytics::enter`] sets aside for a key whose analysis it has opened, to be
+/// passed to the matching [`LevelAnalytics::exit`].
+struct AnalysisFrame {
+    /// The key's position in `frontier`. Assumptions at lower positions concern keys further out
+    /// than this one, and so outlive its analysis.
+    depth: usize,
+    /// The value of `lowest_assumed` before this key's analysis began, for `exit` to restore.
+    outer_assumed: Option<usize>,
+}
+
+/// The result of [`LevelAnalytics::enter`].
+enum AnalysisEntry<V> {
+    /// No analysis is needed: this is either the key's finished value, or the assumed value for a
+    /// key whose analysis is already in progress.
+    Answered(V),
+    /// The key's analysis has begun. The caller works out its value, then passes this frame and
+    /// the value to [`LevelAnalytics::exit`].
+    Opened(AnalysisFrame),
+}
+
+impl<K: Eq + std::hash::Hash, V: Copy> LevelAnalytics<K, V> {
+    /// Begins the analysis of `key`, unless it has an answer already.
+    ///
+    /// A key that is reached again while its own analysis is in progress is answered with
+    /// `assumption`, and the assumption is noted in `lowest_assumed`, since any value worked out
+    /// from it may not hold once the analysis of that key finishes.
+    ///
+    /// Analysis is split into this method and [`Self::exit`], rather than a single method taking
+    /// a closure, because working out a value needs mutable access to the [`NextDependence`] that
+    /// owns this `LevelAnalytics`.
+    fn enter(&mut self, key: K, assumption: V) -> AnalysisEntry<V> {
+        if let Some(ret) = self.finished.get(&key) {
+            AnalysisEntry::Answered(*ret)
+        } else if let Some(pos) = self.frontier.iter().position(|k| *k == key) {
             self.lowest_assumed = Some(self.lowest_assumed.map_or(pos, |p| p.min(pos)));
-            return false;
+            AnalysisEntry::Answered(assumption)
+        } else {
+            let depth = self.frontier.len();
+            self.frontier.push(key);
+            let outer_assumed = self.lowest_assumed.take();
+            AnalysisEntry::Opened(AnalysisFrame {
+                depth,
+                outer_assumed,
+            })
         }
-        let depth = self.in_progress.len();
-        self.in_progress.push(level);
-        let outer_assumed = self.lowest_assumed.take();
+    }
+
+    /// Ends the analysis of the innermost open key, whose result is `value`, where `frame` is the
+    /// one [`Self::enter`] returned for that key.
+    ///
+    /// `value` is recorded in `finished` unless it relied on an assumption about a key further
+    /// out in `frontier`, in which case it may be wrong, and the key is analysed afresh if asked
+    /// for again.
+    ///
+    /// `is_final` overrides that: it means that `value` holds no matter what any assumption turns
+    /// out to be, so it is recorded regardless, and the assumptions it was computed under are not
+    /// passed on to the keys further out.
+    fn exit(&mut self, frame: AnalysisFrame, value: V, is_final: bool) {
+        let Some(k) = self.frontier.pop() else {
+            unreachable!("exit called on empty frontier")
+        };
+        let assumed_further_out = self.lowest_assumed.filter(|&pos| pos < frame.depth);
+        if is_final || assumed_further_out.is_none() {
+            self.finished.insert(k, value);
+        }
+        let carried = if is_final { None } else { assumed_further_out };
+        self.lowest_assumed = min_opt(carried, frame.outer_assumed);
+    }
+}
+
+fn min_opt<T: Ord>(x: Option<T>, y: Option<T>) -> Option<T> {
+    match (x, y) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The lengths, in bytes, that [`NextDependence::lookahead_budget`] cuts a continuation to in
+/// turn, measuring what a level reads of each cut, until a cut keeps everything the level reads.
+/// If none does, the continuation is cut at [`MATCH_TREE_MAX_DEPTH`] bytes, which always suffices.
+const LOOKAHEAD_BUDGETS: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
+
+impl<'a> NextDependence<'a> {
+    pub(crate) fn level_depends_on_next(&mut self, module: &FormatModule, level: usize) -> bool {
+        let frame = match self.depends.enter(level, false) {
+            AnalysisEntry::Answered(known) => return known,
+            AnalysisEntry::Opened(frame) => frame,
+        };
         let depends =
             self.format_depends_on_next(module, module.get_format(level), Rc::new(Next::Probe));
-        self.in_progress.pop();
-        let assumed_further_out = self.lowest_assumed.filter(|&pos| pos < depth);
-        if depends || assumed_further_out.is_none() {
-            self.known.insert(level, depends);
-        }
-        let carried = if depends { None } else { assumed_further_out };
-        self.lowest_assumed = match (outer_assumed, carried) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let is_final = depends;
+        self.depends.exit(frame, depends, is_final);
         depends
     }
 
-    /// Whether compiling `format` against `next` can consult a [`Next::Probe`] within `next`.
-    fn format_depends_on_next<'a>(
+    /// How many leading bytes of `next` compiling `level` against it consults, through any
+    /// `MatchTree` built in the level's body or in the levels it calls; or
+    /// [`MATCH_TREE_MAX_DEPTH`] if that can't be bounded more tightly.
+    ///
+    /// Each length in [`LOOKAHEAD_BUDGETS`] is tried in turn: `next` is cut to that length (see
+    /// [`Next::truncated`]), and what `level` reads of the cut continuation is measured (see
+    /// [`Self::lookahead_for_key`]). The first measurement no larger than its cut is returned. It
+    /// is exact, not just a bound: the cut agrees with `next` on its first that-many bytes, and on
+    /// whether it can end before them, so every `MatchTree` that reads no further than that is
+    /// the same for both.
+    ///
+    /// The result can be smaller than the cut it was measured against, and can be 0 for a level
+    /// that depends on its continuation in general (see [`Self::level_depends_on_next`]) but
+    /// never reaches this one.
+    fn lookahead_budget(
         &mut self,
         module: &'a FormatModule,
-        format: &'a Format,
-        next: Rc<Next<'a>>,
+        level: usize,
+        next: &Rc<Next<'a>>,
+    ) -> usize {
+        if matches!(**next, Next::Empty) {
+            return 0;
+        }
+        for budget in LOOKAHEAD_BUDGETS {
+            let key = Next::truncated(next, module, budget);
+            let nbytes = self.lookahead_for_key(module, level, key);
+            if nbytes <= budget {
+                return nbytes;
+            }
+        }
+        return MATCH_TREE_MAX_DEPTH;
+    }
+
+    /// The continuation to compile a call to `level` against, given the continuation `next` of
+    /// the call: [`Next::Empty`] if `level` does not depend on its continuation, and otherwise
+    /// `next` cut to the bytes of it that `level` consults (see [`Self::lookahead_budget`]).
+    ///
+    /// Continuations that agree on those bytes then share a `(level, next)` decoder-cache key.
+    /// Within a level compiled against a cut continuation, a nested call's continuation can cut
+    /// to a different key than it would have without the outer cut, since the nested call's own
+    /// search may have looked past the bytes it ends up consulting. The two keys still compile to
+    /// equivalent decoders, because the nested call consults only bytes on which they agree, and
+    /// `merge_identical_decoders` folds the duplicates together.
+    pub(crate) fn call_continuation(
+        &mut self,
+        module: &'a FormatModule,
+        level: usize,
+        next: &Rc<Next<'a>>,
+    ) -> Rc<Next<'a>> {
+        if !self.level_depends_on_next(module, level) {
+            Rc::new(Next::Empty)
+        } else {
+            let nbytes = self.lookahead_budget(module, level, next);
+            Next::truncated(next, module, nbytes)
+        }
+    }
+
+    fn lookahead_for_key(
+        &mut self,
+        module: &'a FormatModule,
+        level: usize,
+        key: Rc<Next<'a>>,
+    ) -> usize {
+        let frame = match self.lookahead.enter((level, key.clone()), 0) {
+            AnalysisEntry::Answered(known) => return known,
+            AnalysisEntry::Opened(frame) => frame,
+        };
+        let nbytes = self.format_lookahead(module, module.get_format(level), key.clone(), &key);
+        self.lookahead.exit(frame, nbytes, false);
+        nbytes
+    }
+
+    /// Whether compiling `format` against `next` can consult a [`Next::Probe`] within `next`.
+    fn format_depends_on_next<'m>(
+        &mut self,
+        module: &'m FormatModule,
+        format: &'m Format,
+        next: Rc<Next<'m>>,
     ) -> bool {
         if matches!(next.as_ref(), Next::Empty) {
             return false;
@@ -2135,6 +2311,135 @@ impl NextDependence {
             }
         }
     }
+
+    fn format_lookahead(
+        &mut self,
+        module: &'a FormatModule,
+        format: &'a Format,
+        next: Rc<Next<'a>>,
+        trailer: &Rc<Next<'a>>,
+    ) -> usize {
+        if matches!(next.as_ref(), Next::Empty) {
+            return 0;
+        }
+        match format {
+            // A call counts what the callee consults of its own continuation, which ends in
+            // `trailer`, as consulted from `trailer` itself. That over-approximates whenever
+            // anything precedes `trailer` in the callee's continuation.
+            Format::ItemVar(level, _, _) => {
+                if self.level_depends_on_next(module, *level) {
+                    self.lookahead_budget(module, *level, &next)
+                } else {
+                    0
+                }
+            }
+            Format::RecVar(_) => unreachable!(
+                "Format::RecVar is rewritten to ItemVar at batch registration; never appears in a stored Format"
+            ),
+            // compiled without a continuation, or against `Next::Empty`
+            Format::Phantom(_)
+            | Format::Fail
+            | Format::Pos
+            | Format::EndOfInput
+            | Format::Align(_)
+            | Format::Byte(_)
+            | Format::SkipRemainder
+            | Format::Compute(_)
+            | Format::Apply(_)
+            | Format::WithView(..)
+            | Format::DecodeBytes(..)
+            | Format::ParseFromView(..)
+            | Format::Peek(_)
+            | Format::PeekNot(_)
+            | Format::Slice(..)
+            | Format::Bits(_)
+            | Format::WithRelativeOffset(..)
+            | Format::LiftedOption(None) => 0,
+            Format::Variant(_, a)
+            | Format::LetView(_, a)
+            | Format::Map(a, _)
+            | Format::Where(a, _)
+            | Format::Permit(a, _)
+            | Format::Let(_, _, a)
+            | Format::Dynamic(_, _, a)
+            | Format::Hint(_, a)
+            | Format::LiftedOption(Some(a))
+            | Format::Maybe(_, a) => self.format_lookahead(module, a, next, trailer),
+            #[cfg(feature = "format_enforce")]
+            Format::Enforce(a) => self.format_lookahead(module, a, next, trailer),
+            Format::Union(branches) => Ord::max(
+                branches
+                    .iter()
+                    .map(|f| self.format_lookahead(module, f, next.clone(), trailer))
+                    .max()
+                    .unwrap_or(0),
+                MatchTree::lookahead_into(module, branches, next, trailer),
+            ),
+            Format::UnionNondet(branches) => branches
+                .iter()
+                .map(|f| self.format_lookahead(module, f, next.clone(), trailer))
+                .max()
+                .unwrap_or(0),
+            Format::Match(_, branches) => branches
+                .iter()
+                .map(|(_, f)| self.format_lookahead(module, f, next.clone(), trailer))
+                .max()
+                .unwrap_or(0),
+            Format::Tuple(fields) | Format::Sequence(fields) => {
+                let mut res = 0;
+                let mut rest = fields.iter();
+                while let Some(f) = rest.next() {
+                    let field_next =
+                        Next::sequence(MaybeTyped::Untyped(rest.as_slice()), next.clone());
+                    res = Ord::max(res, self.format_lookahead(module, f, field_next, trailer))
+                }
+                res
+            }
+            Format::Repeat(a) | Format::Repeat1(a) => {
+                if a.is_nullable(module) {
+                    // fails to compile whatever the continuation
+                    return MATCH_TREE_MAX_DEPTH;
+                }
+                let inner_next = Rc::new(Next::Repeat(MaybeTyped::Untyped(a), next.clone()));
+                let fa = Format::Tuple(vec![(**a).clone(), Format::Repeat(a.clone())]);
+                Ord::max(
+                    self.format_lookahead(module, a, inner_next, trailer),
+                    MatchTree::lookahead_into(module, &[fa, Format::EMPTY], next, trailer),
+                )
+            }
+            Format::RepeatCount(_, a)
+            | Format::RepeatUntilLast(_, a)
+            | Format::RepeatUntilSeq(_, a)
+            | Format::ForEach(_, _, a)
+            | Format::AccumUntil(_, _, _, _, a) => {
+                let inner_next = Rc::new(Next::Repeat(MaybeTyped::Untyped(a), next));
+                self.format_lookahead(module, a, inner_next, trailer)
+            }
+            Format::RepeatBetween(range, a) => {
+                let (min, max) = (range.min(), range.max());
+                let inner_next = Rc::new(Next::RepeatBetween(
+                    min.saturating_sub(1),
+                    max.saturating_sub(1),
+                    MaybeTyped::Untyped(a),
+                    next.clone(),
+                ));
+                let branches: Vec<Format> = (0..=max)
+                    .map(|count| Format::RepeatCount(Box::new(Expr::U32(count as u32)), a.clone()))
+                    .collect();
+                Ord::max(
+                    self.format_lookahead(module, a, inner_next, trailer),
+                    MatchTree::lookahead_into(module, &branches, next, trailer),
+                )
+            }
+            Format::LetFormat(first, _, second) | Format::MonadSeq(first, second) => {
+                let first_next = Next::cat(MaybeTyped::Untyped(second), next.clone());
+                Ord::max(
+                    self.format_lookahead(module, first, first_next, trailer),
+                    self.format_lookahead(module, second, next, trailer),
+                )
+            }
+        }
+    }
 }
 
 /// A single choice-point in a conceptual [MatchTree] structure.
@@ -2167,6 +2472,14 @@ fn any_byte() -> &'static Format {
 /// Maximum number of bytes of lookahead a [`MatchTree`] examines past its decision point.
 const MATCH_TREE_MAX_DEPTH: usize = 80;
 
+#[derive(Default)]
+struct NextUsage {
+    reached_probe: bool,
+    trailer: Option<NextPtrAddr>,
+    /// Maximum number of bytes of `trailer` that are read, over all possible paths
+    trailer_bytes_read: usize,
+}
+
 /// A byte-level prefix-tree evaluated to a fixed depth.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct MatchTree {
@@ -2177,20 +2490,27 @@ pub struct MatchTree {
 /// Alias used for semantic transparency of the `usize` value used to identify `Rc<Next>`-values within [`CycleGuard`]
 type NextPtrAddr = usize;
 
-/// Tracks which `Format::ItemVar`/`TypedFormat::FormatCall` levels are currently being eagerly
-/// expanded within a single top-level [`MatchTreeStep`] construction (one iteration of
-/// [`MatchTreeLevel::try_grow`]'s per-index loop), so that construction terminates instead of
-/// recursing forever on a self-referential format.
+/// Tracks which levels are currently being eagerly expanded within a single top-level [`MatchTreeStep`]
+/// construction (one iteration of [`MatchTreeLevel::try_grow`]'s per-index loop), so that construction
+/// terminates instead of recursing forever on a self-referential format.
 ///
-/// A level is added to `open_levels` immediately before recursing into [`MatchTreeStep::from_format`]
-/// on `module.get_format(level)`, and is removed just after that call returns.
+/// Upon visiting `Format::ItemVar` (or the elaborated equivalent, `TypedFormat::FormatCall`),
+/// the referenced level is 'opened' (i.e. inserted into `open_levels`) just before recursing
+/// into the [`MatchTreeStep::from_format`] on `module.get_format(level)`, and is removed immediately
+/// after that call returns.
 ///
-/// The walk of a level's body only ever reaches the continuation it was opened with (`exit`) once
-/// the body itself has been fully matched, so whenever [`MatchTreeStep::from_next`] is called on
-/// exactly that continuation, the level is closed for the duration of that call (see
-/// [`Self::leave`]). A later reference to the same level from within that continuation - e.g. the
-/// second `B` in `B ~ B ~ 'x'` with a nullable `B` - is then a sibling, not a re-entry. Exits are
-/// matched by `Rc` pointer identity: the continuation stays alive for as long as its level is open,
+/// # Notes
+///
+/// In order to distinguish true recursion from sibling-nodes that happen to call into the same level
+/// before any additional bytes are read, we track, for each level in the open-set, an 'exit'
+/// continuation; this is the `next` value in-hand at the time that we saw the `ItemVar`
+/// we are descending into the level for. We can then automatically close a level once
+/// we call `MatchTreeStep::from_next` on its exit-continuation, as that means that the
+/// full content of the format at that level has been processed. This is done to prevent
+/// the second instance of the level from being viewed as a self-recursive descent when
+/// it is actually a juxtaposition of nullable format-calls.
+///
+/// Exits are matched by `Rc` pointer identity: the continuation stays alive for as long as its level is open,
 /// so no other live `Next` can share its address, and a structurally equal but separately
 /// allocated continuation is simply not recognized as an exit (conservative, never unsound).
 ///
@@ -2209,16 +2529,25 @@ struct CycleGuard {
     cycle_level: Option<usize>,
     /// Whether [`Next::Probe`] was consulted.
     reached_probe: bool,
+    /// Address of the trailing continuation that marks the boundary of 'the original Format node we are analyzing' and 'what comes after it'
+    trailer: Option<NextPtrAddr>,
+    /// Whether `trailer` was consulted
+    reached_trailer: bool,
 }
 
 impl CycleGuard {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    /// The address identifying `next` as some open level's `exit`.
-    fn exit_addr(next: &Rc<Next<'_>>) -> NextPtrAddr {
-        Rc::as_ptr(next) as *const () as usize
+    /// Constructs a [`CycleGuard`] with a specific `trailer` marking the possibly-truncated `Next`-value that
+    /// marks the frontier of additional context we read only for formats that 'depend-on-next'.
+    fn with_trailer(trailer: Option<NextPtrAddr>) -> Self {
+        Self {
+            trailer,
+            ..Self::default()
+        }
     }
 
     /// Inserts `level` into the open-set, with `exit` the continuation its body is walked under,
@@ -2231,7 +2560,7 @@ impl CycleGuard {
             self.has_cycle = true;
             self.cycle_level.get_or_insert(level);
         } else {
-            self.open_levels.insert(level, Self::exit_addr(exit));
+            self.open_levels.insert(level, Next::as_ptr_addr(exit));
         }
         self.has_cycle
     }
@@ -2243,7 +2572,7 @@ impl CycleGuard {
         if self.open_levels.is_empty() {
             return Vec::new();
         }
-        let addr = Self::exit_addr(next);
+        let addr = Next::as_ptr_addr(next);
         let left: Vec<(usize, NextPtrAddr)> = self
             .open_levels
             .iter()
@@ -2269,6 +2598,7 @@ impl CycleGuard {
     }
 }
 
+// SECTION - fundamental constructors and combinators for MatchTreeStep
 impl<'a> MatchTreeStep<'a> {
     /// Returns a `MatchTreeStep` that rejects all inputs without branching.
     fn reject() -> MatchTreeStep<'a> {
@@ -2376,7 +2706,11 @@ impl<'a> MatchTreeStep<'a> {
         }
         self
     }
+}
+// !SECTION
 
+// SECTION - conversion methods specialized to constructing a `MatchTreeStep` from particular formats
+impl<'a> MatchTreeStep<'a> {
     /// Constructs a [MatchTreeStep] that accepts a given series of sequential formats, with a trailing sequence of partially-consumed formats ([`Next`]s).
     fn from_sequential(
         module: &'a FormatModule,
@@ -2459,6 +2793,33 @@ impl<'a> MatchTreeStep<'a> {
         }
     }
 
+    /// Constructs a [`MatchTreeStep`] that matches the various possible align-offset versions of `next`.
+    ///
+    /// For a given value of `n`, builds a `MatchTreeStep` that represents up to `n - 1` repetitions
+    /// of any single byte, followed by `next`.
+    ///
+    /// For `n == 1`, builds directly from `next`.
+    fn from_align(
+        module: &'a FormatModule,
+        next: Rc<Next<'a>>,
+        n: NonZeroUsize,
+        guard: &mut CycleGuard,
+    ) -> MatchTreeStep<'a> {
+        match n.get() {
+            1 => Self::from_next(module, next, guard), // guaranteed to already be in alignment
+            // skips up to `n - 1` bytes, depending on the position
+            n => Self::from_next(
+                module,
+                Rc::new(Next::RepeatMax(
+                    n - 1,
+                    MaybeTyped::Untyped(any_byte()),
+                    next,
+                )),
+                guard,
+            ),
+        }
+    }
+
     /// Constructs a [MatchTreeStep] from a given (partial) format `inner` and a slice-length `n`
     pub fn from_slice(
         module: &'a FormatModule,
@@ -2484,12 +2845,35 @@ impl<'a> MatchTreeStep<'a> {
         }
     }
 
+    /// Over-approximates a format whose byte-level language cannot be modelled here as `Σ*`,
+    /// followed by `next`. A `MatchTree` can then never tell it apart from an alternative by what
+    /// the alternative reads, so such a choice is rejected (as ambiguous or needing too much
+    /// lookahead) rather than settled by treating the format as matching nothing.
+    fn any_bytes(
+        module: &'a FormatModule,
+        next: Rc<Next<'a>>,
+        guard: &mut CycleGuard,
+    ) -> MatchTreeStep<'a> {
+        Self::from_next(
+            module,
+            Rc::new(Next::Repeat(MaybeTyped::Untyped(any_byte()), next)),
+            guard,
+        )
+    }
+}
+// !SECTION
+
+// SECTION - Core convertors from `Next`-values
+impl<'a> MatchTreeStep<'a> {
     /// Constructs a [MatchTreeStep] from a [`Next`]
     fn from_next(
         module: &'a FormatModule,
         next: Rc<Next<'a>>,
         guard: &mut CycleGuard,
     ) -> MatchTreeStep<'a> {
+        if Some(Next::as_ptr_addr(&next)) == guard.trailer {
+            guard.reached_trailer = true;
+        }
         let left = guard.leave(&next);
         let step = Self::from_next_inner(module, next, guard);
         guard.reenter(left);
@@ -2613,19 +2997,11 @@ impl<'a> MatchTreeStep<'a> {
             }
         }
     }
+}
+// !SECTION
 
-    pub fn from_mt_format(
-        module: &'a FormatModule,
-        f: MTFormatRef<'a>,
-        next: Rc<Next<'a>>,
-        guard: &mut CycleGuard,
-    ) -> MatchTreeStep<'a> {
-        match f {
-            MaybeTyped::Untyped(f) => Self::from_format(module, f, next, guard),
-            MaybeTyped::Typed(tf) => Self::from_gt_format(module, tf, next, guard),
-        }
-    }
-
+// SECTION - utility methods related to recursion
+impl<'a> MatchTreeStep<'a> {
     /// Internal helper to dedup and simplify the common ItemVar/FormatCall handling between `from_format` and `from_gt_format`
     ///
     /// Opens `level` in `guard`, returning `Self::reject` if `level` was already open (a zero-progress cycle; see
@@ -2654,6 +3030,22 @@ impl<'a> MatchTreeStep<'a> {
         let step = f(guard);
         guard.close(level);
         step
+    }
+}
+// !SECTION
+
+// SECTION - high-level `Format`-to-`MatchTreeStep` convertors
+impl<'a> MatchTreeStep<'a> {
+    pub fn from_mt_format(
+        module: &'a FormatModule,
+        f: MTFormatRef<'a>,
+        next: Rc<Next<'a>>,
+        guard: &mut CycleGuard,
+    ) -> MatchTreeStep<'a> {
+        match f {
+            MaybeTyped::Untyped(f) => Self::from_format(module, f, next, guard),
+            MaybeTyped::Typed(tf) => Self::from_gt_format(module, tf, next, guard),
+        }
     }
 
     pub fn from_gt_format(
@@ -2885,7 +3277,6 @@ impl<'a> MatchTreeStep<'a> {
             TypedFormat::WithView(_, _ident, _vf) => Self::from_next(module, next, guard),
         }
     }
-
     /// Constructs a [MatchTreeStep] from an Format and a trailing [`Next`] value
     pub fn from_format(
         module: &'a FormatModule,
@@ -3063,49 +3454,8 @@ impl<'a> MatchTreeStep<'a> {
             Format::WithView(_ident, _vf) => Self::from_next(module, next, guard),
         }
     }
-
-    /// Constructs a [MatchTreeStep] that matches the various possible align-offset versions of `next`, for small enough `n`,
-    /// and otherwise fudges the return value with a universal-acceptance.
-    ///
-    /// NOTE - currently 'small enough' just means that `n` is `1` (irrefutable as an alignment modulus). `n == 0` has no
-    /// valid interpretation, but is unrepresentable (`n: NonZeroUsize`) rather than an illegal value to check for here.
-    fn from_align(
-        module: &'a FormatModule,
-        next: Rc<Next<'a>>,
-        n: NonZeroUsize,
-        guard: &mut CycleGuard,
-    ) -> MatchTreeStep<'a> {
-        match n.get() {
-            1 => Self::from_next(module, next, guard), // guaranteed to already be in alignment
-            // skips up to `n - 1` bytes, depending on the position
-            n => Self::from_next(
-                module,
-                Rc::new(Next::RepeatMax(
-                    n - 1,
-                    MaybeTyped::Untyped(any_byte()),
-                    next,
-                )),
-                guard,
-            ),
-        }
-    }
-
-    /// Over-approximates a format whose byte-level language cannot be modelled here as `Σ*`,
-    /// followed by `next`. A `MatchTree` can then never tell it apart from an alternative by what
-    /// the alternative reads, so such a choice is rejected (as ambiguous or needing too much
-    /// lookahead) rather than settled by treating the format as matching nothing.
-    fn any_bytes(
-        module: &'a FormatModule,
-        next: Rc<Next<'a>>,
-        guard: &mut CycleGuard,
-    ) -> MatchTreeStep<'a> {
-        Self::from_next(
-            module,
-            Rc::new(Next::Repeat(MaybeTyped::Untyped(any_byte()), next)),
-            guard,
-        )
-    }
 }
+// !SECTION
 
 /// Reason why [`MatchTreeLevel::try_grow`] (and hence [`MatchTree::try_build`]) failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3243,12 +3593,14 @@ impl<'a> MatchTreeLevel<'a> {
     /// Otherwise, returns a `MatchTree` that is guaranteed to decide on a unique branch for
     /// all input within at most `depth` bytes of lookahead.
     ///
-    /// Sets `reached_probe` if any step consults [`Next::Probe`].
+    /// If any step consults [`Next::Probe`], sets the corresponding field in `next_usage`.
     fn try_grow(
         module: &'a FormatModule,
         nexts: LevelBranch<'a>,
         depth: usize,
-        reached_probe: &mut bool,
+        next_usage: &mut NextUsage,
+        offset: usize,
+        trailer_offset: Option<usize>,
     ) -> Result<MatchTree, MatchTreeError> {
         if let Some(tree) = Self::accepts(&nexts) {
             Ok(tree)
@@ -3256,12 +3608,16 @@ impl<'a> MatchTreeLevel<'a> {
             let mut tree = Self::reject();
             let mut tmp = Vec::from_iter(nexts);
             tmp.sort_by_key(|(ix, _)| *ix);
+            let mut trailer_offset = trailer_offset;
             for (i, next) in tmp.into_iter() {
                 let _next = next.clone();
                 // instantiate a fresh CycleGuard to detect zero-progress ItemVar cycles in `from_next` call-stack
-                let mut guard = CycleGuard::new();
+                let mut guard = CycleGuard::with_trailer(next_usage.trailer);
                 let subtree = MatchTreeStep::from_next(module, next, &mut guard);
-                *reached_probe |= guard.reached_probe;
+                next_usage.reached_probe |= guard.reached_probe;
+                if guard.reached_trailer && trailer_offset.is_none() {
+                    trailer_offset = Some(offset);
+                }
                 if guard.has_cycle {
                     // Upon detecting a zero-progress cycle, we know the format is not well-formed, and we return early to surface the error to the caller.
                     log::error!(
@@ -3275,9 +3631,20 @@ impl<'a> MatchTreeLevel<'a> {
                 }
                 tree = tree.merge_step(i, subtree)?;
             }
+            if let Some(trailer_offset) = trailer_offset {
+                next_usage.trailer_bytes_read =
+                    Ord::max(next_usage.trailer_bytes_read, offset - trailer_offset + 1);
+            }
             let mut branches = Vec::new();
             for (bs, nexts) in tree.branches {
-                let t = Self::try_grow(module, nexts, depth - 1, reached_probe)?;
+                let t = Self::try_grow(
+                    module,
+                    nexts,
+                    depth - 1,
+                    next_usage,
+                    offset + 1,
+                    trailer_offset,
+                )?;
                 branches.push((bs, t));
             }
             Ok(MatchTree {
@@ -3326,7 +3693,7 @@ impl MatchTree {
         branches: &[Format],
         next: Rc<Next<'_>>,
     ) -> Result<MatchTree, MatchTreeError> {
-        Self::try_build_probed(module, branches, next, &mut false)
+        Self::try_build_probed(module, branches, next, &mut NextUsage::default())
     }
 
     /// Like [`Self::try_build`], but as an error naming `what` (the format whose choice the tree
@@ -3350,22 +3717,73 @@ impl MatchTree {
     /// a [`Next::Probe`] within `next`, i.e. if the tree could differ depending on what that probe
     /// stands for. A failed build also counts, since whether it fails can depend on the probe.
     fn reaches_probe(module: &FormatModule, branches: &[Format], next: Rc<Next<'_>>) -> bool {
-        let mut reached = false;
-        let res = Self::try_build_probed(module, branches, next, &mut reached);
-        reached || res.is_err()
+        let mut next_usage = NextUsage::default();
+        let res = Self::try_build_probed(module, branches, next, &mut next_usage);
+        next_usage.reached_probe || res.is_err()
     }
 
+    /// Computes the maximum possible number of bytes of `trailer` that must be available to read when constructing a `MatchTree`
+    /// over the union of `branches` followed by `next`.
+    ///
+    /// When compiling the format-union implied by `branches`, the answer this method returns must be the shortest byte-length
+    /// that the trailing continuation may be safely truncated to without affecting the decision-graph of the resulting decoder.
+    ///
+    /// # Notes
+    ///
+    /// `trailer` will always be a suffix of `next`, and they may often be the same; `trailer` is specifically
+    /// 'the continuation following the enclosing format whose lookahead is being measured'. In contrast, `next` can also
+    /// include partial-formats that fall after the branch-union, but which are still part of the node we are determining
+    /// extra-lookahead requirements relative to.
+    ///
+    /// E.g. for entry format `Tuple(<Union>, X)`, `next` will end up being `X + trailer`.
+    fn lookahead_into(
+        module: &FormatModule,
+        branches: &[Format],
+        next: Rc<Next<'_>>,
+        trailer: &Rc<Next<'_>>,
+    ) -> usize {
+        let mut next_usage = NextUsage {
+            trailer: Some(Next::as_ptr_addr(trailer)),
+            ..Default::default()
+        };
+        let res = Self::try_build_probed(module, branches, next, &mut next_usage);
+        match res {
+            Err(_) => MATCH_TREE_MAX_DEPTH,
+            Ok(_) => next_usage.trailer_bytes_read,
+        }
+    }
+
+    /// Internal helper for [`Self::try_build`]
+    ///
+    /// Takes an additional parameter to track a [`NextUsage`] value, which serves to record
+    /// how many bytes of the trailing continuation (i.e. `next`) are required for lookahead
+    /// purposes, across all branches.
+    ///
+    /// # Notes
+    ///
+    /// The mutated `NextUsage` argument tracks whether any path witnessed `Next::Probe`, as well
+    /// as the maximum number of bytes of the 'trailer' continuation that any branch or
+    /// decision-path ended up consulting.
     fn try_build_probed(
         module: &FormatModule,
         branches: &[Format],
         next: Rc<Next<'_>>,
-        reached_probe: &mut bool,
+        next_usage: &mut NextUsage,
     ) -> Result<MatchTree, MatchTreeError> {
         let mut nexts = HashSet::new();
         for (i, f) in branches.iter().enumerate() {
             nexts.insert((i, Rc::new(Next::Cat(MaybeTyped::Untyped(f), next.clone()))));
         }
-        MatchTreeLevel::try_grow(module, nexts, MATCH_TREE_MAX_DEPTH, reached_probe)
+        let offset = 0;
+        let trailer_offset = None;
+        MatchTreeLevel::try_grow(
+            module,
+            nexts,
+            MATCH_TREE_MAX_DEPTH,
+            next_usage,
+            offset,
+            trailer_offset,
+        )
     }
 }
 
@@ -4676,6 +5094,151 @@ mod test {
             let (value, _) = prog.run(ReadCtxt::new(input)).unwrap();
             assert!(format!("{value:?}").contains(inner), "{value:?}");
         }
+    }
+
+    /// `value := 'n' ws | '[' ws value* ']' ws | '(' ws value* ')' ws`, with `ws := ' '*`, for the
+    /// test below: whitespace-separated tokens nested inside two kinds of bracket, shaped like
+    /// PDF's arrays and dictionaries.
+    fn register_spaced_brackets(module: &mut FormatModule) -> FormatRef {
+        use crate::helper::{is_byte, repeat};
+
+        let ws = || repeat(is_byte(b' '));
+        let bracketed = |open: u8, close: u8| {
+            Format::Tuple(vec![
+                is_byte(open),
+                ws(),
+                repeat(Format::RecVar(0)),
+                is_byte(close),
+                ws(),
+            ])
+        };
+        let value = Format::Union(vec![
+            Format::Variant(
+                Label::Borrowed("Atom"),
+                Box::new(Format::Tuple(vec![is_byte(b'n'), ws()])),
+            ),
+            Format::Variant(Label::Borrowed("List"), Box::new(bracketed(b'[', b']'))),
+            Format::Variant(Label::Borrowed("Group"), Box::new(bracketed(b'(', b')'))),
+        ]);
+        module.define_batch_recvar(vec![("test.spaced_brackets", value)])[0]
+    }
+
+    /// Each trailing `ws` decides whether to read another space by looking one byte past itself,
+    /// into its continuation, so `value` depends on its continuation. The nested calls' continuations
+    /// differ by which brackets enclose them; truncating each to [`MATCH_TREE_MAX_DEPTH`] bytes
+    /// still leaves exponentially many in the nesting depth, whereas truncating to the lookahead
+    /// `value` actually uses leaves a handful.
+    #[test]
+    fn continuation_dependent_recursion_truncates_to_lookahead_used() {
+        let mut module = FormatModule::new();
+        let value = register_spaced_brackets(&mut module);
+        let prog = super::decoder::Compiler::compile_program(&module, &value.call()).unwrap();
+        assert!(
+            prog.decoders.len() <= 32,
+            "{} decoders",
+            prog.decoders.len()
+        );
+        assert!(prog.run(ReadCtxt::new(b"[ ( n [n] ) n ]  ")).is_ok());
+        assert!(prog.run(ReadCtxt::new(b"[ ( n ] )")).is_err());
+    }
+
+    #[test]
+    fn lookahead_into_counts_bytes_read_from_the_trailer() {
+        use crate::helper::{byte_seq, is_byte};
+
+        let module = FormatModule::new();
+        let a_or_ab = [is_byte(b'a'), byte_seq(b"ab")];
+        let measure = |branches: &[Format], trailer_bytes: &[u8]| {
+            let fields: Vec<Format> = trailer_bytes.iter().map(|b| is_byte(*b)).collect();
+            let trailer = Rc::new(Next::Sequence(
+                MaybeTyped::Untyped(&fields[..]),
+                Rc::new(Next::Empty),
+            ));
+            MatchTree::lookahead_into(&module, branches, trailer.clone(), &trailer)
+        };
+        // settled by the trailer's first byte
+        assert_eq!(measure(&a_or_ab, b"c"), 1);
+        // the trailer's `b` looks like the second branch's, so its next byte is needed too
+        assert_eq!(measure(&a_or_ab, b"bd"), 2);
+        // settled before either branch finishes, so the trailer is never reached
+        let a_x_or_a_y = [byte_seq(b"ax"), byte_seq(b"ay")];
+        assert_eq!(measure(&a_x_or_a_y, b"c"), 0);
+        // no lookahead can separate identical branches, so the build fails
+        let a_or_a = [is_byte(b'a'), is_byte(b'a')];
+        assert_eq!(measure(&a_or_a, b"c"), MATCH_TREE_MAX_DEPTH);
+    }
+
+    #[test]
+    fn format_lookahead_is_correct() {
+        use crate::helper::{byte_seq, is_byte, repeat, tuple, union};
+
+        let module = FormatModule::new();
+        let fields = [is_byte(b'c')];
+        let trailer = Rc::new(Next::Sequence(
+            MaybeTyped::Untyped(&fields[..]),
+            Rc::new(Next::Empty),
+        ));
+        let measure = |format: &Format| {
+            NextDependence::default().format_lookahead(&module, format, trailer.clone(), &trailer)
+        };
+        let a_or_ab = || union([is_byte(b'a'), byte_seq(b"ab")]);
+        // the union is last, so what follows it is the trailer
+        assert_eq!(measure(&tuple([is_byte(b'x'), a_or_ab()])), 1);
+        // `'x'` against `'b'` settles the union before the trailer is reached
+        assert_eq!(measure(&tuple([a_or_ab(), is_byte(b'x')])), 0);
+        // `'b'` can't settle it, so the first branch's path goes on into the trailer
+        assert_eq!(measure(&tuple([a_or_ab(), is_byte(b'b')])), 1);
+        // stop-or-continue for a repeat also branches
+        assert_eq!(measure(&repeat(is_byte(b' '))), 1);
+        // a nullable repeat body can't be compiled, no matter what follows
+        assert_eq!(
+            measure(&repeat(repeat(is_byte(b' ')))),
+            MATCH_TREE_MAX_DEPTH
+        );
+    }
+
+    #[test]
+    fn lookahead_budget_is_correct() {
+        use crate::helper::{alts, byte_seq, is_byte};
+
+        fn seq<'a>(fields: &'a [Format], rest: Rc<Next<'a>>) -> Rc<Next<'a>> {
+            Rc::new(Next::Sequence(MaybeTyped::Untyped(fields), rest))
+        }
+        let empty = || Rc::new(Next::Empty);
+
+        let mut module = FormatModule::new();
+        let a_or_ab = module
+            .define_format(
+                "test.a_or_ab",
+                alts([("A", is_byte(b'a')), ("AB", byte_seq(b"ab"))]),
+            )
+            .get_level();
+        let tree = register_tree(&mut module).get_level();
+        let brackets = register_spaced_brackets(&mut module).get_level();
+
+        let c = [is_byte(b'c')];
+        let d = [is_byte(b'd')];
+        let bd = [is_byte(b'b'), is_byte(b'd')];
+        let mut dep = NextDependence::default();
+
+        // the result is how many bytes of the continuation the level consults
+        assert_eq!(dep.lookahead_budget(&module, a_or_ab, &seq(&c, empty())), 1);
+        assert_eq!(
+            dep.lookahead_budget(&module, a_or_ab, &seq(&bd, empty())),
+            2
+        );
+        // a recursive level: nested calls must not stop this from finishing
+        assert_eq!(
+            dep.lookahead_budget(&module, brackets, &seq(&c, empty())),
+            1
+        );
+
+        // a level that never reads what follows it keeps none of it
+        let cut = dep.call_continuation(&module, tree, &seq(&c, empty()));
+        assert!(matches!(cut.as_ref(), Next::Empty));
+        // one that reads a byte of it keeps only that much
+        let cut = dep.call_continuation(&module, a_or_ab, &seq(&c, seq(&d, empty())));
+        assert_eq!(cut, seq(&c, empty()));
     }
 
     /// `peano := 'Z' | 'S' ~ peano`, registered as a batch, for the tests below.

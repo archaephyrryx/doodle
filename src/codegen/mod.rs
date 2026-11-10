@@ -58,7 +58,7 @@ mod tests;
 mod trace;
 
 mod typed_decoder;
-use typed_decoder::{GTCompiler, GTDecoder, TypedDecoder};
+pub(crate) use typed_decoder::{GTCompiler, GTDecoder, TypedDecoder};
 
 pub(crate) mod typed_format;
 use typed_format::{
