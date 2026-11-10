@@ -2013,6 +2013,11 @@ pub(crate) struct NextDependence<'a> {
     depends: LevelAnalytics,
     /// Analysis-cache for lookahead byte-depth
     lookahead: LevelAnalytics<(usize, Rc<Next<'a>>), usize>,
+    /// Makes [`Self::call_continuation`] cut each continuation at [`MATCH_TREE_MAX_DEPTH`] bytes,
+    /// as the compilers did before cutting to what a level consults, so that tests can compare
+    /// the two.
+    #[cfg(test)]
+    cut_at_max_depth: bool,
 }
 
 /// Helper-struct for consolidating the design of 'depends-on-next' and 'lookahead byte-depth' caching
@@ -2182,10 +2187,32 @@ impl<'a> NextDependence<'a> {
     ) -> Rc<Next<'a>> {
         if !self.level_depends_on_next(module, level) {
             Rc::new(Next::Empty)
+        } else if self.cuts_at_max_depth() {
+            Next::truncated(next, module, MATCH_TREE_MAX_DEPTH)
         } else {
             let nbytes = self.lookahead_budget(module, level, next);
             Next::truncated(next, module, nbytes)
         }
+    }
+
+    /// A `NextDependence` whose [`Self::call_continuation`] cuts each continuation it keeps at
+    /// [`MATCH_TREE_MAX_DEPTH`] bytes instead of at what the level consults.
+    #[cfg(test)]
+    pub(crate) fn cutting_at_max_depth() -> Self {
+        Self {
+            cut_at_max_depth: true,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn cuts_at_max_depth(&self) -> bool {
+        self.cut_at_max_depth
+    }
+
+    #[cfg(not(test))]
+    fn cuts_at_max_depth(&self) -> bool {
+        false
     }
 
     fn lookahead_for_key(
@@ -5096,10 +5123,15 @@ mod test {
         }
     }
 
-    /// `value := 'n' ws | '[' ws value* ']' ws | '(' ws value* ')' ws`, with `ws := ' '*`, for the
-    /// test below: whitespace-separated tokens nested inside two kinds of bracket, shaped like
-    /// PDF's arrays and dictionaries.
-    fn register_spaced_brackets(module: &mut FormatModule) -> FormatRef {
+    /// `value := 'n' ws | open ws value* close ws | ...`, with `ws := ' '*` and one bracketed
+    /// alternative per entry of `brackets` (its variant name, opening byte and closing byte):
+    /// whitespace-separated tokens nested inside brackets. With [`SPACED_BRACKETS`] it is
+    /// `value := 'n' ws | '[' ws value* ']' ws | '(' ws value* ')' ws`, shaped like PDF's arrays
+    /// and dictionaries.
+    fn register_spaced_brackets(
+        module: &mut FormatModule,
+        brackets: &[(&'static str, u8, u8)],
+    ) -> FormatRef {
         use crate::helper::{is_byte, repeat};
 
         let ws = || repeat(is_byte(b' '));
@@ -5112,16 +5144,22 @@ mod test {
                 ws(),
             ])
         };
-        let value = Format::Union(vec![
-            Format::Variant(
-                Label::Borrowed("Atom"),
-                Box::new(Format::Tuple(vec![is_byte(b'n'), ws()])),
-            ),
-            Format::Variant(Label::Borrowed("List"), Box::new(bracketed(b'[', b']'))),
-            Format::Variant(Label::Borrowed("Group"), Box::new(bracketed(b'(', b')'))),
-        ]);
+        let mut branches = vec![Format::Variant(
+            Label::Borrowed("Atom"),
+            Box::new(Format::Tuple(vec![is_byte(b'n'), ws()])),
+        )];
+        for &(name, open, close) in brackets {
+            branches.push(Format::Variant(
+                Label::Borrowed(name),
+                Box::new(bracketed(open, close)),
+            ));
+        }
+        let value = Format::Union(branches);
         module.define_batch_recvar(vec![("test.spaced_brackets", value)])[0]
     }
+
+    /// Two kinds of bracket for [`register_spaced_brackets`].
+    const SPACED_BRACKETS: &[(&str, u8, u8)] = &[("List", b'[', b']'), ("Group", b'(', b')')];
 
     /// Each trailing `ws` decides whether to read another space by looking one byte past itself,
     /// into its continuation, so `value` depends on its continuation. The nested calls' continuations
@@ -5131,7 +5169,7 @@ mod test {
     #[test]
     fn continuation_dependent_recursion_truncates_to_lookahead_used() {
         let mut module = FormatModule::new();
-        let value = register_spaced_brackets(&mut module);
+        let value = register_spaced_brackets(&mut module, SPACED_BRACKETS);
         let prog = super::decoder::Compiler::compile_program(&module, &value.call()).unwrap();
         assert!(
             prog.decoders.len() <= 32,
@@ -5140,6 +5178,94 @@ mod test {
         );
         assert!(prog.run(ReadCtxt::new(b"[ ( n [n] ) n ]  ")).is_ok());
         assert!(prog.run(ReadCtxt::new(b"[ ( n ] )")).is_err());
+    }
+
+    /// Asserts that programs `p` and `q` decode alike, naming them `what` on failure.
+    ///
+    /// Both are walked in step from their entry points (index 0): each pair of decoders reached
+    /// together must have equal types and be equal apart from which decoders they call, and the
+    /// decoders they call are then compared pairwise in turn. Neither how the decoders are
+    /// numbered, nor a recursive level coming out as a cycle of a different length in each
+    /// program, makes a difference, just as neither does to the interpreter.
+    fn assert_decode_alike<D, T>(what: &str, p: &[(D, T)], q: &[(D, T)])
+    where
+        D: super::decoder::CallIndices + Clone + PartialEq + std::fmt::Debug,
+        T: PartialEq + std::fmt::Debug,
+    {
+        // `d` with every call index replaced by 0, and the indices it called in order
+        let split_calls = |d: &D| {
+            let mut d = d.clone();
+            let mut callees = Vec::new();
+            d.for_each_call_mut(&mut |ix| {
+                callees.push(*ix);
+                *ix = 0;
+            });
+            (d, callees)
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut pending = vec![(0, 0)];
+        while let Some((i, j)) = pending.pop() {
+            if !seen.insert((i, j)) {
+                continue;
+            }
+            let ((dp, tp), (dq, tq)) = (&p[i], &q[j]);
+            assert_eq!(tp, tq, "{what}: types of decoders {i} and {j} differ");
+            let (dp, callees_p) = split_calls(dp);
+            let (dq, callees_q) = split_calls(dq);
+            assert_eq!(dp, dq, "{what}: decoders {i} and {j} differ");
+            pending.extend(callees_p.into_iter().zip(callees_q));
+        }
+    }
+
+    /// Compiling each call against its continuation cut to what the called level consults gives
+    /// a program that decodes exactly as one whose calls are cut at [`MATCH_TREE_MAX_DEPTH`]
+    /// bytes, as the compilers did before, which cannot change what a level decodes.
+    ///
+    /// The grammars are ones where the two cuts differ but the old one still compiles quickly:
+    /// recursion through one kind of bracket rather than two, a recursive level that looks into
+    /// its continuation only through its own alternatives, and non-recursive calls that look
+    /// two bytes ahead, or through a nullable call.
+    #[test]
+    fn cut_continuations_decode_as_uncut() {
+        use super::decoder::Compiler;
+        use crate::helper::{is_byte, repeat};
+
+        let mut module = FormatModule::new();
+        let cont_tree = register_continuation_dependent_tree(&mut module);
+        let list = register_spaced_brackets(&mut module, &[("List", b'[', b']')]);
+        let ws = module.define_format("test.ws", repeat(is_byte(b' ')));
+        let a_or_ab = module.define_format(
+            "test.a_or_ab",
+            Format::Union(vec![
+                Format::Variant(Label::Borrowed("A"), Box::new(is_byte(b'a'))),
+                Format::Variant(
+                    Label::Borrowed("AB"),
+                    Box::new(Format::Tuple(vec![is_byte(b'a'), is_byte(b'b')])),
+                ),
+            ]),
+        );
+        // `a_or_ab` looks through the nullable `ws` into whatever follows the token
+        let token =
+            module.define_format("test.token", Format::Tuple(vec![a_or_ab.call(), ws.call()]));
+        // the last `a_or_ab` needs both of the bytes after it to tell `a` from `ab`
+        let tokens = Format::Tuple(vec![
+            token.call(),
+            token.call(),
+            a_or_ab.call(),
+            is_byte(b'b'),
+            is_byte(b'd'),
+        ]);
+
+        for (what, format) in [
+            ("cont_tree", cont_tree.call()),
+            ("list", list.call()),
+            ("tokens", tokens),
+        ] {
+            let cut = Compiler::compile_program(&module, &format).unwrap();
+            let reference =
+                Compiler::compile_program_cutting_at_max_depth(&module, &format).unwrap();
+            assert_decode_alike(what, &cut.decoders, &reference.decoders);
+        }
     }
 
     #[test]
@@ -5214,7 +5340,7 @@ mod test {
             )
             .get_level();
         let tree = register_tree(&mut module).get_level();
-        let brackets = register_spaced_brackets(&mut module).get_level();
+        let brackets = register_spaced_brackets(&mut module, SPACED_BRACKETS).get_level();
 
         let c = [is_byte(b'c')];
         let d = [is_byte(b'd')];

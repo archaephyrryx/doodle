@@ -484,7 +484,27 @@ impl<'a> Compiler<'a> {
 
     /// Compiles a top-level entry-point `Format` into a `Program` using the provided `FormatModule`.
     pub fn compile_program(module: &FormatModule, format: &Format) -> AResult<Program> {
+        Self::compile_program_with(module, format, NextDependence::default())
+    }
+
+    /// Like [`Self::compile_program`], but with every call compiled against its continuation cut
+    /// at `MATCH_TREE_MAX_DEPTH` bytes, as before calls were cut to what their level consults
+    /// (see `NextDependence::cutting_at_max_depth`).
+    #[cfg(test)]
+    pub(crate) fn compile_program_cutting_at_max_depth(
+        module: &FormatModule,
+        format: &Format,
+    ) -> AResult<Program> {
+        Self::compile_program_with(module, format, NextDependence::cutting_at_max_depth())
+    }
+
+    fn compile_program_with<'m>(
+        module: &'m FormatModule,
+        format: &'m Format,
+        next_dependence: NextDependence<'m>,
+    ) -> AResult<Program> {
         let mut compiler = Compiler::new(module);
+        compiler.next_dependence = next_dependence;
         // type
         let scope = TypeScope::with_rec_types(&module.format_types);
         let t = module.infer_format_type(&scope, format)?;

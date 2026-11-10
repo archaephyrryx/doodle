@@ -472,8 +472,10 @@ bound this, both in `src/lib.rs` and used by both compilers:
   a pair reached again while its own answer is being worked out assumed to consult nothing. No such
   answer is final in the way a `true` dependence answer is, so one that relied on that assumption for
   a pair further out is never cached. That this single pass reaches the least fixpoint of the
-  measurement has been argued, not proven, and no test compares a decoder compiled against a cut
-  continuation with one compiled against the original.
+  measurement has been argued, not proven. `cut_continuations_decode_as_uncut` (in `src/lib.rs`)
+  checks, for a few grammars where the two cuts differ, that the interpreter's program decodes
+  exactly as one compiled with every call cut at 80 bytes instead; it does not cover `GTCompiler`,
+  or grammars like the two-bracket one above, for which the 80-byte cut never finishes compiling.
 
 That leaves levels that depend on their continuation but are called with continuations that happen
 not to differ in anything they consult: these compile to identical decoders. Once compilation
