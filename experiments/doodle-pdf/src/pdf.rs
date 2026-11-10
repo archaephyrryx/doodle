@@ -39,7 +39,10 @@ fn hex_num_u32(len: usize) -> Format {
         lambda(
             "raw",
             left_fold(
-                lambda_tuple(["acc", "b"], add(var("b"), mul(var("acc"), Expr::U32(16)))),
+                lambda_tuple(
+                    ["acc", "b"],
+                    add(as_u32(var("b")), mul(var("acc"), Expr::U32(16))),
+                ),
                 Expr::U32(0),
                 ValueType::Base(BaseType::U32),
                 var("raw"),
@@ -269,8 +272,23 @@ fn v_hex_string(any_ws: FormatRef) -> Format {
     )
 }
 
+/// Parses `digits` and then requires that no digit follows, so a run of digits is read as one token.
+fn greedy_digits(digits: Format) -> Format {
+    chain(
+        digits,
+        "ds",
+        monad_seq(
+            Format::PeekNot(Box::new(Format::Byte(DIGIT))),
+            compute(var("ds")),
+        ),
+    )
+}
+
 fn natural(module: &mut FormatModule) -> FormatRef {
-    module.define_format("pdf.util.natural", repeat1(Format::Byte(DIGIT)))
+    module.define_format(
+        "pdf.util.natural",
+        greedy_digits(repeat1(Format::Byte(DIGIT))),
+    )
 }
 
 // TODO: add support to allow de-stringification of numbers
@@ -280,7 +298,7 @@ fn number(module: &mut FormatModule, natural: FormatRef) -> FormatRef {
         "n",
         Format::UnionNondet(vec![
             chain(
-                cons(is_byte(b'.'), repeat(Format::Byte(DIGIT))),
+                cons(is_byte(b'.'), greedy_digits(repeat(Format::Byte(DIGIT)))),
                 "frac",
                 compute(append(var("n"), var("frac"))),
             ),
@@ -293,7 +311,7 @@ fn number(module: &mut FormatModule, natural: FormatRef) -> FormatRef {
         "pdf.util.unsigned_number",
         Format::UnionNondet(vec![
             unsigned_lead_digits,
-            cons(is_byte(b'.'), repeat1(Format::Byte(DIGIT))),
+            cons(is_byte(b'.'), greedy_digits(repeat1(Format::Byte(DIGIT)))),
         ]),
     );
 
@@ -307,7 +325,7 @@ fn number(module: &mut FormatModule, natural: FormatRef) -> FormatRef {
                     lambda(
                         "digits",
                         concat(Expr::Seq(vec![
-                            Expr::Seq(vec![as_char(Expr::U8(b'-'))]),
+                            Expr::Seq(vec![Expr::U8(b'-')]),
                             var("digits"),
                         ])),
                     ),
@@ -408,19 +426,31 @@ fn v_name(module: &mut FormatModule, any_ws: FormatRef) -> FormatRef {
         );
         union([Format::Byte(ok_raw), name_esc])
     };
-    module.define_format(
-        "pdf.value.name",
-        token(cons(is_byte(b'/'), repeat(name_char)), any_ws),
-    )
+    // A name runs until whitespace or a delimiter, so no name character (raw or `#`-escaped) may follow it
+    let name_start = ByteSet::from(*b"\0\t\n\x0C\r ()<>[]{}/%").complement();
+    let name = chain(
+        cons(is_byte(b'/'), repeat(name_char)),
+        "name",
+        monad_seq(
+            Format::PeekNot(Box::new(Format::Byte(name_start))),
+            compute(var("name")),
+        ),
+    );
+    module.define_format("pdf.value.name", token(name, any_ws))
 }
 
+/// Daedalus `Value`, as a recursive batch of `pdf.value`, `pdf.value.array` and `pdf.value.dict`.
+///
+/// Each member takes a nesting limit `lim : u64`; entering an array or dict decrements it, and
+/// nesting deeper than the limit fails. Returns `[value, dict]`, both expecting `lim`.
 fn pdf_value(
     module: &mut FormatModule,
     any_ws: FormatRef,
     eol: FormatRef,
     natural: FormatRef,
+    number: FormatRef,
     v_name: FormatRef,
-) -> FormatRef {
+) -> [FormatRef; 2] {
     let v_null = void(kw(b"null", any_ws));
     let v_bool = interpret([
         (kw(b"true", any_ws), Expr::Bool(true)),
@@ -431,21 +461,70 @@ fn pdf_value(
         ("gen", token(natural.call(), any_ws)),
         ("__kw", kw(b"R", any_ws)),
     ]);
+    let v_number = token(number.call(), any_ws);
 
     let v_string = v_string(module, any_ws, eol);
     let v_hex_string = v_hex_string(any_ws);
-    let pdf_value = module.define_format(
-        "pdf.value",
-        alts_nondet([
-            ("null", v_null),
-            ("bool", v_bool),
-            ("ref", v_ref),
-            ("name", v_name.call()),
-            ("string", v_string),
-            ("string", v_hex_string),
-        ]),
+
+    // Fails once nesting exceeds the limit, otherwise parses `f`. Used after the opening bracket
+    // has been consumed, so that the array/dict branch always consumes input.
+    let nested = |f: Format| {
+        if_then_else(
+            expr_eq(var("lim"), Expr::U64(0)),
+            Format::Fail, // "value nesting limit exceeded"
+            f,
+        )
+    };
+    let inner_lim = || vec![sub(var("lim"), Expr::U64(1))];
+
+    let lim = || vec![(Label::Borrowed("lim"), ValueType::Base(BaseType::U64))];
+    let [value, _array, dict] = module.define_batch_with_args(
+        [
+            ("pdf.value", lim()),
+            ("pdf.value.array", lim()),
+            ("pdf.value.dict", lim()),
+        ],
+        [
+            Box::new(move |&[_, array, dict]: &[FormatRef; 3]| {
+                // `ref` comes before `number`, so that `1 0 R` isn't read as two numbers
+                alts_nondet([
+                    ("null", v_null),
+                    ("bool", v_bool),
+                    ("ref", v_ref),
+                    ("name", v_name.call()),
+                    ("string", v_string),
+                    ("string", v_hex_string),
+                    ("number", v_number),
+                    ("array", array.call_args(vec![var("lim")])),
+                    ("dict", dict.call_args(vec![var("lim")])),
+                ])
+            }),
+            Box::new(move |&[value, _, _]: &[FormatRef; 3]| {
+                monad_seq(
+                    kw(b"[", any_ws),
+                    nested(chain(
+                        repeat(value.call_args(inner_lim())),
+                        "elems",
+                        monad_seq(kw(b"]", any_ws), compute(var("elems"))),
+                    )),
+                )
+            }),
+            Box::new(move |&[value, _, _]: &[FormatRef; 3]| {
+                monad_seq(
+                    kw(b"<<", any_ws),
+                    nested(chain(
+                        repeat(record([
+                            ("key", v_name.call()),
+                            ("value", value.call_args(inner_lim())),
+                        ])),
+                        "entries",
+                        monad_seq(kw(b">>", any_ws), compute(var("entries"))),
+                    )),
+                )
+            }),
+        ],
     );
-    pdf_value
+    [value, dict]
 }
 
 fn token(f: Format, any_ws: FormatRef) -> Format {
@@ -479,7 +558,7 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
     let natural = natural(module);
     let number = number(module, natural);
 
-    let pdf_value = pdf_value(module, any_ws, eol, natural, v_name);
+    let [pdf_value, pdf_dict] = pdf_value(module, any_ws, eol, natural, number, v_name);
     let pdf_value_type = module.get_format_type(pdf_value.get_level()).clone();
     let stream: FormatRef = todo!("implement Stream (val : Value)");
     let top_decl_def = module.define_format_args(
@@ -496,33 +575,18 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
             ("id", token(natural.call(), any_ws)),
             ("gen", token(natural.call(), any_ws)),
             ("__kw_obj", kw(b"obj", any_ws)),
-            ("_val", pdf_value.call()),
+            ("_val", pdf_value.call_args(vec![Expr::U64(32)])),
             ("obj", top_decl_def.call_args(vec![var("_val")])),
             ("__kw_end", kw(b"endobj", any_ws)),
         ]),
     );
     let cross_ref_section: FormatRef = todo!();
-    let pdf_dict = {
-        let dict = module.define_format_args(
-            "pdf.util.dict",
-            vec![(Label::Borrowed("lim"), ValueType::Base(BaseType::U64))],
-            between(
-                b"<<",
-                b">>",
-                repeat(record([
-                    ("key", v_name.call()),
-                    ("value", pdf_value.call_args(vec![var("lim")])),
-                ])),
-                any_ws,
-            ),
-        );
-
-        module.define_format("pdf.util.pdf-dict", dict.call_args(vec![Expr::U64(32)]))
-    };
-
     let trailer = module.define_format(
         "pdf.trailer",
-        monad_seq(kw(b"trailer", any_ws), pdf_dict.call()),
+        monad_seq(
+            kw(b"trailer", any_ws),
+            pdf_dict.call_args(vec![Expr::U64(32)]),
+        ),
     );
 
     let pdf_chunk = module.define_format(
