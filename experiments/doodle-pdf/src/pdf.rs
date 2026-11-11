@@ -119,19 +119,8 @@ fn interpret(assocs: impl IntoIterator<Item = (Format, Expr)>) -> Format {
 }
 
 /// Skips bytes up to the first offset at which `f` matches, then parses `f` there.
-///
-/// PROVISIONAL: each skipped byte is guarded by `PeekNot(f)`, so the repetition stops at the
-/// first offset where `f` matches. The decoder only compiles `PeekNot` over a format with
-/// bounded lookahead (at most 1024 bytes), so this only works for such `f`; in particular the
-/// `pdf.main` call site, whose `f` ends in an unbounded `number`, does not compile.
 fn skip_to(f: Format) -> Format {
-    monad_seq(
-        repeat(monad_seq(
-            Format::PeekNot(Box::new(f.clone())),
-            Format::ANY_BYTE,
-        )),
-        f,
-    )
+    Format::SkipTo(Box::new(f))
 }
 
 /// Parse `f` and ensure that there is no trailing content
@@ -639,13 +628,14 @@ mod tests {
         }
     }
 
-    /// `skip_to` stops at the first offset where its (bounded-lookahead) format matches,
-    /// including offset 0 and after a partial match, and fails if there is no such offset.
+    /// `skip_to` stops at the first offset where its format matches, including offset 0 and
+    /// after a partial match, and fails if there is no such offset. The format is the one
+    /// `pdf.main` skips to, whose trailing `number` needs unbounded lookahead.
     #[test]
     fn skip_to_finds_first_match() {
         let long = [vec![b'x'; 1000], b"%PDF-7".to_vec()].concat();
         let cases: &[(&[u8], bool)] = &[
-            (b"%PDF-1", true),
+            (b"%PDF-1.7", true),
             (b"garbage\n%PDF-4", true),
             (b"%PDF%PDF-2", true),
             (b"%PDF-", false),
@@ -654,7 +644,12 @@ mod tests {
             (&long, true),
         ];
         let mut module = FormatModule::new();
-        let digit = byte_in(b'0'..=b'9');
-        check_skip_to(&mut module, monad_seq(is_bytes(b"%PDF-"), digit), cases);
+        let natural = natural(&mut module);
+        let number = number(&mut module, natural);
+        check_skip_to(
+            &mut module,
+            monad_seq(is_bytes(b"%PDF-"), number.call()),
+            cases,
+        );
     }
 }
