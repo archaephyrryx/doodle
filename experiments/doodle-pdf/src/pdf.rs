@@ -118,14 +118,20 @@ fn interpret(assocs: impl IntoIterator<Item = (Format, Expr)>) -> Format {
     union(assocs.into_iter().map(|(f, e)| monad_seq(f, compute(e))))
 }
 
-/// Greedily matches the given format, skipping any bytes that don't match.
-fn skip_to(_f: Format) -> Format {
-    // FIXME - we need a combinator for this to avoid infinite recursion while constructing the Format
-    // Format::UnionNondet(vec![
-    //     f.clone(),
-    //     monad_seq(Format::ANY_BYTE, skip_to(f)),
-    // ])
-    todo!()
+/// Skips bytes up to the first offset at which `f` matches, then parses `f` there.
+///
+/// PROVISIONAL: each skipped byte is guarded by `PeekNot(f)`, so the repetition stops at the
+/// first offset where `f` matches. The decoder only compiles `PeekNot` over a format with
+/// bounded lookahead (at most 1024 bytes), so this only works for such `f`; in particular the
+/// `pdf.main` call site, whose `f` ends in an unbounded `number`, does not compile.
+fn skip_to(f: Format) -> Format {
+    monad_seq(
+        repeat(monad_seq(
+            Format::PeekNot(Box::new(f.clone())),
+            Format::ANY_BYTE,
+        )),
+        f,
+    )
 }
 
 /// Parse `f` and ensure that there is no trailing content
@@ -612,4 +618,43 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
             ("__rem", repeat(any_ws.call())),
         ])),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use doodle::{decoder::Compiler, read::ReadCtxt};
+
+    /// Decodes each input with `skip_to(f)` and checks whether it succeeds.
+    fn check_skip_to(module: &mut FormatModule, f: Format, cases: &[(&[u8], bool)]) {
+        let top = module.define_format("test.skip_to", skip_to(f));
+        let prog = Compiler::compile_program(module, &top.call()).expect("skip_to must compile");
+        for (input, ok) in cases {
+            assert_eq!(
+                prog.run(ReadCtxt::new(input)).is_ok(),
+                *ok,
+                "decoding {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// `skip_to` stops at the first offset where its (bounded-lookahead) format matches,
+    /// including offset 0 and after a partial match, and fails if there is no such offset.
+    #[test]
+    fn skip_to_finds_first_match() {
+        let long = [vec![b'x'; 1000], b"%PDF-7".to_vec()].concat();
+        let cases: &[(&[u8], bool)] = &[
+            (b"%PDF-1", true),
+            (b"garbage\n%PDF-4", true),
+            (b"%PDF%PDF-2", true),
+            (b"%PDF-", false),
+            (b"no header here", false),
+            (b"", false),
+            (&long, true),
+        ];
+        let mut module = FormatModule::new();
+        let digit = byte_in(b'0'..=b'9');
+        check_skip_to(&mut module, monad_seq(is_bytes(b"%PDF-"), digit), cases);
+    }
 }
