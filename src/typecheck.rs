@@ -3791,6 +3791,12 @@ impl TypeChecker {
                 self.unify_var_utype(newvar, peek_t)?;
                 Ok(newvar)
             }
+            Format::SkipTo(inner) => {
+                let newvar = self.get_new_uvar();
+                let inner_t = self.infer_utype_format(inner, ctxt)?;
+                self.unify_var_utype(newvar, inner_t)?;
+                Ok(newvar)
+            }
             Format::PeekNot(peek) => {
                 let newvar = self.init_var_simple(UType::UNIT)?.0;
                 let _peek_t = self.infer_utype_format(peek, ctxt)?;

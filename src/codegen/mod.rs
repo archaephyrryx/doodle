@@ -5269,6 +5269,8 @@ impl<'a> Elaborator<'a> {
                 self.codegen.name_gen.ctxt.escape();
                 TypedFormat::FormatCall(gt, *level, t_args, t_views, t_inner)
             }
+            // FIXME[codegen-gap] - SkipTo is interpreter-only for now; no TypedFormat/decoder exists for it
+            Format::SkipTo(_) => unimplemented!("codegen does not yet support Format::SkipTo"),
             Format::RecVar(_) => unreachable!(
                 "Format::RecVar is rewritten to ItemVar at batch registration; never appears in a stored Format"
             ),

@@ -466,6 +466,10 @@ mod census {
                 pop.add_format("Peek");
                 crawl(format, module, pop);
             }
+            Format::SkipTo(format) => {
+                pop.add_format("SkipTo");
+                crawl(format, module, pop);
+            }
             Format::PeekNot(format) => {
                 pop.add_format("PeekNot");
                 crawl(format, module, pop);

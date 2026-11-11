@@ -236,6 +236,8 @@ pub enum Decoder {
     RepeatBetween(MatchTree, RepeatRange, Box<Decoder>),
     ForEach(Box<Expr>, Label, Box<Decoder>),
     SkipRemainder,
+    /// Tries the decoder at each successive offset, yielding its value at the first one where it succeeds
+    SkipTo(Box<Decoder>),
     DecodeBytes(Box<Expr>, Box<Decoder>),
     ParseFromView(ViewExpr, Box<Decoder>),
     LetFormat(Box<Decoder>, Label, Box<Decoder>),
@@ -390,6 +392,7 @@ impl CallIndices for Decoder {
             | Decoder::Maybe(_, d)
             | Decoder::Peek(d)
             | Decoder::PeekNot(d)
+            | Decoder::SkipTo(d)
             | Decoder::Slice(_, d)
             | Decoder::Bits(d)
             | Decoder::WithRelativeOffset(_, _, d)
@@ -620,6 +623,11 @@ impl<'a> Compiler<'a> {
             Format::Align(n) => Ok(Decoder::Align(*n)),
             Format::Byte(bs) => Ok(Decoder::Byte(*bs)),
             Format::SkipRemainder => Ok(Decoder::SkipRemainder),
+            // tried at each offset in turn, as the `f` branch of `S := UnionNondet[f, ANY_BYTE ~ S]` would be
+            Format::SkipTo(f) => {
+                let d = self.compile_format(f, next.clone())?;
+                Ok(Decoder::SkipTo(Box::new(d)))
+            }
             Format::Variant(label, f) => {
                 let d = self.compile_format(f, next.clone())?;
                 Ok(Decoder::Variant(label.clone(), Box::new(d)))
@@ -922,6 +930,7 @@ impl Decoder {
             Decoder::Fail => Self::parse_fail,
             Decoder::Pos => Self::parse_pos,
             Decoder::SkipRemainder => Self::parse_skip_remainder,
+            Decoder::SkipTo(..) => Self::parse_skip_to,
             Decoder::EndOfInput => Self::parse_end_of_input,
             Decoder::Align(..) => Self::parse_align,
             Decoder::Byte(..) => Self::parse_byte,
@@ -1037,6 +1046,36 @@ impl Decoder {
     ) -> EDecodeResult<(Value, ReadCtxt<'input>)> {
         let input = input.skip_remainder();
         Ok(WithErr::new((Value::UNIT, input)))
+    }
+
+    #[inline(never)]
+    fn parse_skip_to<'input>(
+        &self,
+        program: &Program,
+        scope: &Scope<'_>,
+        input: ReadCtxt<'input>,
+    ) -> EDecodeResult<(Value, ReadCtxt<'input>)> {
+        let Decoder::SkipTo(d) = self else {
+            unreachable!()
+        };
+        // As in `parse_parallel`: inside a recursive decoder, hitting the recursion limit
+        // rejects the input; outside one it only rules out the current offset.
+        let limit_is_fatal = recursion_depth() > 0;
+        let mut input = input;
+        loop {
+            match d.parse(program, scope, input) {
+                Ok(p) => return Ok(p),
+                Err(err) if limit_is_fatal && err.is_recursion_limit() => return Err(err),
+                Err(_) => {}
+            }
+            match input.read_byte() {
+                Some((_, rest)) => input = rest,
+                None => {
+                    return Err(DecodeErrorKind::<Value>::fail(scope, input)
+                        .with_trace(("SkipTo", "no match before end of input")));
+                }
+            }
+        }
     }
 
     #[inline(never)]

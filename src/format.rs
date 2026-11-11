@@ -141,6 +141,11 @@ pub enum Format {
     Pos,
     /// Skip the remainder of the stream, up until the end of input or the last available byte within a Slice
     SkipRemainder,
+    /// Skip bytes up to the first offset at which the format matches, then parse it there
+    ///
+    /// Equivalent to `S := UnionNondet[f, ANY_BYTE ~ S]`, but decoded by iteration rather than
+    /// recursion, so neither the number of bytes skipped nor the lookahead of `f` is bounded.
+    SkipTo(Box<Format>),
     /// Given an expression corresponding to a byte-sequence, decode it again using the provided Format. This can be used to reparse the initial decode of formats that output `Vec<u8>` or similar
     DecodeBytes(Box<Expr>, Box<Format>),
     /// Process one format, bind the result to a label, and process a second format, discarding the result of the first
@@ -518,6 +523,8 @@ impl Format {
             Format::Fail => RecursiveBounds::exact(0),
             Format::EndOfInput => RecursiveBounds::exact(0),
             Format::SkipRemainder => RecursiveBounds::any(),
+            // any number of skipped bytes, then a match of `f`
+            Format::SkipTo(f) => RecursiveBounds::any() + f.match_bounds_recursive(module, open),
             Format::Align(n) => RecursiveBounds::new(0, n.get() - 1),
             Format::Byte(_) => RecursiveBounds::exact(1),
             Format::Variant(_label, f) => f.match_bounds_recursive(module, open),
@@ -625,6 +632,10 @@ impl Format {
             Format::EndOfInput => RecursiveBounds::exact(0),
             // NOTE - for PeekNot purposes it is not fully clear how to treat SkipRemainder, but we want to mirror the behavior of `Repeat(Byte)`
             Format::SkipRemainder => RecursiveBounds::any(),
+            // `f` is attempted at every offset up to the one where it matches, so any byte may be read
+            Format::SkipTo(f) => {
+                RecursiveBounds::any() + f.lookahead_bounds_recursive(module, open)
+            }
             Format::Align(n) => RecursiveBounds::new(0, n.get() - 1),
             Format::Byte(_) => RecursiveBounds::exact(1),
             Format::Variant(_label, f) => f.lookahead_bounds_recursive(module, open),
@@ -830,6 +841,7 @@ impl Format {
             Format::Apply(name) => Format::Apply(name),
             Format::Pos => Format::Pos,
             Format::SkipRemainder => Format::SkipRemainder,
+            Format::SkipTo(f) => Format::SkipTo(Box::new(f.substitute_rec_var(start, len))),
             Format::DecodeBytes(expr, f) => {
                 Format::DecodeBytes(expr, Box::new(f.substitute_rec_var(start, len)))
             }
@@ -928,6 +940,7 @@ impl Format {
             | Format::Let(.., inner)
             | Format::Dynamic(.., inner)
             | Format::DecodeBytes(.., inner)
+            | Format::SkipTo(inner)
             | Format::LetFormat(.., inner) => inner.as_inner_format(),
         }
     }

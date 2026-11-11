@@ -684,6 +684,7 @@ impl Decoder {
             Decoder::Fail => Self::loc_parse_fail,
             Decoder::Pos => Self::loc_parse_pos,
             Decoder::SkipRemainder => Self::loc_parse_skip_remainder,
+            Decoder::SkipTo(..) => Self::loc_parse_skip_to,
             Decoder::EndOfInput => Self::loc_parse_end_of_input,
             Decoder::Align(..) => Self::loc_parse_align,
             Decoder::Byte(..) => Self::loc_parse_byte,
@@ -919,6 +920,37 @@ impl Decoder {
             }
         }
         Err(DecodeErrorKind::loc_fail(scope, input).with_trace("no valid branch"))
+    }
+
+    #[inline(never)]
+    fn loc_parse_skip_to<'input>(
+        &self,
+        program: &Program,
+        scope: &LocScope<'_>,
+        input: ReadCtxt<'input>,
+    ) -> ELocDecodeResult<(ParsedValue, ReadCtxt<'input>)> {
+        let Decoder::SkipTo(d) = self else {
+            unreachable!()
+        };
+        // as in `loc_parse_parallel`: the recursion limit only rules out an offset outside any
+        // recursive decoder
+        let limit_is_fatal = recursion_depth() > 0;
+        let mut input = input;
+        loop {
+            match d.parse_with_loc(program, scope, input) {
+                // the value spans only the match, not the bytes skipped before it
+                Ok(p) => return Ok(p),
+                Err(err) if limit_is_fatal && err.is_recursion_limit() => return Err(err),
+                Err(_) => {}
+            }
+            match input.read_byte() {
+                Some((_, rest)) => input = rest,
+                None => {
+                    return Err(DecodeErrorKind::loc_fail(scope, input)
+                        .with_trace(("SkipTo", "no match before end of input")));
+                }
+            }
+        }
     }
 
     #[inline(never)]

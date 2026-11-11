@@ -141,7 +141,7 @@ impl<'module> TreePrinter<'module> {
             Format::AccumUntil(..) => false,
             Format::ForEach(..) => false,
             Format::Maybe(..) => false,
-            Format::Peek(format) => self.is_implied_value_format(format),
+            Format::Peek(format) | Format::SkipTo(format) => self.is_implied_value_format(format),
             Format::PeekNot(_) => true,
             Format::Bits(format) => self.is_implied_value_format(format),
             Format::WithRelativeOffset(.., format) => self.is_implied_value_format(format),
@@ -563,7 +563,9 @@ impl<'module> TreePrinter<'module> {
                 },
                 _ => panic!("expected Option, found {value:?}"),
             },
-            Format::Peek(format) => self.compile_decoded_parsedvalue(value, format),
+            Format::Peek(format) | Format::SkipTo(format) => {
+                self.compile_decoded_parsedvalue(value, format)
+            }
             Format::PeekNot(_format) => self.compile_parsed_value(value),
             Format::Slice(_, format) => self.compile_decoded_parsedvalue(value, format),
             Format::Bits(format) => self.compile_decoded_parsedvalue(value, format),
@@ -810,7 +812,9 @@ impl<'module> TreePrinter<'module> {
                 },
                 _ => panic!("expected Option, found {value}"),
             },
-            Format::Peek(format) => self.compile_decoded_value(value, format),
+            Format::Peek(format) | Format::SkipTo(format) => {
+                self.compile_decoded_value(value, format)
+            }
             Format::PeekNot(_format) => self.compile_value(value),
             Format::Slice(_, format) => self.compile_decoded_value(value, format),
             Format::Bits(format) => self.compile_decoded_value(value, format),
@@ -2338,6 +2342,11 @@ impl<'module> TreePrinter<'module> {
             ),
             Format::PeekNot(format) => cond_paren(
                 self.compile_nested_format("peek-not", None, format, prec),
+                prec,
+                Precedence::FORMAT_COMPOUND,
+            ),
+            Format::SkipTo(format) => cond_paren(
+                self.compile_nested_format("skip-to", None, format, prec),
                 prec,
                 Precedence::FORMAT_COMPOUND,
             ),

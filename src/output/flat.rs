@@ -179,7 +179,7 @@ fn check_covered(
         Format::LiftedOption(Some(format)) => {
             check_covered(module, path, format)?;
         }
-        Format::Peek(format) => {
+        Format::Peek(format) | Format::SkipTo(format) => {
             check_covered(module, path, format)?;
         }
         // NOTE - because PeekNot is expressly negated, its contents will never represent the actual structure of a parsed value
@@ -329,7 +329,7 @@ impl<'module, W: io::Write> Context<'module, W> {
             },
             Format::DecodeBytes(_bytes, format) => self.write_flat(value, format),
             Format::ParseFromView(_view, format) => self.write_flat(value, format),
-            Format::Peek(format) => self.write_flat(value, format),
+            Format::Peek(format) | Format::SkipTo(format) => self.write_flat(value, format),
             Format::PeekNot(format) => self.write_flat(value, format),
             Format::Slice(_, format) => self.write_flat(value, format),
             Format::Bits(format) => self.write_flat(value, format),

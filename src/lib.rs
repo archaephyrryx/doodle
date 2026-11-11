@@ -1587,6 +1587,7 @@ impl FormatModule {
             },
             Format::Peek(a) => self.infer_format_type(scope, a),
             Format::PeekNot(_a) => Ok(ValueType::Tuple(vec![])),
+            Format::SkipTo(a) => self.infer_format_type(scope, a),
             Format::Slice(len, a) => match len.infer_type(scope)? {
                 t if t.is_unsigned_or_auto() => self.infer_format_type(scope, a),
                 other => Err(anyhow!(
@@ -2273,6 +2274,8 @@ impl<'a> NextDependence<'a> {
             | Format::Dynamic(_, _, a)
             | Format::Hint(_, a)
             | Format::LiftedOption(Some(a))
+            // compiled against `next`, as a `UnionNondet` branch is
+            | Format::SkipTo(a)
             | Format::Maybe(_, a) => self.format_depends_on_next(module, a, next),
             #[cfg(feature = "format_enforce")]
             Format::Enforce(a) => self.format_depends_on_next(module, a, next),
@@ -2391,6 +2394,8 @@ impl<'a> NextDependence<'a> {
             | Format::Dynamic(_, _, a)
             | Format::Hint(_, a)
             | Format::LiftedOption(Some(a))
+            // compiled against `next`, as a `UnionNondet` branch is
+            | Format::SkipTo(a)
             | Format::Maybe(_, a) => self.format_lookahead(module, a, next, trailer),
             #[cfg(feature = "format_enforce")]
             Format::Enforce(a) => self.format_lookahead(module, a, next, trailer),
@@ -3327,6 +3332,12 @@ impl<'a> MatchTreeStep<'a> {
             Format::EndOfInput => Self::accept(),
             // consumes whatever remains, which only the empty continuation can follow
             Format::SkipRemainder => Self::any_bytes(module, Rc::new(Next::Empty), guard),
+            // any bytes, then `f`, then `next`
+            Format::SkipTo(f) => Self::any_bytes(
+                module,
+                Rc::new(Next::Cat(MaybeTyped::Untyped(f.as_ref()), next)),
+                guard,
+            ),
             Format::Align(n) => Self::from_align(module, next, *n, guard),
             Format::DecodeBytes(_bytes, _f) => Self::from_next(module, next, guard),
             Format::ParseFromView(_view, _f) => Self::from_next(module, next, guard),
@@ -4294,6 +4305,93 @@ mod test {
     /// `(input, ok)` pair decodes (or fails to) as expected. Building it through
     /// `MatchTree::build` (via `compile_program`) puts the `ItemVar`s inside `top` on the
     /// `CycleGuard`'s path, which a single top-level `Tuple` never would.
+    /// `SkipTo(f)` decodes as `f` does at the first offset where `f` matches, or fails if there
+    /// is none. `f` here needs unbounded lookahead (`Repeat1` of digits), which a
+    /// `PeekNot`-guarded skip cannot compile, and one input skips more bytes than the default
+    /// recursion limit, which a recursive `UnionNondet[f, ANY_BYTE ~ S]` cannot get past.
+    #[test]
+    fn skip_to_decodes_as_format_at_first_match() {
+        use crate::helper::{byte_in, is_bytes, monad_seq, repeat1};
+
+        let f = || monad_seq(is_bytes(b"%PDF-"), repeat1(byte_in(b'0'..=b'9')));
+        let mut module = FormatModule::new();
+        let skip = module.define_format("test.skip_to", Format::SkipTo(Box::new(f())));
+        let direct = module.define_format("test.direct", f());
+        let prog_skip =
+            decoder::Compiler::compile_program(&module, &skip.call()).expect("SkipTo must compile");
+        let prog_direct = decoder::Compiler::compile_program(&module, &direct.call())
+            .expect("direct format must compile");
+
+        let long = [vec![b'x'; 1000], b"%PDF-12".to_vec()].concat();
+        // (input, offset of the first match, if any)
+        let cases: &[(&[u8], Option<usize>)] = &[
+            (b"%PDF-17", Some(0)),
+            (b"junk\n%PDF-4 trailing", Some(5)),
+            (b"%PDF%PDF-2", Some(4)),
+            (b"%PDF-x%PDF-3%PDF-9", Some(6)),
+            (&long, Some(1000)),
+            (b"%PDF-", None),
+            (b"no header here", None),
+            (b"", None),
+        ];
+        for (input, start) in cases {
+            let what = String::from_utf8_lossy(&input[..input.len().min(40)]);
+            let skipped = prog_skip.run(ReadCtxt::new(input));
+            let skipped_loc = prog_skip.run_with_loc(ReadCtxt::new(input));
+            match start {
+                None => {
+                    assert!(skipped.is_err(), "decoding {what:?}");
+                    assert!(skipped_loc.is_err(), "decoding {what:?} with locations");
+                }
+                Some(start) => {
+                    let (v_skip, rest_skip) = skipped.unwrap_or_else(|e| panic!("{what:?}: {e:?}"));
+                    let (v_direct, rest_direct) = prog_direct
+                        .run(ReadCtxt::new(&input[*start..]))
+                        .expect("f must match at the expected offset");
+                    assert_eq!(v_skip, v_direct, "value decoding {what:?}");
+                    assert_eq!(rest_skip.offset, rest_direct.offset + start, "{what:?}");
+                    let (_, rest_loc) =
+                        skipped_loc.unwrap_or_else(|e| panic!("{what:?} with locations: {e:?}"));
+                    assert_eq!(rest_loc.offset, rest_skip.offset, "{what:?} with locations");
+                }
+            }
+        }
+    }
+
+    /// A `MatchTree` models `SkipTo(f)` as any bytes followed by `f`: choosing between branches
+    /// headed by `SkipTo(f)` builds the same tree as with `Repeat(ANY_BYTE) ~ f` in its place,
+    /// and a branch that starts with distinguishing bytes before its `SkipTo` is still chosen
+    /// by them.
+    #[test]
+    fn skip_to_in_matchtree() {
+        use crate::helper::{is_byte, is_bytes, monad_seq, repeat};
+
+        let module = FormatModule::new();
+        let z = || Format::Variant(Label::Borrowed("Z"), Box::new(is_bytes(b"zq")));
+        for f in [is_byte(b'a'), is_bytes(b"zq"), is_bytes(b"zzz")] {
+            let skip = [Format::SkipTo(Box::new(f.clone())), z()];
+            let modelled = [monad_seq(repeat(Format::ANY_BYTE), f.clone()), z()];
+            let tree = |branches: &[Format]| {
+                MatchTree::build_for(&module, branches, Rc::new(Next::Empty), String::new)
+                    .map_err(|e| e.to_string())
+            };
+            assert_eq!(tree(&skip), tree(&modelled), "SkipTo({f:?}) vs Z");
+        }
+
+        let mut module = FormatModule::new();
+        check_union_with_z(
+            &mut module,
+            Format::Tuple(vec![is_byte(b'a'), Format::SkipTo(Box::new(is_byte(b'b')))]),
+            &[
+                (b"ab", true),
+                (b"axxb", true),
+                (b"z", true),
+                (b"azb", true),
+                (b"axx", false),
+            ],
+        );
+    }
+
     fn check_union_with_z(module: &mut FormatModule, top: Format, cases: &[(&[u8], bool)]) {
         use crate::helper::is_byte;
 

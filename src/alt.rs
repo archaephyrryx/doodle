@@ -67,6 +67,7 @@ pub enum MonoKind {
     Maybe(Box<Expr>),
     Peek,
     PeekNot,
+    SkipTo,
     Slice(Box<Expr>),
     Bits,
     WithRelativeOffset(Box<Expr>, Box<Expr>),
@@ -1199,7 +1200,7 @@ impl FormatModuleExt {
                                 "Maybe-predicate is not a bool-type: {x:?} ~ {other:?}"
                             )),
                         },
-                        MonoKind::Peek => self.infer_format_ext_type(scope, f),
+                        MonoKind::Peek | MonoKind::SkipTo => self.infer_format_ext_type(scope, f),
                         MonoKind::PeekNot => Ok(ValueTypeExt::UNIT),
                         MonoKind::Slice(len) => match len.infer_type_ext(scope)? {
                             t if t.is_unsigned_or_auto() => self.infer_format_ext_type(scope, f),
@@ -1917,6 +1918,10 @@ mod __impls {
                     MonoKind::PeekNot,
                     Box::new(FormatExt::from(*format)),
                 )),
+                Format::SkipTo(format) => FormatExt::Epi(EpiFormat::Mono(
+                    MonoKind::SkipTo,
+                    Box::new(FormatExt::from(*format)),
+                )),
                 Format::Slice(expr, format) => FormatExt::Epi(EpiFormat::Mono(
                     MonoKind::Slice(expr),
                     Box::new(FormatExt::from(*format)),
@@ -2069,6 +2074,7 @@ mod __impls {
                 MonoKind::Maybe(expr) => Format::Maybe(expr, inner),
                 MonoKind::Peek => Format::Peek(inner),
                 MonoKind::PeekNot => Format::PeekNot(inner),
+                MonoKind::SkipTo => Format::SkipTo(inner),
                 MonoKind::Slice(expr) => Format::Slice(expr, inner),
                 MonoKind::Bits => Format::Bits(inner),
                 MonoKind::WithRelativeOffset(expr, expr1) => {
