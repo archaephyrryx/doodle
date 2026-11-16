@@ -299,7 +299,13 @@ impl Expr {
             }
             Expr::Destructure(head, pattern, body) => {
                 let head_type = Rc::new(head.infer_type(scope)?);
-                pattern.infer_expr_branch_type(scope, head_type, body)
+                let t = pattern.infer_expr_branch_type(scope, head_type.clone(), body)?;
+                if !pattern.is_irrefutable_for(scope, &head_type) {
+                    return Err(anyhow!(
+                        "Destructure pattern {pattern:?} is refutable for head type {head_type:?}"
+                    ));
+                }
+                Ok(t)
             }
             Expr::Lambda(..) => Err(anyhow!("infer_type encountered unexpected lambda")),
 

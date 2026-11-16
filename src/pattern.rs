@@ -27,6 +27,18 @@ pub enum Pattern {
     Option(Option<Box<Pattern>>),
 }
 
+/// Returns `true` if `bounds` includes every value of the unsigned-integer type `b`.
+fn bounds_cover_base(bounds: &Bounds, b: BaseType) -> bool {
+    let type_max = match b {
+        BaseType::U8 => u8::MAX as usize,
+        BaseType::U16 => u16::MAX as usize,
+        BaseType::U32 => u32::MAX as usize,
+        BaseType::U64 => u64::MAX as usize,
+        BaseType::Bool | BaseType::Char => return false,
+    };
+    bounds.min() == 0 && bounds.max().is_none_or(|max| max >= type_max)
+}
+
 impl Pattern {
     pub const UNIT: Pattern = Pattern::Tuple(Vec::new());
 
@@ -169,6 +181,50 @@ impl Pattern {
         Ok(())
     }
 
+    /// Returns `true` if `self` matches every value of type `t`, as required of the pattern of an
+    /// [`Expr::Destructure`].
+    ///
+    /// Conservative: a pattern other than a binding or wildcard is deemed refutable against a type
+    /// whose shape is not known (`Any`, `NumericHole`), and every `Seq` pattern is refutable, as no
+    /// `ValueType` fixes the length of a sequence. A union type is taken as the exact set of
+    /// variants a value of that type may take, so a variant pattern is irrefutable against a
+    /// single-variant union.
+    pub(crate) fn is_irrefutable_for(&self, scope: &TypeScope<'_>, t: &ValueType) -> bool {
+        let t = scope.unfold(t.clone());
+        match (self, &t) {
+            (Pattern::Binding(_) | Pattern::Wildcard, _) => true,
+            (Pattern::Tuple(ps), ValueType::Tuple(ts)) => {
+                ps.len() == ts.len()
+                    && Iterator::zip(ps.iter(), ts.iter()).all(|(p, t)| p.is_irrefutable_for(scope, t))
+            }
+            (Pattern::Variant(label, p), ValueType::Union(branches)) => match branches.get(label) {
+                Some(t) if branches.len() == 1 => p.is_irrefutable_for(scope, t),
+                _ => false,
+            },
+            (Pattern::Int(bounds), ValueType::Base(b)) => bounds_cover_base(bounds, *b),
+            _ => false,
+        }
+    }
+
+    /// As [`Pattern::is_irrefutable_for`], but over [`ValueTypeExt`].
+    pub(crate) fn is_irrefutable_for_ext(&self, t: &ValueTypeExt) -> bool {
+        match (self, t) {
+            (Pattern::Binding(_) | Pattern::Wildcard, _) => true,
+            (Pattern::Tuple(ps), ValueTypeExt::Tuple(ts)) => {
+                ps.len() == ts.len()
+                    && Iterator::zip(ps.iter(), ts.iter()).all(|(p, t)| p.is_irrefutable_for_ext(t))
+            }
+            (Pattern::Variant(label, p), ValueTypeExt::Union(branches)) => {
+                match branches.get(label) {
+                    Some(t) if branches.len() == 1 => p.is_irrefutable_for_ext(t),
+                    _ => false,
+                }
+            }
+            (Pattern::Int(bounds), ValueTypeExt::Base(b)) => bounds_cover_base(bounds, *b),
+            _ => false,
+        }
+    }
+
     pub(crate) fn infer_expr_branch_type(
         &self,
         scope: &TypeScope<'_>,
@@ -233,5 +289,41 @@ impl Pattern {
             Pattern::Seq(ps) => ps.iter().any(|p| p.shadows(name)),
             Pattern::Option(opt_p) => opt_p.as_ref().is_some_and(|p| p.shadows(name)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::helper::{bind, compute, expr_destruct, variant};
+    use crate::{Expr, FormatModule, Pattern};
+
+    fn register(value: Expr, pattern: Pattern) {
+        let mut module = FormatModule::new();
+        module.define_format("destructure", compute(expr_destruct(value, pattern, Expr::U8(0))));
+    }
+
+    #[test]
+    #[should_panic(expected = "is refutable")]
+    fn refutable_literal_destructure_is_rejected_at_registration() {
+        register(Expr::U8(1), Pattern::U8(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "is refutable")]
+    fn seq_destructure_is_rejected_at_registration() {
+        register(Expr::Seq(vec![Expr::U8(1)]), Pattern::Seq(vec![bind("x")]));
+    }
+
+    #[test]
+    fn tuple_destructure_is_accepted() {
+        register(
+            Expr::Tuple(vec![Expr::U8(1), Expr::U16(2)]),
+            Pattern::Tuple(vec![bind("x"), Pattern::Wildcard]),
+        );
+    }
+
+    #[test]
+    fn single_variant_destructure_is_accepted() {
+        register(variant("A", Expr::U8(1)), Pattern::variant("A", bind("x")));
     }
 }
