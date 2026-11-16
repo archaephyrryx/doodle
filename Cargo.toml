@@ -51,6 +51,10 @@ format_enforce = []
 __unify_mixed_to_int = []
 expr_eval_strict_numeric = []
 tc_seq_length_polymorphic = []
+# Guards a `Destructure` that codegen cannot itself prove irrefutable with `else { unreachable!() }`.
+# Presently has no effect on output: such patterns (variants of inline `LocalDef` type) are not yet
+# lowerable by `embed_pattern`.
+embed_destructure_always_fallback = []
 
 [[bin]]
 name = "doodle"

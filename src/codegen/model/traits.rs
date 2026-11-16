@@ -209,6 +209,7 @@ pub mod object_api {
                                     stmts.push(RustStmt::LetPattern(
                                         lhs_pat,
                                         RustExpr::local("args"),
+                                        None,
                                     ))
                                 }
                             }

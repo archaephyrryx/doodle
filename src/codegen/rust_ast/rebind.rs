@@ -109,9 +109,12 @@ impl Rebindable for RustStmt {
     fn rebind(&mut self, table: &impl MapLike<Label, Label>) {
         match self {
             RustStmt::Expr(expr) => expr.rebind(table),
-            RustStmt::LetPattern(pat, rhs) => {
+            RustStmt::LetPattern(pat, rhs, else_stmt) => {
                 pat.rebind(table);
-                rhs.rebind(table)
+                rhs.rebind(table);
+                if let Some(stmt) = else_stmt {
+                    stmt.rebind(table);
+                }
             }
             RustStmt::Let(_, _, otyp, rhs) => {
                 otyp.rebind(table);

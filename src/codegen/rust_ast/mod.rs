@@ -3778,7 +3778,8 @@ impl From<bool> for ReturnKind {
 pub(crate) enum RustStmt {
     Let(Mut, Label, Option<RustType>, RustExpr),
     // REVIEW - we might be able to modify `Let` to use a Pattern in place of a Label, but that would be a bit disruptive as the first pass
-    LetPattern(RustPattern, RustExpr),
+    /// `let <pattern> = <expr>;`, or `let <pattern> = <expr> else { <stmt> };` when the third field is `Some(stmt)`
+    LetPattern(RustPattern, RustExpr, Option<Box<RustStmt>>),
     Reassign(Label, RustExpr),
     Expr(RustExpr),
     Return(ReturnKind, RustExpr),
@@ -3797,7 +3798,7 @@ impl RustStmt {
     }
 
     pub fn destructure(pat: RustPattern, rhs: RustExpr) -> Self {
-        Self::LetPattern(pat, rhs)
+        Self::LetPattern(pat, rhs, None)
     }
 
     /// Classifies the provided Expr using [`RustExpr::is_pure`], and returns a [`RustStmt`]
@@ -4153,11 +4154,28 @@ impl ToFragment for RustStmt {
             .cat(Fragment::string(" = "))
             .cat(value.to_fragment_precedence(Precedence::TOP))
             .cat(Fragment::Char(';')),
-            RustStmt::LetPattern(pat, value) => Fragment::string("let ")
+            RustStmt::LetPattern(pat, value, None) => Fragment::string("let ")
                 .cat(pat.to_fragment())
                 .cat(Fragment::string(" = "))
                 .cat(value.to_fragment_precedence(Precedence::TOP))
                 .cat(Fragment::Char(';')),
+            RustStmt::LetPattern(pat, value, Some(else_stmt)) => {
+                // NOTE - the scrutinee of a `let`-`else` may neither end in `}` nor be a lazy
+                // boolean operation, so such expressions are parenthesized
+                let value_frag = match value {
+                    RustExpr::Control(..) | RustExpr::BlockScope(..) => value
+                        .to_fragment_precedence(Precedence::TOP)
+                        .delimit(Fragment::Char('('), Fragment::Char(')')),
+                    _ => value.to_fragment_precedence(Precedence::EQUALITY),
+                };
+                Fragment::string("let ")
+                    .cat(pat.to_fragment())
+                    .cat(Fragment::string(" = "))
+                    .cat(value_frag)
+                    .cat(Fragment::string(" else { "))
+                    .cat(else_stmt.to_fragment())
+                    .cat(Fragment::string(" };"))
+            }
             RustStmt::Reassign(binding, value) => binding
                 .to_fragment()
                 .cat(Fragment::string(" = "))
@@ -4286,6 +4304,45 @@ mod test {
             &format!("{}", value.to_fragment_precedence(Precedence::TOP)),
             expected
         )
+    }
+
+    fn pair_pattern() -> RustPattern {
+        RustPattern::TupleLiteral(vec![
+            RustPattern::CatchAll(Some(Label::from("a"))),
+            RustPattern::CatchAll(Some(Label::from("b"))),
+        ])
+    }
+
+    fn unreachable_stmt() -> Option<Box<RustStmt>> {
+        Some(Box::new(RustStmt::Expr(
+            RustExpr::local("unreachable!").call_with([]),
+        )))
+    }
+
+    #[test]
+    fn let_pattern_without_else() {
+        let stmt = RustStmt::LetPattern(pair_pattern(), RustExpr::local("v"), None);
+        expect_fragment(&stmt, "let (a, b) = v;");
+    }
+
+    #[test]
+    fn let_pattern_with_else() {
+        let stmt = RustStmt::LetPattern(pair_pattern(), RustExpr::local("v"), unreachable_stmt());
+        expect_fragment(&stmt, "let (a, b) = v else { unreachable!(); };");
+    }
+
+    #[test]
+    fn let_pattern_with_else_parenthesizes_block_value() {
+        let value = RustExpr::BlockScope(
+            vec![RustStmt::assign("t", RustExpr::local("v"))],
+            Box::new(RustExpr::local("t")),
+        );
+        let stmt = RustStmt::LetPattern(pair_pattern(), value, unreachable_stmt());
+        let rendered = format!("{}", stmt.to_fragment());
+        assert!(
+            rendered.starts_with("let (a, b) = ({") && rendered.ends_with("}) else { unreachable!(); };"),
+            "block-valued let-else scrutinee not parenthesized: {rendered}"
+        );
     }
 
     #[test]
@@ -4451,7 +4508,7 @@ pub mod short_circuit {
                 RustStmt::Expr(expr)
                 | RustStmt::Reassign(.., expr)
                 | RustStmt::Let(.., expr)
-                | RustStmt::LetPattern(.., expr)
+                | RustStmt::LetPattern(_, expr, _)
                 | RustStmt::Return(ReturnKind::Implicit, expr) => expr.is_short_circuiting(),
                 RustStmt::Return(ReturnKind::Keyword, ..) => true,
                 // RustStmt::Control(ctrl) => ctrl.is_short_circuiting(),
@@ -4465,7 +4522,7 @@ pub mod short_circuit {
                 RustStmt::Expr(expr)
                 | RustStmt::Reassign(.., expr)
                 | RustStmt::Let(.., expr)
-                | RustStmt::LetPattern(.., expr)
+                | RustStmt::LetPattern(_, expr, _)
                 | RustStmt::Return(ReturnKind::Implicit, expr) => expr.short_circuit_rank(),
                 RustStmt::Return(ReturnKind::Keyword, ..) => ShortCircuitRank::Try,
                 // RustStmt::Control(ctrl) => ctrl.short_circuit_rank(),
@@ -4858,7 +4915,10 @@ pub mod var_container {
         {
             match self {
                 RustStmt::Let(.., value) => value.contains_var_ref(var),
-                RustStmt::LetPattern(.., value) => value.contains_var_ref(var),
+                RustStmt::LetPattern(_, value, else_stmt) => {
+                    value.contains_var_ref(var)
+                        || else_stmt.as_ref().is_some_and(|stmt| stmt.contains_var_ref(var))
+                }
                 RustStmt::Reassign(binding, value) => {
                     binding == var.as_ref() || value.contains_var_ref(var)
                 }

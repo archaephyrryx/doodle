@@ -1512,34 +1512,36 @@ fn embed_expr(expr: &GTExpr, info: ExprInfo) -> RustExpr {
             // NOTE - registration (`Pattern::is_irrefutable_for`) has already rejected any
             // refutable `Destructure`, so only the precision of this layer's judgement varies.
             match destructure_refutability(pattern) {
-                Refutability::Irrefutable => {
+                // `Indeterminate` arises where this layer cannot confirm irrefutability (e.g. a
+                // variant of an inline `LocalDef` type, whose definition is not available here);
+                // the registration-time guarantee is trusted, and rustc rejects a plain `let`
+                // should the emitted type nonetheless admit other values. Under the
+                // `embed_destructure_always_fallback` feature, such a `let` instead carries an
+                // `else { unreachable!() }` fallback.
+                //
+                // NOTE - `embed_pattern` cannot yet lower a variant pattern of inline `LocalDef`
+                // type (it requires `GenType::Def` to determine the variant's shape), so the
+                // `Indeterminate` case is presently unreachable in practice.
+                ck @ (Refutability::Irrefutable | Refutability::Indeterminate) => {
                     // REVIEW - confirm ExprInfo pragmatics of these choices
                     let value = embed_expr(bound_value, info);
                     let pattern = embed_pattern(pattern);
                     let inner = embed_expr(inner, info);
 
-                    inner.prepend_stmt(RustStmt::LetPattern(pattern, value))
-                }
-                Refutability::Indeterminate => {
-                    // This layer cannot confirm irrefutability (e.g. a variant of an inline
-                    // `LocalDef` type, whose definition is not available here), but Rust requires
-                    // a `let`-pattern to be provably irrefutable, so the binding is a single-case
-                    // `match` whose catch-all is unreachable by the registration-time guarantee.
-                    let value = embed_expr(bound_value, info);
-                    let case = (
-                        MatchCaseLHS::Pattern(embed_pattern(pattern)),
-                        vec![RustStmt::Return(
-                            ReturnKind::Implicit,
-                            embed_expr(inner, info),
-                        )],
-                    );
-                    let body = RustMatchBody::Refutable(
-                        vec![case],
-                        RustCatchAll::PanicUnreachable {
-                            message: Label::from("Destructure refuted: "),
-                        },
-                    );
-                    RustExpr::Control(Box::new(RustControl::Match(Box::new(value), body)))
+                    let fallback = cfg_select! {
+                        feature = "embed_destructure_always_fallback" => {
+                            (ck == Refutability::Indeterminate).then(|| {
+                                Box::new(RustStmt::Expr(
+                                    RustExpr::local("unreachable!").call_with([]),
+                                ))
+                            })
+                        }
+                        _ => {{
+                            let _ = ck;
+                            None
+                        }}
+                    };
+                    inner.prepend_stmt(RustStmt::LetPattern(pattern, value, fallback))
                 }
                 Refutability::Refutable => panic!(
                     "Destructure pattern judged refutable by codegen but admitted at registration (by `Pattern::is_irrefutable_for`): {pattern:?}"
@@ -2575,7 +2577,7 @@ impl GenLambda {
                 [] => unreachable!("empty RustStmt-array in RustExpr::BlockScope"),
                 // NOTE - based on the `crate::helper::lambda_tuple` helper, we assume and specialize for pair-lambdas that immediately de-structure the pair (as the first statement)
                 [first, rest @ ..] => match first {
-                    RustStmt::LetPattern(pat, rhs) if rhs.as_local() == Some(&self.head) => {
+                    RustStmt::LetPattern(pat, rhs, None) if rhs.as_local() == Some(&self.head) => {
                         match pat {
                             RustPattern::TupleLiteral(pair) => match &pair[..] {
                                 [RustPattern::CatchAll(fst), RustPattern::CatchAll(snd)] => {

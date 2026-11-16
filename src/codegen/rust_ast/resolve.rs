@@ -95,8 +95,13 @@ impl Resolvable for RustFn {
 impl Resolvable for RustStmt {
     fn resolve(&mut self, ctx: &SourceContext<'_>) {
         match self {
+            RustStmt::LetPattern(_, expr, else_stmt) => {
+                expr.resolve(ctx);
+                if let Some(stmt) = else_stmt {
+                    stmt.resolve(ctx);
+                }
+            }
             RustStmt::Let(.., expr)
-            | RustStmt::LetPattern(.., expr)
             | RustStmt::Reassign(.., expr)
             | RustStmt::Return(.., expr)
             | RustStmt::Expr(expr) => expr.resolve(ctx),
