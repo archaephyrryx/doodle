@@ -1537,9 +1537,12 @@ pub fn lambda_tuple<const N: usize>(names: [&'static str; N], body: Expr) -> Exp
 ///
 /// Intended for cases where the `Pattern` is irrefutable.
 ///
-/// Will result in runtime failure if the pattern does not match.
+/// # Notes
+///
+/// A refutable `pattern` (judged against `value`'s inferred type) is rejected when the enclosing
+/// format is registered, so neither the interpreter nor codegen meets one. Sequence patterns are
+/// always refutable, as no type fixes a sequence's length.
 pub fn expr_destruct(value: Expr, pattern: Pattern, body: Expr) -> Expr {
-    // FIXME - develop a first-class solution for this paradigm
     Expr::Destructure(Box::new(value), pattern, Box::new(body))
 }
 

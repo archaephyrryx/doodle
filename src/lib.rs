@@ -164,6 +164,9 @@ pub enum Expr {
     Numeric(Box<NumExpr>),
 
     Match(Box<Expr>, Vec<(Pattern, Expr)>),
+    /// Destructure: binds an expression to an irrefutable pattern; used for destructuring tuples or single-variant enums.
+    ///
+    /// Irrefutability is checked against the head's inferred type when the enclosing format is registered.
     Destructure(Box<Expr>, Pattern, Box<Expr>),
 
     Lambda(Label, Box<Expr>),

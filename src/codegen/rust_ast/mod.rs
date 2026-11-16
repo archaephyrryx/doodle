@@ -3777,7 +3777,7 @@ impl From<bool> for ReturnKind {
 #[derive(Clone, Debug)]
 pub(crate) enum RustStmt {
     Let(Mut, Label, Option<RustType>, RustExpr),
-    // REVIEW - we might be able to modify `Let` to use a Pattern in place of a Label, but that would be a bit disruptive as the first pass
+    // REVIEW - we might be able to modify `Let` itself to accept a Pattern (obviating LetPattern), but this solution is less invasive and has clearer semantics
     /// `let <pattern> = <expr>;`, or `let <pattern> = <expr> else { <stmt> };` when the third field is `Some(stmt)`
     LetPattern(RustPattern, RustExpr, Option<Box<RustStmt>>),
     Reassign(Label, RustExpr),
