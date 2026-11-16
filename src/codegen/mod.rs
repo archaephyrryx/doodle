@@ -1509,15 +1509,41 @@ fn embed_expr(expr: &GTExpr, info: ExprInfo) -> RustExpr {
             }
         }
         TypedExpr::Destructure(_t, bound_value, pattern, inner) => {
-            if is_pattern_irrefutable(pattern) {
-                // REVIEW - confirm ExprInfo pragmatics of these choices
-                let value = embed_expr(bound_value, info);
-                let pattern = embed_pattern(pattern);
-                let inner = embed_expr(inner, info);
+            // NOTE - registration (`Pattern::is_irrefutable_for`) has already rejected any
+            // refutable `Destructure`, so only the precision of this layer's judgement varies.
+            match destructure_refutability(pattern) {
+                Refutability::Irrefutable => {
+                    // REVIEW - confirm ExprInfo pragmatics of these choices
+                    let value = embed_expr(bound_value, info);
+                    let pattern = embed_pattern(pattern);
+                    let inner = embed_expr(inner, info);
 
-                inner.prepend_stmt(RustStmt::LetPattern(pattern, value))
-            } else {
-                unimplemented!("non-irrefutable destructuring");
+                    inner.prepend_stmt(RustStmt::LetPattern(pattern, value))
+                }
+                Refutability::Indeterminate => {
+                    // This layer cannot confirm irrefutability (e.g. a variant of an inline
+                    // `LocalDef` type, whose definition is not available here), but Rust requires
+                    // a `let`-pattern to be provably irrefutable, so the binding is a single-case
+                    // `match` whose catch-all is unreachable by the registration-time guarantee.
+                    let value = embed_expr(bound_value, info);
+                    let case = (
+                        MatchCaseLHS::Pattern(embed_pattern(pattern)),
+                        vec![RustStmt::Return(
+                            ReturnKind::Implicit,
+                            embed_expr(inner, info),
+                        )],
+                    );
+                    let body = RustMatchBody::Refutable(
+                        vec![case],
+                        RustCatchAll::PanicUnreachable {
+                            message: Label::from("Destructure refuted: "),
+                        },
+                    );
+                    RustExpr::Control(Box::new(RustControl::Match(Box::new(value), body)))
+                }
+                Refutability::Refutable => panic!(
+                    "Destructure pattern judged refutable by codegen but admitted at registration (by `Pattern::is_irrefutable_for`): {pattern:?}"
+                ),
             }
         }
         TypedExpr::Match(t, scrutinee, cases) => {
@@ -2209,6 +2235,96 @@ fn is_pattern_irrefutable(pat: &TypedPattern<GenType>) -> bool {
             MachineUint::U64 => max.is_none_or(|v| v == u64::MAX as usize),
         },
         _ => false, // all the other cases are prim-types that cover only one of N > 1 possible values
+    }
+}
+
+/// Judges the refutability of the pattern of a `Destructure`, as [`is_pattern_irrefutable`] does,
+/// except that a variant pattern over an inline `LocalDef` type, whose variant set is not
+/// available at this layer, is `Indeterminate` rather than refutable.
+fn destructure_refutability(pat: &TypedPattern<GenType>) -> Refutability {
+    match pat {
+        TypedPattern::Binding(..) | TypedPattern::Wildcard(..) => Refutability::Irrefutable,
+        TypedPattern::Tuple(_, elts) => elts
+            .iter()
+            .map(destructure_refutability)
+            .fold(Refutability::Irrefutable, Refutability::and),
+        TypedPattern::Variant(gt, lab, inner) => {
+            let outer = match gt {
+                GenType::Def(_, def) => match &def.def {
+                    RustTypeDef::Enum(vars) if vars.len() == 1 && vars[0].get_label() == lab => {
+                        Refutability::Irrefutable
+                    }
+                    _ => Refutability::Refutable,
+                },
+                GenType::Inline(RustType::Atom(AtomType::TypeRef(LocalType::LocalDef(..)))) => {
+                    Refutability::Indeterminate
+                }
+                _ => Refutability::Refutable,
+            };
+            outer.and(destructure_refutability(inner))
+        }
+        other if is_pattern_irrefutable(other) => Refutability::Irrefutable,
+        _ => Refutability::Refutable,
+    }
+}
+
+#[cfg(test)]
+mod destructure_refutability_tests {
+    use super::*;
+
+    fn u8_type() -> GenType {
+        GenType::Inline(RustType::Atom(AtomType::Prim(PrimType::Unsigned(
+            MachineUint::U8,
+        ))))
+    }
+
+    fn inline_local_def() -> GenType {
+        GenType::Inline(RustType::Atom(AtomType::TypeRef(LocalType::LocalDef(
+            0,
+            Label::from("Foo"),
+            None,
+        ))))
+    }
+
+    #[test]
+    fn tuple_of_bindings_is_irrefutable() {
+        let pat = TypedPattern::Tuple(
+            GenType::Inline(RustType::AnonTuple(vec![])),
+            vec![
+                TypedPattern::Binding(u8_type(), Label::from("x")),
+                TypedPattern::Wildcard(u8_type()),
+            ],
+        );
+        assert_eq!(destructure_refutability(&pat), Refutability::Irrefutable);
+    }
+
+    #[test]
+    fn inline_local_def_variant_is_indeterminate() {
+        let pat = TypedPattern::Variant(
+            inline_local_def(),
+            Label::from("A"),
+            Box::new(TypedPattern::Binding(u8_type(), Label::from("x"))),
+        );
+        assert_eq!(destructure_refutability(&pat), Refutability::Indeterminate);
+    }
+
+    #[test]
+    fn literal_under_inline_local_def_variant_is_refutable() {
+        let pat = TypedPattern::Variant(
+            inline_local_def(),
+            Label::from("A"),
+            Box::new(TypedPattern::U8(2)),
+        );
+        assert_eq!(destructure_refutability(&pat), Refutability::Refutable);
+    }
+
+    #[test]
+    fn seq_is_refutable() {
+        let pat = TypedPattern::Seq(
+            u8_type(),
+            vec![TypedPattern::Binding(u8_type(), Label::from("x"))],
+        );
+        assert_eq!(destructure_refutability(&pat), Refutability::Refutable);
     }
 }
 

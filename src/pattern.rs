@@ -195,7 +195,8 @@ impl Pattern {
             (Pattern::Binding(_) | Pattern::Wildcard, _) => true,
             (Pattern::Tuple(ps), ValueType::Tuple(ts)) => {
                 ps.len() == ts.len()
-                    && Iterator::zip(ps.iter(), ts.iter()).all(|(p, t)| p.is_irrefutable_for(scope, t))
+                    && Iterator::zip(ps.iter(), ts.iter())
+                        .all(|(p, t)| p.is_irrefutable_for(scope, t))
             }
             (Pattern::Variant(label, p), ValueType::Union(branches)) => match branches.get(label) {
                 Some(t) if branches.len() == 1 => p.is_irrefutable_for(scope, t),
@@ -299,7 +300,10 @@ mod tests {
 
     fn register(value: Expr, pattern: Pattern) {
         let mut module = FormatModule::new();
-        module.define_format("destructure", compute(expr_destruct(value, pattern, Expr::U8(0))));
+        module.define_format(
+            "destructure",
+            compute(expr_destruct(value, pattern, Expr::U8(0))),
+        );
     }
 
     #[test]
