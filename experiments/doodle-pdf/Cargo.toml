@@ -3,7 +3,17 @@ name = "doodle-pdf"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "dood-e-pdf"
+path = "src/main.rs"
+bench = false
+
 [dependencies]
 doodle = { path = "../../" }
 doodle-numexpr-macro = { path = "../../doodle-numexpr-macro" }
 doodle-formats = { path = "../../doodle-formats/" }
+clap = { version = "4.2", features = ["derive"] }
+anyhow = "1.0"
+serde_json = "1.0"
+stderrlog = "0.6.0"
+log = "0.4.29"

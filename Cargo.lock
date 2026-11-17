@@ -635,9 +635,14 @@ dependencies = [
 name = "doodle-pdf"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "clap",
  "doodle",
  "doodle-formats",
  "doodle-numexpr-macro",
+ "log",
+ "serde_json",
+ "stderrlog",
 ]
 
 [[package]]
