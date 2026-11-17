@@ -1,8 +1,8 @@
 use std::ops::RangeInclusive;
 
 use doodle::{
-    BaseType, Expr, Format, FormatModule, FormatRef, IntoLabel, Label, Pattern, ValueType,
-    helper::*, prelude::ByteSet,
+    BaseType, DepFormat, Expr, Format, FormatModule, FormatRef, IntoLabel, Label, Pattern,
+    ValueType, helper::*, prelude::ByteSet,
 };
 use doodle_numexpr_macro::numexpr;
 
@@ -51,14 +51,43 @@ fn hex_num_u32(len: usize) -> Format {
     )
 }
 
+/// Folds a sequence of ASCII decimal digits into the u64 value it spells out
+fn decimal_value(digits: Expr) -> Expr {
+    left_fold(
+        lambda_tuple(
+            ["acc", "d"],
+            add(
+                mul(var("acc"), Expr::U64(10)),
+                as_u64(sub(var("d"), Expr::U8(b'0'))),
+            ),
+        ),
+        Expr::U64(0),
+        ValueType::Base(BaseType::U64),
+        digits,
+    )
+}
+
+/// Daedalus `NatN len`: exactly `len` decimal digits, read as a u64
+fn nat_n(len: u32) -> Format {
+    map(
+        repeat_count(Expr::U32(len), Format::Byte(DIGIT)),
+        lambda("ds", decimal_value(var("ds"))),
+    )
+}
+
 fn octal_val() -> Format {
     const OCTAL: RangeInclusive<u8> = b'0'..=b'7';
 
     map(byte_in(OCTAL), lambda("b", sub(var("b"), Expr::U8(b'0'))))
 }
 
-fn octal_num_u8(len_min: u32, len_max: u32) -> Format {
-    let raw = repeat_between(len_min, len_max, octal_val());
+/// Parses up to three ASCII octal digits (greedily) and interprets them as a u8-typed numeric value with that octal representation.
+fn octal_num_u8() -> Format {
+    let raw = union([
+        repeat_count(Expr::U8(3), octal_val()),
+        excluding(repeat_count(Expr::U8(3), byte_in(b'0'..=b'7')), repeat_count(Expr::U8(2), octal_val())),
+        excluding(repeat_count(Expr::U8(2), byte_in(b'0'..=b'7')), seq([octal_val()])),
+    ]);
 
     map(
         raw,
@@ -121,6 +150,24 @@ fn interpret(assocs: impl IntoIterator<Item = (Format, Expr)>) -> Format {
 /// Skips bytes up to the first offset at which `f` matches, then parses `f` there.
 fn skip_to(f: Format) -> Format {
     Format::SkipTo(Box::new(f))
+}
+
+/// Daedalus `CountTo P 0`: consumes bytes up to the first offset at which `p` matches,
+/// leaving `p` unconsumed, and returns the number of bytes consumed.
+///
+/// `p` must have bounded lookahead (`PeekNot` rejects unbounded lookahead). Daedalus
+/// `CountTo (KW s)` only needs `Match s` here, since the trailing `Many AnyWS` of `KW`
+/// always succeeds.
+///
+/// A recursive `CountTo` (one call per byte) would hit the recursion limit, so this
+/// repeats a guarded byte instead and measures the result. The skipped bytes are
+/// materialized only to be counted.
+fn count_to(p: Format) -> Format {
+    chain(
+        repeat(monad_seq(Format::PeekNot(Box::new(p)), ANY_BYTE)),
+        "_skipped",
+        compute(seq_length(var("_skipped"))),
+    )
 }
 
 /// Parse `f` and ensure that there is no trailing content
@@ -348,13 +395,14 @@ fn v_string(module: &mut FormatModule, any_ws: FormatRef, eol: FormatRef) -> For
         // A backslash before an end-of-line continues the string onto the next line
         (eol.call(), Expr::Seq(vec![])),
     ]);
+    let octal_esc = map(octal_num_u8(), lambda("b", Expr::Seq(vec![var("b")])));
     // Any other escaped byte stands for itself (the backslash is ignored). Octal digits are
     // excluded so that an octal escape fails rather than silently decoding as its digits.
     let unknown_esc = map(
         byte_in(ByteSet::from(*b"nrtbf()\\\r\n01234567").complement()),
         lambda("b", Expr::Seq(vec![var("b")])),
     );
-    let string_esc = monad_seq(is_byte(b'\\'), union([known_esc, unknown_esc]));
+    let string_esc = monad_seq(is_byte(b'\\'), union([known_esc, octal_esc, unknown_esc]));
 
     let lim = || vec![(Label::Borrowed("lim"), ValueType::Base(BaseType::U64))];
     // Registration types a call to a *later* batch member as `Any`, which `snoc`'s `Append` and
@@ -541,6 +589,110 @@ fn between(open: &[u8], close: &[u8], f: Format, any_ws: FormatRef) -> Format {
     )
 }
 
+/// Daedalus `Stream (val : Value)`. `val` is a whole `Value` (as passed by `pdf.top_decl`), and
+/// `header = val is dict` narrows it. Like the Daedalus definition, this leaves the `endstream`
+/// keyword unconsumed.
+fn stream(
+    module: &mut FormatModule,
+    simple_eol: FormatRef,
+    value_type: ValueType,
+) -> DepFormat<1, 0> {
+    module.register_format_args(
+        "pdf.stream",
+        [(Label::Borrowed("val"), value_type)],
+        record_daedalus([
+            // header = val is dict;
+            (
+                "header",
+                fmt_match(
+                    var("val"),
+                    [
+                        (
+                            Pattern::Variant("dict".into(), Box::new(bind("d"))),
+                            compute(var("d")),
+                        ),
+                        (Pattern::Wildcard, Format::Fail),
+                    ],
+                ),
+            ),
+            // Match "stream"; SimpleEOL;
+            ("__kw_stream", match_str(b"stream")),
+            ("__eol", simple_eol.call()),
+            // @start = GetStream;
+            // @len   = CountTo (KW "endstream") 0;
+            // body   = Take len start;
+            (
+                "body",
+                let_view(
+                    "start",
+                    chain(
+                        count_to(match_str(b"endstream")),
+                        "len",
+                        with_view(vvar("start"), capture_bytes(var("len"))),
+                    ),
+                ),
+            ),
+        ]),
+    )
+}
+
+/// Cross-reference table: `xref` followed by one or more subsections.
+///
+/// Prototype: only the classic table form is handled (not cross-reference streams).
+fn cross_ref_section(
+    module: &mut FormatModule,
+    any_ws: FormatRef,
+    natural: FormatRef,
+) -> FormatRef {
+    // Each entry is exactly 20 bytes: `nnnnnnnnnn ggggg f` plus a two-byte end-of-line,
+    // where `f` is `n` (in use, `offset` is a byte offset) or `f` (free, `offset` is the
+    // next free object number).
+    let entry = module.define_format(
+        "pdf.xref.entry",
+        record_auto([
+            ("offset", nat_n(10)),
+            ("__sp0", is_byte(b' ')),
+            ("gen", nat_n(5)),
+            ("__sp1", is_byte(b' ')),
+            (
+                "in_use",
+                interpret([
+                    (is_byte(b'n'), Expr::Bool(true)),
+                    (is_byte(b'f'), Expr::Bool(false)),
+                ]),
+            ),
+            (
+                "__eol",
+                union([
+                    void(is_bytes(b" \r")),
+                    void(is_bytes(b" \n")),
+                    void(is_bytes(b"\r\n")),
+                ]),
+            ),
+        ]),
+    );
+
+    let decimal = || {
+        token(
+            map(natural.call(), lambda("ds", decimal_value(var("ds")))),
+            any_ws,
+        )
+    };
+    let subsection = module.define_format(
+        "pdf.xref.subsection",
+        record_auto([
+            ("first_id", decimal()),
+            ("count", decimal()),
+            ("entries", repeat_count(as_u32(var("count")), entry.call())),
+        ]),
+    );
+
+    module.define_format(
+        "pdf.xref",
+        monad_seq(kw(b"xref", any_ws), repeat1(subsection.call())),
+    )
+}
+
 pub fn main(module: &mut FormatModule) -> FormatRef {
     let simple_eol = simple_eol(module);
     let eol = eol(module, simple_eol);
@@ -555,12 +707,16 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
 
     let [pdf_value, pdf_dict] = pdf_value(module, any_ws, eol, natural, number, v_name);
     let pdf_value_type = module.get_format_type(pdf_value.get_level()).clone();
-    let stream: FormatRef = todo!("implement Stream (val : Value)");
+    let stream = stream(module, simple_eol, pdf_value_type.clone());
     let top_decl_def = module.define_format_args(
         "pdf.top_decl",
         vec![(Label::Borrowed("val"), pdf_value_type)],
-        record([
-            ("stream", stream.call_args(vec![var("val")])),
+        alts([
+            ("stream", chain(
+                stream.invoke_args([var("val")]),
+                "s",
+                monad_seq(kw(b"endstream", any_ws), compute(var("s"))),
+            )),
             ("value", compute(var("val"))),
         ]),
     );
@@ -575,7 +731,7 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
             ("__kw_end", kw(b"endobj", any_ws)),
         ]),
     );
-    let cross_ref_section: FormatRef = todo!();
+    let cross_ref_section = cross_ref_section(module, any_ws, natural);
     let trailer = module.define_format(
         "pdf.trailer",
         monad_seq(
@@ -603,8 +759,8 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
                 "version",
                 skip_to(monad_seq(is_bytes(b"%PDF-"), number.call())),
             ),
+            ("__ws", repeat(any_ws.call())),
             ("chunks", repeat(pdf_chunk.call())),
-            ("__rem", repeat(any_ws.call())),
         ])),
     )
 }
@@ -618,6 +774,86 @@ mod tests {
     fn check_skip_to(module: &mut FormatModule, f: Format, cases: &[(&[u8], bool)]) {
         let top = module.define_format("test.skip_to", skip_to(f));
         let prog = Compiler::compile_program(module, &top.call()).expect("skip_to must compile");
+        for (input, ok) in cases {
+            assert_eq!(
+                prog.run(ReadCtxt::new(input)).is_ok(),
+                *ok,
+                "decoding {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// `pdf.stream` accepts a dict followed by `stream`, an EOL, and a body running up to
+    /// `endstream` (consumed by the test, not by `pdf.stream`), and rejects a non-dict value.
+    #[test]
+    fn stream_after_dict() {
+        let mut module = FormatModule::new();
+        let simple_eol = simple_eol(&mut module);
+        let eol = eol(&mut module, simple_eol);
+        let comment = comment(&mut module, eol);
+        let any_ws = any_ws(&mut module, eol, comment);
+        let v_name = v_name(&mut module, any_ws);
+        let natural = natural(&mut module);
+        let number = number(&mut module, natural);
+        let [value, _dict] = pdf_value(&mut module, any_ws, eol, natural, number, v_name);
+        let value_type = module.get_format_type(value.get_level()).clone();
+        let stream = stream(&mut module, simple_eol, value_type);
+        let top = module.define_format(
+            "test.stream",
+            only(chain(
+                value.call_args(vec![Expr::U64(32)]),
+                "val",
+                chain(
+                    stream.invoke_args([var("val")]),
+                    "s",
+                    monad_seq(match_str(b"endstream"), compute(var("s"))),
+                ),
+            )),
+        );
+        let prog = Compiler::compile_program(&module, &top.call()).expect("stream must compile");
+        let cases: &[(&[u8], bool)] = &[
+            (b"<< /Length 5 >>\nstream\r\nhello\nendstream", true),
+            (b"<<>>stream\nendstream", true),
+            (b"<<>>stream\nend stream endstrea endstream", true),
+            (b"<<>>stream\nno terminator", false),
+            (b"<<>>streamhelloendstream", false),
+            (b"42 stream\nhelloendstream", false),
+        ];
+        for (input, ok) in cases {
+            assert_eq!(
+                prog.run(ReadCtxt::new(input)).is_ok(),
+                *ok,
+                "decoding {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// `pdf.xref` reads subsections of fixed-width 20-byte entries, with any of the three
+    /// two-byte end-of-line forms, and rejects entries of the wrong width or with a bad flag.
+    #[test]
+    fn xref_section() {
+        let mut module = FormatModule::new();
+        let simple_eol = simple_eol(&mut module);
+        let eol = eol(&mut module, simple_eol);
+        let comment = comment(&mut module, eol);
+        let any_ws = any_ws(&mut module, eol, comment);
+        let natural = natural(&mut module);
+        let xref = cross_ref_section(&mut module, any_ws, natural);
+        let top = module.define_format("test.xref", only(xref.call()));
+        let prog = Compiler::compile_program(&module, &top.call()).expect("xref must compile");
+        let cases: &[(&[u8], bool)] = &[
+            (b"xref\n0 1\n0000000000 65535 f\r\n", true),
+            (b"xref\n0 2\n0000000000 65535 f \n0000000017 00000 n \r", true),
+            (b"xref\n0 1\n0000000000 65535 f\r\n3 1\n0000000123 00002 n\r\n", true),
+            (b"xref\n0 0\n", true),
+            (b"xref\n", false),
+            (b"xref\n0 2\n0000000000 65535 f\r\n", false),
+            (b"xref\n0 1\n000000000 65535 f\r\n", false),
+            (b"xref\n0 1\n0000000000 65535 x\r\n", false),
+            (b"xref\n0 1\n0000000000 65535 f\n", false),
+        ];
         for (input, ok) in cases {
             assert_eq!(
                 prog.run(ReadCtxt::new(input)).is_ok(),

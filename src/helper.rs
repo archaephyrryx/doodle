@@ -1694,16 +1694,23 @@ pub fn slice(len: Expr, inner: Format) -> Format {
     Format::Slice(Box::new(len), Box::new(inner))
 }
 
+/// Helper that returns a format whose parse succeeds, yielding a unit-value, if and only if
+/// some parse within `formats` succeeded.
+///
+/// The individual formats in `formats` are allowed to overlap.
 pub fn any_of(formats: impl IntoIterator<Item = Format>) -> Format {
     Format::UnionNondet(formats.into_iter().map(void).collect())
 }
 
-/// Helper for parsing a given Format `inner` in such a way that none of the formats
-/// in the list of `negative` are matched.
+/// Helper for parsing a given Format `inner` conditioned on the negated-lookahead of the format `negative`.
 ///
 /// Can be used for filtering out a specific subset of exceptions to a general rule
 /// without designing a format that explicitly excludes such exceptions in its
 /// definition.
+///
+/// # Notes
+///
+/// Can be called with `negative := any_of([..])` (see [`any_of`]) to exclude multiple anti-patterns simultaneously.
 pub fn excluding(negative: Format, inner: Format) -> Format {
     monad_seq(Format::PeekNot(Box::new(negative)), inner)
 }
