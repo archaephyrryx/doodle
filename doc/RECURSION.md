@@ -438,9 +438,10 @@ bound this, both in `src/lib.rs` and used by both compilers:
   extends its own. To find out, each decision point's tree is built against a `Next::Probe` marker,
   which behaves like `Next::Empty` for lookahead but is recorded in the `CycleGuard` when reached
   (`MatchTree::reaches_probe`; a failed build also counts, since whether it fails can depend on the
-  probe). Recursive levels are resolved as a least fixpoint: a level reached again while its own
-  answer is being worked out is assumed independent. A `true` answer is always final; a `false`
-  answer that relied on that assumption for a level further out is not cached. `Maybe`, whose inner
+  probe). Recursive levels are resolved as a least fixpoint, a cycle at a time (see
+  [Resolving the analyses over recursive levels](#resolving-the-analyses-over-recursive-levels)): a
+  level reached again while its own answer is being worked out is first assumed independent, and a
+  `true` answer is final whatever it was worked out under. `Maybe`, whose inner
   format codegen compiles against the outer continuation and the interpreter against `Next::Empty`,
   is analysed as the former, so the answer covers both backends.
 - **`NextDependence::call_continuation`** cuts the continuation of a call to a level that does
@@ -468,11 +469,9 @@ bound this, both in `src/lib.rs` and used by both compilers:
   (`MatchTree::lookahead_into`, recorded in a `NextUsage`; a failed build counts as 80). A call within
   the level counts what its callee consults of its own continuation, which ends in the trailer, as if
   it were all trailer, which over-approximates. `(level, cut continuation)` pairs are cached and
-  resolved recursively in the same way as the dependence answers, both through `LevelAnalytics`, with
-  a pair reached again while its own answer is being worked out assumed to consult nothing. No such
-  answer is final in the way a `true` dependence answer is, so one that relied on that assumption for
-  a pair further out is never cached. That this single pass reaches the least fixpoint of the
-  measurement has been argued, not proven. `cut_continuations_decode_as_uncut` (in `src/lib.rs`)
+  resolved over recursive levels in the same way as the dependence answers, both through
+  `LevelAnalytics`, with a pair reached again while its own answer is being worked out first assumed
+  to consult nothing (see the next section). `cut_continuations_decode_as_uncut` (in `src/lib.rs`)
   checks, for a few grammars where the two cuts differ, that the interpreter's program decodes
   exactly as one compiled with every call cut at 80 bytes instead; it does not cover `GTCompiler`,
   or grammars like the two-bracket one above, for which the 80-byte cut never finishes compiling.
@@ -489,6 +488,65 @@ Merging also covers calls nested inside a level compiled against a cut continuat
 own continuation can cut to a different key than it would under the original continuation, since its
 own search through the cut lengths may look past the bytes it ends up consulting; but it consults only
 bytes on which the two agree, so both keys compile to the same decoder.
+
+#### Resolving the analyses over recursive levels
+
+Both `NextDependence` analyses (whether a level depends on its continuation, and how many bytes of a
+cut continuation it consults) recurse through the levels a level calls, so inside a recursive batch
+they meet keys whose own analysis is still in progress. `LevelAnalytics` (`src/lib.rs`) holds the
+state for each: `finished` answers, the `frontier` of keys being analysed (outermost first), and
+`lowest_assumed`, the outermost frontier position the innermost analysis has relied on so far.
+`LevelAnalytics::enter` opens a key or answers it; `LevelAnalytics::exit` ends a pass over it.
+
+Within a recursive batch, nearly every result relies on some key still open further out. Such a
+result has to be kept, not just the ones that relied on nothing: each `lookahead_budget` call tries
+several cuts of its continuation, each a separate key, so recomputing results that relied on an
+assumption multiplies the work by the number of cuts tried at every level of nesting the analysis
+passes through. In doodle-pdf's `pdf.value`/`.array`/`.dict` batch, octal string escapes read three
+bytes past a string's end, which fails at cuts 1 and 2 and succeeds at 4; recomputing every result
+that relied on an assumption would take about 125,000 analyses and 970,000 tree builds to compile a
+one-object PDF.
+
+The answers are worked out as a least fixpoint, one cycle of keys at a time:
+
+- **Estimates.** A key reached again while open is answered with its *estimate*: the `assumption`
+  passed to `enter` (`false` for dependence, `0` for lookahead) on the first pass, and the value an
+  earlier pass gave it after that. Being answered this way is noted on the key (`was_assumed`) and in
+  `lowest_assumed`.
+- **Provisional values.** A result that relied on an estimate further out is *provisional*. `exit`
+  keeps it under the outermost key it relied on, the head of its cycle, along with any provisional
+  values the exiting key held itself, and `enter` answers it from there while that head stays open,
+  noting the dependence on the head exactly as an estimate would.
+- **Passes.** When a key whose result relied on nothing further out exits, it is a head (or relied on
+  no estimate at all). If any estimate in its cycle differed from the value it stood for, `exit`
+  returns `AnalysisExit::Again`: the head's new value becomes its estimate, its provisional values
+  are dropped, and the caller (`level_depends_on_next`, `lookahead_for_key`) analyses it again.
+  Otherwise the head's value and every provisional value under it are recorded in `finished`
+  together.
+- **Inner keys.** A key that was reached again while open but is not a head carries its value to the
+  next pass, as an estimate kept under its head. If that value differs from the estimate it was
+  answered with, every head that received provisional values while the key was open must run another
+  pass, since those values may have relied on the stale estimate. `LevelAnalytics::stored` counts
+  provisional values, and each frontier entry notes the count after the latest one it received
+  (`last_stored`), which tells such heads apart from the rest.
+- **Final answers.** A `true` dependence answer holds whatever it was worked out under, so it is
+  recorded at once and passes no assumptions on. If its estimate was missed, the provisional values
+  under it are dropped rather than recorded.
+
+Each pass analyses each key of a cycle at most once, so the work is the size of the cycle times the
+number of passes. For the doodle-pdf batch above, the same compile opens 425 keys across both
+analyses and runs 13 repeated passes, taking 310 answers from provisional values. The passes settle
+provided the analyses are monotone (a larger estimate never gives a smaller answer). This holds for
+`format_lookahead`'s `max`-combinations, and `MatchTree::lookahead_into` does not read the cache,
+but it is not proven for `lookahead_budget`, where a larger estimate can move the search to a later
+cut. The passes over a cycle are capped at `MAX_FIXPOINT_PASSES` (twice `MATCH_TREE_MAX_DEPTH`):
+reaching the cap fails a debug assertion, and otherwise gives the head its `top` value (`true`, or
+`MATCH_TREE_MAX_DEPTH`), which always suffices.
+
+Logging every `call_continuation` result over doodle-formats' main format (through both compilers)
+and doodle-pdf gives the same results with this resolution as with a single pass that keeps only
+results relying on nothing, so for those grammars the two agree; the difference is in how many
+analyses it takes.
 
 #### `TypedFormat`'s own cycle-safe traversals
 
@@ -669,6 +727,12 @@ the other types they cannot convert.
   preferring a named `Format::record` over a raw multi-field `Tuple` for anything that both
   participates in a recursive cycle *and* is referenced from more than one place, since `Record` is
   always cached and doesn't have this problem.
+- **Monotonicity of the lookahead analysis is unproven.** The fixpoint over a recursive batch's
+  analyses (see
+  [Resolving the analyses over recursive levels](#resolving-the-analyses-over-recursive-levels))
+  settles only if a larger estimate never gives a smaller answer, which is argued but not proven for
+  `lookahead_budget`. `MAX_FIXPOINT_PASSES` bounds the passes either way, and debug builds assert
+  that it is never reached.
 - **Batch members taking views.** `define_batch_with_args` supports expression arguments only;
   every batch member is reserved with no view parameters. A views form would also need
   `solve_batch_types` to bind each unreached member's view names, as it binds its parameters.
@@ -703,7 +767,14 @@ the other types they cannot convert.
     `define_batch_with_args_rejects_ill_typed_self_call_argument`;
   - continuation keys (mechanism 4): `next_dependence_is_decided_by_reachable_lookahead`,
     `interpreter_compiles_and_decodes_repeat_of_recursive_item`,
-    `continuation_dependent_recursion_compiles_to_bounded_decoders`;
+    `continuation_dependent_recursion_compiles_to_bounded_decoders`,
+    `continuation_dependent_recursion_truncates_to_lookahead_used`, and
+    `cut_continuations_decode_as_uncut`; measuring what a tree or level consults:
+    `lookahead_into_counts_bytes_read_from_the_trailer`, `format_lookahead_is_correct`,
+    `lookahead_budget_is_correct`; and resolving the analyses over recursive levels:
+    `lookahead_analyses_in_recursion_are_bounded`, which counts the analyses run (through a
+    `cfg(test)` log in `lookahead_for_key`) for a bracket batch whose atom reads three bytes into its
+    continuation, and bounds them by a small multiple of the distinct `(level, key)` pairs;
   - mechanism 6: `ill_typed_use_of_recursive_field_is_rejected_or_decodes_without_panic`, its
     `..._from_later_registration_...` counterpart, `rec_batch_member_type_refers_to_itself_through_rec`,
     and `rec_batch_member_type_keeps_registration_conventions`.

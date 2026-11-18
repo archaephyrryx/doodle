@@ -62,6 +62,37 @@ that names the format (`what()`) along with the reason. (`MatchTree::build`, whi
 `MatchTree::matches` indicates what unambiguous branch-index, if one exists, corresponds to the immediate byte-sequence yielded by looking into `input` up to the first unconditional choice-point, or
 running out of look-ahead. In the former case, `Some(n)` is returned where `n` is the original index of the `Format` in the `branches` parameter passed to `MatchTree::try_build`.
 
+#### Measuring what a tree consults of its continuation
+
+Two further methods build a tree only to learn something about the continuation it was built
+against; both are used by `NextDependence` to decide which continuation a called level's decoder is
+compiled against (see `doc/RECURSION.md`, mechanism 4):
+
+* `MatchTree::reaches_probe(module, branches, next) -> bool`: whether the tree could consult a
+  [`Next::Probe`](#next) within `next`, i.e. whether the tree depends on what the probe stands for.
+  A failed build counts as `true`, since whether it fails can depend on the probe.
+* `MatchTree::lookahead_into(module, branches, next, trailer) -> usize`: the most bytes of `trailer`
+  that any path through the tree reads. `trailer` is a suffix of `next` (often all of it): the
+  continuation that follows the format whose lookahead is being measured, while `next` can also
+  hold the rest of that format after the decision point. For `Tuple([<Union>, X])`, `next` is
+  `X ++ trailer`. A failed build counts as `MATCH_TREE_MAX_DEPTH`.
+
+Both go through `MatchTree::try_build_probed`, which is `try_build` with a `NextUsage` threaded
+through `MatchTreeLevel::try_grow`:
+
+* `reached_probe`: whether any step consulted `Next::Probe`
+* `trailer`: the address (a `NextPtrAddr`) of the trailer, if one is being measured
+* `trailer_bytes_read`: the most bytes of the trailer read so far, over all paths
+
+At each node, `try_grow` hands `trailer` to the fresh `CycleGuard` of every `MatchTreeStep` it
+builds, and `MatchTreeStep::from_next` notes in the guard when the continuation it is given is the
+trailer, matched by `Rc` address as exits are (see
+[Cycle guard for self-referential formats](#cycle-guard-for-self-referential-formats)). The first
+depth at which a step reaches the trailer is passed down that node's subtrees as `trailer_offset`,
+and from that node on, each node at depth `offset` counts `offset - trailer_offset + 1` bytes as
+read from the trailer (1 at the node where it is first reached). A tree that is decided before
+reaching the trailer reads none of it.
+
 #### Failure reasons
 
 `MatchTree::try_build` fails with one of:
@@ -224,8 +255,12 @@ decoder on its continuation (see `doc/RECURSION.md`, mechanism 4).
 
 Because a `MatchTree` never looks more than `MATCH_TREE_MAX_DEPTH` bytes past its decision point,
 whatever follows the first `MATCH_TREE_MAX_DEPTH` bytes (by minimum length) of a continuation cannot
-affect a tree built against it, and `Next::truncated` replaces it with `Next::Empty` where a level is
-called.
+affect a tree built against it. `Next::truncated(next, module, n)` cuts a continuation to its first
+`n` bytes, replacing what follows with `Next::Empty`; the cut agrees with `next` on those bytes and
+on whether it can end before them, so any tree that reads no more than `n` bytes of it is the same
+for both. Where a level is called, its continuation is cut to the bytes the level consults
+(`NextDependence::call_continuation`, measured with `MatchTree::lookahead_into` above), with
+`MATCH_TREE_MAX_DEPTH` as the cut that always suffices.
 
 `Next::Probe` stands in for an unknown continuation when working out whether a level's decoder
 depends on its continuation at all. It behaves exactly like `Next::Empty` for lookahead, but the walk
@@ -257,6 +292,9 @@ parameter of type `&mut CycleGuard`.
 * `has_cycle`: a boolean flag used to indicate that a cycle was detected, to avoid having to panic or introduce fallibility to `MatchTreeStep::from_format`
 * `cycle_level`: the first level found to be re-entered, if any
 * `reached_probe`: whether [`Next::Probe`](#next) was consulted
+* `trailer`: the address of the trailer being measured, if any (see
+  [Measuring what a tree consults of its continuation](#measuring-what-a-tree-consults-of-its-continuation))
+* `reached_trailer`: whether the walk reached `trailer`
 
 The concept of an 'open' level is somewhat circular, but it is best summed up as follows:
 
@@ -275,6 +313,8 @@ MatchTreeStep::from_format(Module, F, Next, CycleGuard):
     ...
 
 MatchTreeStep::from_next(Module, Next, CycleGuard):
+    if Next is CycleGuard->trailer (by pointer identity):
+        CycleGuard->reached_trailer := true
     let Left = every open Level whose exit is Next (by pointer identity)
     mark each Level in Left as closed in CycleGuard
     let Ret = (the usual walk of Next)
