@@ -2082,7 +2082,8 @@ struct FrontierEntry<K, V> {
 
 /// Maximum number of passes [`LevelAnalytics`] runs over a cycle before answering its `top`
 /// value for the cycle's head (see [`LevelAnalytics::exit`]). Lookahead values range over
-/// `0..=MATCH_TREE_MAX_DEPTH`, so a monotone analysis settles well within this.
+/// `0..=MATCH_TREE_MAX_DEPTH`, so a monotone analysis settles well within this; reaching the cap
+/// fails a debug assertion, as it suggests the analysis is not monotone.
 const MAX_FIXPOINT_PASSES: usize = 2 * MATCH_TREE_MAX_DEPTH;
 
 impl<K, V> std::default::Default for LevelAnalytics<K, V> {
@@ -2222,6 +2223,10 @@ impl<K: Eq + std::hash::Hash + Clone, V: Copy + PartialEq> LevelAnalytics<K, V> 
                 self.lowest_assumed = None;
                 return AnalysisExit::Again(frame);
             }
+            debug_assert!(
+                false,
+                "fixpoint did not settle within {MAX_FIXPOINT_PASSES} passes; the analysis may not be monotone"
+            );
             let entry = self.frontier.pop().unwrap();
             self.finished.insert(entry.key, top);
             self.lowest_assumed = frame.outer_assumed;
