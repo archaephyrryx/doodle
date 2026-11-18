@@ -379,10 +379,6 @@ fn number(module: &mut FormatModule, natural: FormatRef) -> FormatRef {
 }
 
 fn v_string(module: &mut FormatModule, any_ws: FormatRef, eol: FormatRef) -> Format {
-    // TODO - octal escapes (`\ddd`, up to three digits, read greedily). `MatchTree` rejects
-    // `map(octal_num_u8(1, 3), lambda("c", Expr::Seq(vec![var("c")])))` here as ambiguous: after
-    // `\10`, a following digit could be the escape's third digit or the start of a plain chunk,
-    // and there is no greedy repetition to settle it.
     let known_esc = interpret([
         (is_byte(b'n'), Expr::Seq(vec![Expr::U8(b'\n')])),
         (is_byte(b'r'), Expr::Seq(vec![Expr::U8(b'\r')])),
@@ -395,9 +391,11 @@ fn v_string(module: &mut FormatModule, any_ws: FormatRef, eol: FormatRef) -> For
         // A backslash before an end-of-line continues the string onto the next line
         (eol.call(), Expr::Seq(vec![])),
     ]);
+    // `\ddd`: one to three octal digits, read greedily (see `octal_num_u8`), so `\0053` is the byte
+    // 5 followed by `3`. A value over 255 (e.g. `\777`) fails rather than wrapping.
     let octal_esc = map(octal_num_u8(), lambda("b", Expr::Seq(vec![var("b")])));
     // Any other escaped byte stands for itself (the backslash is ignored). Octal digits are
-    // excluded so that an octal escape fails rather than silently decoding as its digits.
+    // excluded so that this branch does not overlap `octal_esc`.
     let unknown_esc = map(
         byte_in(ByteSet::from(*b"nrtbf()\\\r\n01234567").complement()),
         lambda("b", Expr::Seq(vec![var("b")])),
