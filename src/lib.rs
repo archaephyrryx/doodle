@@ -2013,10 +2013,10 @@ impl<'a> Next<'a> {
 /// compiles against the outer continuation and the interpreter against `Next::Empty`), the
 /// answer covers both.
 ///
-/// Recursive levels are resolved as a least fixpoint: a level reached again while its own answer
-/// is being worked out is assumed independent. A `true` answer is always final; a `false` answer
-/// that relied on that assumption for a level further out is not recorded, and is worked out
-/// again if asked for later.
+/// Recursive levels are resolved as a least fixpoint, a cycle at a time (see [`LevelAnalytics`]):
+/// a level reached again while its own answer is being worked out is first assumed independent,
+/// and a lookahead it is reached again for is first assumed to be 0. A `true` dependence answer is
+/// always final, whatever the assumptions it was worked out under.
 #[derive(Default)]
 pub(crate) struct NextDependence<'a> {
     /// Analysis-cache for 'depends-on-next' as a raw boolean
@@ -2031,15 +2031,59 @@ pub(crate) struct NextDependence<'a> {
 }
 
 /// Helper-struct for consolidating the design of 'depends-on-next' and 'lookahead byte-depth' caching
+///
+/// # Recursion
+///
+/// Values are worked out as a least fixpoint, over a cycle of keys at a time. A key reached again
+/// while its own analysis is in progress is answered with an estimate (initially the `assumption`
+/// passed to [`Self::enter`]), and a value worked out from an estimate is provisional: it is kept,
+/// and reused, only while the outermost key it relied on (the head of its cycle) is still open.
+/// When the head's analysis ends, it is run again if any estimate in the cycle turned out
+/// different from the value it stood for, now starting from those values; otherwise the head's
+/// value and the cycle's provisional values are all final. Each pass analyses each key of the
+/// cycle at most once.
+///
+/// This relies on the analysis being monotone (a larger estimate never yields a smaller value)
+/// for the passes to settle. The number of passes is capped regardless, see [`MAX_FIXPOINT_PASSES`].
 struct LevelAnalytics<K = usize, V = bool> {
     /// Lookup table of finished judgments mapping level-based `K` to the analysis-value `V`
     finished: HashMap<K, V>,
-    /// Frontier of levels currently being analyzed (outermost first)
-    frontier: Vec<K>,
-    /// Index of the earliest element in `frontier` we are assuming to be an analytical fixed-point
-    /// while working out the answer for the innermost (final-index) level
+    /// Keys currently being analysed (outermost first)
+    frontier: Vec<FrontierEntry<K, V>>,
+    /// Index of the earliest element in `frontier` whose estimate (or provisional value) the
+    /// innermost key's analysis has relied on so far
     lowest_assumed: Option<usize>,
+    /// Number of provisional values recorded so far, used to tell which heads received any
+    /// while a given key was open (see [`FrontierEntry::last_stored`])
+    stored: u64,
 }
+
+/// A key whose analysis is in progress, with the state of any cycle it heads.
+struct FrontierEntry<K, V> {
+    key: K,
+    /// The value this key is answered with if it is reached again while open
+    estimate: V,
+    /// Whether this key has been answered with `estimate` during the current pass
+    was_assumed: bool,
+    /// Values worked out during the current pass that rely on this key's estimate, and on no
+    /// estimate further out
+    provisional: HashMap<K, V>,
+    /// Estimates for keys of this cycle, other than this one, carried from one pass to the next
+    estimates: HashMap<K, V>,
+    /// Whether some estimate in this cycle differed from the value it stood for, so that the
+    /// current pass must be followed by another
+    changed: bool,
+    /// Number of completed passes over this key's cycle
+    passes: usize,
+    /// The value of [`LevelAnalytics::stored`] after the most recent provisional value recorded
+    /// under this key
+    last_stored: u64,
+}
+
+/// Maximum number of passes [`LevelAnalytics`] runs over a cycle before answering its `top`
+/// value for the cycle's head (see [`LevelAnalytics::exit`]). Lookahead values range over
+/// `0..=MATCH_TREE_MAX_DEPTH`, so a monotone analysis settles well within this.
+const MAX_FIXPOINT_PASSES: usize = 2 * MATCH_TREE_MAX_DEPTH;
 
 impl<K, V> std::default::Default for LevelAnalytics<K, V> {
     fn default() -> Self {
@@ -2047,6 +2091,7 @@ impl<K, V> std::default::Default for LevelAnalytics<K, V> {
             finished: Default::default(),
             frontier: Default::default(),
             lowest_assumed: Default::default(),
+            stored: 0,
         }
     }
 }
@@ -2059,65 +2104,155 @@ struct AnalysisFrame {
     depth: usize,
     /// The value of `lowest_assumed` before this key's analysis began, for `exit` to restore.
     outer_assumed: Option<usize>,
+    /// The value of [`LevelAnalytics::stored`] when this key's analysis began
+    opened_at: u64,
 }
 
 /// The result of [`LevelAnalytics::enter`].
 enum AnalysisEntry<V> {
-    /// No analysis is needed: this is either the key's finished value, or the assumed value for a
-    /// key whose analysis is already in progress.
+    /// No analysis is needed: this is the key's finished value, its provisional value, or the
+    /// estimate for a key whose analysis is already in progress.
     Answered(V),
     /// The key's analysis has begun. The caller works out its value, then passes this frame and
     /// the value to [`LevelAnalytics::exit`].
     Opened(AnalysisFrame),
 }
 
-impl<K: Eq + std::hash::Hash, V: Copy> LevelAnalytics<K, V> {
+/// The result of [`LevelAnalytics::exit`].
+enum AnalysisExit<V> {
+    /// The key's analysis is over, with this value.
+    Done(V),
+    /// The key heads a cycle that needs another pass: the caller works out its value again and
+    /// passes it to [`LevelAnalytics::exit`] with this frame.
+    Again(AnalysisFrame),
+}
+
+impl<K: Eq + std::hash::Hash + Clone, V: Copy + PartialEq> LevelAnalytics<K, V> {
     /// Begins the analysis of `key`, unless it has an answer already.
     ///
-    /// A key that is reached again while its own analysis is in progress is answered with
-    /// `assumption`, and the assumption is noted in `lowest_assumed`, since any value worked out
-    /// from it may not hold once the analysis of that key finishes.
+    /// A key that is reached again while its own analysis is in progress is answered with its
+    /// estimate, `assumption` unless an earlier pass over its cycle gave a value. Answering with
+    /// an estimate or a provisional value is noted in `lowest_assumed`, since any value worked
+    /// out from it may not hold once the analysis of the key it depends on finishes.
     ///
     /// Analysis is split into this method and [`Self::exit`], rather than a single method taking
     /// a closure, because working out a value needs mutable access to the [`NextDependence`] that
     /// owns this `LevelAnalytics`.
     fn enter(&mut self, key: K, assumption: V) -> AnalysisEntry<V> {
         if let Some(ret) = self.finished.get(&key) {
-            AnalysisEntry::Answered(*ret)
-        } else if let Some(pos) = self.frontier.iter().position(|k| *k == key) {
-            self.lowest_assumed = Some(self.lowest_assumed.map_or(pos, |p| p.min(pos)));
-            AnalysisEntry::Answered(assumption)
-        } else {
-            let depth = self.frontier.len();
-            self.frontier.push(key);
-            let outer_assumed = self.lowest_assumed.take();
-            AnalysisEntry::Opened(AnalysisFrame {
-                depth,
-                outer_assumed,
-            })
+            return AnalysisEntry::Answered(*ret);
         }
+        if let Some(pos) = self.frontier.iter().position(|e| e.key == key) {
+            let entry = &mut self.frontier[pos];
+            entry.was_assumed = true;
+            self.lowest_assumed = min_opt(self.lowest_assumed, Some(pos));
+            return AnalysisEntry::Answered(entry.estimate);
+        }
+        let mut estimate = assumption;
+        for (pos, entry) in self.frontier.iter().enumerate() {
+            if let Some(ret) = entry.provisional.get(&key) {
+                self.lowest_assumed = min_opt(self.lowest_assumed, Some(pos));
+                return AnalysisEntry::Answered(*ret);
+            }
+            if let Some(est) = entry.estimates.get(&key) {
+                estimate = *est;
+            }
+        }
+        let depth = self.frontier.len();
+        self.frontier.push(FrontierEntry {
+            key,
+            estimate,
+            was_assumed: false,
+            provisional: HashMap::new(),
+            estimates: HashMap::new(),
+            changed: false,
+            passes: 0,
+            last_stored: 0,
+        });
+        let outer_assumed = self.lowest_assumed.take();
+        AnalysisEntry::Opened(AnalysisFrame {
+            depth,
+            outer_assumed,
+            opened_at: self.stored,
+        })
     }
 
-    /// Ends the analysis of the innermost open key, whose result is `value`, where `frame` is the
-    /// one [`Self::enter`] returned for that key.
+    /// Ends a pass over the innermost open key, whose result is `value`, where `frame` is the one
+    /// [`Self::enter`] (or a previous `exit`) returned for that key.
     ///
-    /// `value` is recorded in `finished` unless it relied on an assumption about a key further
-    /// out in `frontier`, in which case it may be wrong, and the key is analysed afresh if asked
-    /// for again.
+    /// - If `value` relied on an estimate for a key further out in `frontier`, it is provisional,
+    ///   and is kept under the outermost such key, together with any provisional values this key
+    ///   held.
+    /// - Otherwise, if this key heads a cycle that needs another pass, `Again` is returned, and
+    ///   the caller works out the key's value afresh. After [`MAX_FIXPOINT_PASSES`] passes,
+    ///   `top` is recorded instead.
+    /// - Otherwise, `value` is recorded in `finished`, together with the cycle's provisional
+    ///   values.
     ///
-    /// `is_final` overrides that: it means that `value` holds no matter what any assumption turns
-    /// out to be, so it is recorded regardless, and the assumptions it was computed under are not
-    /// passed on to the keys further out.
-    fn exit(&mut self, frame: AnalysisFrame, value: V, is_final: bool) {
-        let Some(k) = self.frontier.pop() else {
+    /// `is_final` means that `value` holds no matter what any estimate turns out to be, so it is
+    /// recorded regardless, and the assumptions it was computed under are not passed on to the
+    /// keys further out.
+    fn exit(&mut self, frame: AnalysisFrame, value: V, is_final: bool, top: V) -> AnalysisExit<V> {
+        let depth = frame.depth;
+        debug_assert_eq!(depth + 1, self.frontier.len());
+        let Some(entry) = self.frontier.last() else {
             unreachable!("exit called on empty frontier")
         };
-        let assumed_further_out = self.lowest_assumed.filter(|&pos| pos < frame.depth);
-        if is_final || assumed_further_out.is_none() {
-            self.finished.insert(k, value);
+        let estimate_missed = entry.was_assumed && entry.estimate != value;
+        let assumed_further_out = self.lowest_assumed.filter(|&pos| pos < depth);
+
+        if estimate_missed {
+            // values recorded under keys further out while this key was open may have relied on
+            // its estimate
+            for outer in &mut self.frontier[..depth] {
+                if outer.last_stored > frame.opened_at {
+                    outer.changed = true;
+                }
+            }
         }
-        let carried = if is_final { None } else { assumed_further_out };
-        self.lowest_assumed = min_opt(carried, frame.outer_assumed);
+
+        let entry = self.frontier.last_mut().unwrap();
+        if !is_final && assumed_further_out.is_none() && (estimate_missed || entry.changed) {
+            entry.passes += 1;
+            if entry.passes < MAX_FIXPOINT_PASSES {
+                entry.estimate = value;
+                entry.was_assumed = false;
+                entry.changed = false;
+                entry.provisional.clear();
+                self.lowest_assumed = None;
+                return AnalysisExit::Again(frame);
+            }
+            let entry = self.frontier.pop().unwrap();
+            self.finished.insert(entry.key, top);
+            self.lowest_assumed = frame.outer_assumed;
+            return AnalysisExit::Done(top);
+        }
+
+        let entry = self.frontier.pop().unwrap();
+        match assumed_further_out.filter(|_| !is_final) {
+            Some(head) => {
+                self.stored += 1;
+                let stored = self.stored;
+                let outer = &mut self.frontier[head];
+                outer.provisional.extend(entry.provisional);
+                outer.estimates.extend(entry.estimates);
+                outer.changed |= entry.changed;
+                if entry.was_assumed {
+                    outer.estimates.insert(entry.key.clone(), value);
+                }
+                outer.provisional.insert(entry.key, value);
+                outer.last_stored = stored;
+                self.lowest_assumed = min_opt(Some(head), frame.outer_assumed);
+            }
+            None => {
+                if !is_final || !estimate_missed {
+                    self.finished.extend(entry.provisional);
+                }
+                self.finished.insert(entry.key, value);
+                self.lowest_assumed = frame.outer_assumed;
+            }
+        }
+        AnalysisExit::Done(value)
     }
 }
 
@@ -2167,15 +2302,19 @@ const LOOKAHEAD_BUDGETS: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
 
 impl<'a> NextDependence<'a> {
     pub(crate) fn level_depends_on_next(&mut self, module: &FormatModule, level: usize) -> bool {
-        let frame = match self.depends.enter(level, false) {
+        let mut frame = match self.depends.enter(level, false) {
             AnalysisEntry::Answered(known) => return known,
             AnalysisEntry::Opened(frame) => frame,
         };
-        let depends =
-            self.format_depends_on_next(module, module.get_format(level), Rc::new(Next::Probe));
-        let is_final = depends;
-        self.depends.exit(frame, depends, is_final);
-        depends
+        loop {
+            let depends =
+                self.format_depends_on_next(module, module.get_format(level), Rc::new(Next::Probe));
+            let is_final = depends;
+            match self.depends.exit(frame, depends, is_final, true) {
+                AnalysisExit::Done(depends) => return depends,
+                AnalysisExit::Again(again) => frame = again,
+            }
+        }
     }
 
     /// How many leading bytes of `next` compiling `level` against it consults, through any
@@ -2263,15 +2402,22 @@ impl<'a> NextDependence<'a> {
         level: usize,
         key: Rc<Next<'a>>,
     ) -> usize {
-        let frame = match self.lookahead.enter((level, key.clone()), 0) {
+        let mut frame = match self.lookahead.enter((level, key.clone()), 0) {
             AnalysisEntry::Answered(known) => return known,
             AnalysisEntry::Opened(frame) => frame,
         };
-        #[cfg(test)]
-        lookahead_analyses::record(level, &key);
-        let nbytes = self.format_lookahead(module, module.get_format(level), key.clone(), &key);
-        self.lookahead.exit(frame, nbytes, false);
-        nbytes
+        loop {
+            #[cfg(test)]
+            lookahead_analyses::record(level, &key);
+            let nbytes = self.format_lookahead(module, module.get_format(level), key.clone(), &key);
+            match self
+                .lookahead
+                .exit(frame, nbytes, false, MATCH_TREE_MAX_DEPTH)
+            {
+                AnalysisExit::Done(nbytes) => return nbytes,
+                AnalysisExit::Again(again) => frame = again,
+            }
+        }
     }
 
     /// Whether compiling `format` against `next` can consult a [`Next::Probe`] within `next`.
