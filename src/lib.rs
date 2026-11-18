@@ -2128,6 +2128,38 @@ fn min_opt<T: Ord>(x: Option<T>, y: Option<T>) -> Option<T> {
     }
 }
 
+/// A per-thread log of the lookahead analyses [`NextDependence::lookahead_for_key`] runs, for
+/// tests that bound how often an analysis is repeated.
+#[cfg(test)]
+mod lookahead_analyses {
+    use super::Next;
+    use std::cell::RefCell;
+    use std::hash::{Hash, Hasher};
+
+    thread_local! {
+        static LOG: RefCell<Vec<(usize, u64)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Notes that the analysis of `level` against `key` has begun.
+    pub(super) fn record(level: usize, key: &Next<'_>) {
+        let mut hasher = std::hash::DefaultHasher::new();
+        key.hash(&mut hasher);
+        LOG.with(|log| log.borrow_mut().push((level, hasher.finish())));
+    }
+
+    /// Clears the log, runs `f`, and returns `f`'s result with the number of analyses run and
+    /// the number of distinct `(level, key)` pairs among them.
+    pub(super) fn count<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
+        LOG.with(|log| log.borrow_mut().clear());
+        let ret = f();
+        LOG.with(|log| {
+            let log = log.borrow();
+            let distinct = log.iter().collect::<std::collections::HashSet<_>>().len();
+            (ret, log.len(), distinct)
+        })
+    }
+}
+
 /// The lengths, in bytes, that [`NextDependence::lookahead_budget`] cuts a continuation to in
 /// turn, measuring what a level reads of each cut, until a cut keeps everything the level reads.
 /// If none does, the continuation is cut at [`MATCH_TREE_MAX_DEPTH`] bytes, which always suffices.
@@ -2235,6 +2267,8 @@ impl<'a> NextDependence<'a> {
             AnalysisEntry::Answered(known) => return known,
             AnalysisEntry::Opened(frame) => frame,
         };
+        #[cfg(test)]
+        lookahead_analyses::record(level, &key);
         let nbytes = self.format_lookahead(module, module.get_format(level), key.clone(), &key);
         self.lookahead.exit(frame, nbytes, false);
         nbytes
@@ -5239,6 +5273,15 @@ mod test {
         module: &mut FormatModule,
         brackets: &[(&'static str, u8, u8)],
     ) -> FormatRef {
+        register_spaced_brackets_with_atom(module, crate::helper::is_byte(b'n'), brackets)
+    }
+
+    /// [`register_spaced_brackets`] with `atom` in place of `'n'`.
+    fn register_spaced_brackets_with_atom(
+        module: &mut FormatModule,
+        atom: Format,
+        brackets: &[(&'static str, u8, u8)],
+    ) -> FormatRef {
         use crate::helper::{is_byte, repeat};
 
         let ws = || repeat(is_byte(b' '));
@@ -5253,7 +5296,7 @@ mod test {
         };
         let mut branches = vec![Format::Variant(
             Label::Borrowed("Atom"),
-            Box::new(Format::Tuple(vec![is_byte(b'n'), ws()])),
+            Box::new(Format::Tuple(vec![atom, ws()])),
         )];
         for &(name, open, close) in brackets {
             branches.push(Format::Variant(
@@ -5285,6 +5328,56 @@ mod test {
         );
         assert!(prog.run(ReadCtxt::new(b"[ ( n [n] ) n ]  ")).is_ok());
         assert!(prog.run(ReadCtxt::new(b"[ ( n ] )")).is_err());
+    }
+
+    /// Three kinds of bracket for [`register_spaced_brackets_with_atom`].
+    const THREE_BRACKETS: &[(&str, u8, u8)] = &[
+        ("List", b'[', b']'),
+        ("Group", b'(', b')'),
+        ("Dict", b'{', b'}'),
+    ];
+
+    /// `'n'` followed by one to three octal digits, read greedily as PDF's octal string escapes
+    /// are: the two- and one-digit branches only match where no longer run of digits does.
+    /// Telling the branches apart reads up to three bytes past the atom's first digit, so past
+    /// a short run of digits it reads into the atom's continuation.
+    fn greedy_octal_atom() -> Format {
+        use crate::helper::{byte_in, excluding, is_byte, monad_seq, repeat_count, union};
+
+        let digits = |n: u32| repeat_count(Expr::U32(n), byte_in(b'0'..=b'7'));
+        let octal = union([
+            digits(3),
+            excluding(digits(3), digits(2)),
+            excluding(digits(2), digits(1)),
+        ]);
+        monad_seq(is_byte(b'n'), monad_seq(octal, Format::EMPTY))
+    }
+
+    /// Each lookahead analysis inside a recursive level is run a bounded number of times.
+    ///
+    /// Inside the bracket batch, nearly every result depends on an assumption about a call still
+    /// being analysed further out. Each `lookahead_budget` tries several cuts of its
+    /// continuation, each a separate key, so if such results are not kept, the number of analyses
+    /// multiplies with every level of nesting the analysis passes through. The bound here is a
+    /// small multiple of the number of distinct `(level, key)` pairs analysed, which allows for a
+    /// few passes over each to reach a fixed point.
+    #[test]
+    fn lookahead_analyses_in_recursion_are_bounded() {
+        let mut module = FormatModule::new();
+        let value =
+            register_spaced_brackets_with_atom(&mut module, greedy_octal_atom(), THREE_BRACKETS);
+        let (prog, analyses, distinct) = lookahead_analyses::count(|| {
+            super::decoder::Compiler::compile_program(&module, &value.call()).unwrap()
+        });
+        assert!(
+            analyses <= 4 * distinct,
+            "{analyses} analyses of {distinct} distinct (level, key) pairs"
+        );
+        assert!(
+            prog.run(ReadCtxt::new(b"[ n1 ( n12 { n123 n4 } ) ]"))
+                .is_ok()
+        );
+        assert!(prog.run(ReadCtxt::new(b"[ n1234 ]")).is_err());
     }
 
     /// Asserts that programs `p` and `q` decode alike, naming them `what` on failure.
