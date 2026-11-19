@@ -212,6 +212,10 @@ pub enum ParserStateError {
     IllegalOffsetRead,
     /// During an operation that closes a slice, an unclosed Lens was found within the slice-context we would close
     UnfinishedLensAboveSlice(super::offset::Lens),
+    /// Attempt to retry or close a [`Lens::Scan`] impossible because there is no [`Lens::Scan`] on the [`ViewStack`].
+    NoScan,
+    /// During an operation that marks a scan as successful, an unclosed Lens was found within the scan-context we would close
+    UnfinishedLensAboveScan(super::offset::Lens),
 }
 
 impl std::fmt::Display for ParserStateError {
@@ -236,6 +240,13 @@ impl std::fmt::Display for ParserStateError {
                 write!(
                     f,
                     "attempted slice-close operation cannot proceed due to an unfinished lens above it: {lens:?}"
+                )
+            }
+            ParserStateError::NoScan => write!(f, "no open scan to retry or close"),
+            ParserStateError::UnfinishedLensAboveScan(lens) => {
+                write!(
+                    f,
+                    "attempted scan-close operation cannot proceed due to an unfinished lens above it: {lens:?}"
                 )
             }
         }

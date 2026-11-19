@@ -3299,6 +3299,11 @@ impl<'a> MatchTreeStep<'a> {
             TypedFormat::Variant(_, _label, f) => {
                 Self::from_gt_format(module, f, next.clone(), guard)
             }
+            TypedFormat::SkipTo(_, f) => Self::any_bytes(
+                module,
+                Rc::new(Next::Cat(MaybeTyped::Typed(f.as_ref()), next)),
+                guard,
+            ),
             TypedFormat::Union(_, branches) | TypedFormat::UnionNondet(_, branches) => {
                 let mut tree = Self::reject();
                 for f in branches {

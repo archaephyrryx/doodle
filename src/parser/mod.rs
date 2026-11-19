@@ -340,6 +340,32 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Opens a 'Scan' (parse-format-otherwise-advance loop) context (as with `Format::SkipTo`),
+    /// saving the immediate value of the offset to be recovered to upon failure.
+    pub fn open_scan(&mut self) {
+        self.offset.open_scan();
+    }
+
+    /// Recovers to the checkpoint of the most-recently-opened 'Scan' context (see [`Self::open_scan`]),
+    /// removing the old checkpoint and replacing it with a new one after advancing by one position
+    /// (one byte, or one bit in bits mode).
+    ///
+    /// Will fail the entire Scan if the attempted advance cannot succeed due to overrun.
+    pub fn retry_scan(&mut self) -> Result<(), ParseError> {
+        self.offset.retry_scan()
+    }
+
+    /// Marks a 'Scan' context as finished, upon successfully parsing the primary format being scanned for.
+    ///
+    /// Leaves the offset as-is rather than returning to a checkpoint, and discards the 'scan'
+    /// context and anything above it.
+    ///
+    /// May error if improper state-management is witnessed in the unfinished contexts opened
+    /// within the to-be-closed Scan context.
+    pub fn close_scan(&mut self) -> Result<(), ParseError> {
+        self.offset.close_scan()
+    }
+
     /// Returns the number of bytes that remain in the current, possibly slice-limited context.
     ///
     /// The return value will be `0` if and only if `self.read_byte` will return `Err(ParseError::Overrun(...))`.

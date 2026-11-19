@@ -106,7 +106,6 @@ impl<TypeRep> std::hash::Hash for TypedFormat<TypeRep> {
                 expr.hash(state);
                 inner.hash(state);
             }
-            TypedFormat::Phantom(_, inner) => inner.hash(state),
             TypedFormat::ParseFromView(_, view, inner) => {
                 view.hash(state);
                 inner.hash(state);
@@ -154,7 +153,9 @@ impl<TypeRep> std::hash::Hash for TypedFormat<TypeRep> {
             | TypedFormat::Repeat1(_, inner)
             | TypedFormat::Bits(_, inner)
             | TypedFormat::Peek(_, inner)
-            | TypedFormat::PeekNot(_, inner) => inner.hash(state),
+            | TypedFormat::PeekNot(_, inner)
+            | TypedFormat::Phantom(_, inner)
+            | TypedFormat::SkipTo(_, inner) => inner.hash(state),
             TypedFormat::Slice(_, sz, inner) => {
                 sz.hash(state);
                 inner.hash(state);
@@ -404,6 +405,7 @@ pub enum TypedFormat<TypeRep> {
     #[cfg(feature = "format_enforce")]
     Enforce(TypeRep, Box<TypedFormat<TypeRep>>),
     Permit(TypeRep, Box<TypedFormat<TypeRep>>, Box<TypedExpr<TypeRep>>),
+    SkipTo(TypeRep, Box<TypedFormat<TypeRep>>),
 }
 
 impl TypedFormat<GenType> {
@@ -436,6 +438,10 @@ impl TypedFormat<GenType> {
                 guarded_bounds(*level, open, move |open| {
                     def.lookahead_bounds_recursive(open)
                 })
+            }
+
+            TypedFormat::SkipTo(_, inner) => {
+                RecursiveBounds::any() + inner.lookahead_bounds_recursive(open)
             }
 
             TypedFormat::DecodeBytes(_, _, _)
@@ -606,6 +612,10 @@ impl TypedFormat<GenType> {
             | TypedFormat::Pos(_)
             | TypedFormat::Fail => RecursiveBounds::exact(0),
 
+            TypedFormat::SkipTo(_, inner) => {
+                RecursiveBounds::any() + inner.match_bounds_recursive(open)
+            }
+
             TypedFormat::Align(n) => RecursiveBounds::new(0, n.get() - 1),
             TypedFormat::Byte(_) => RecursiveBounds::exact(1),
             TypedFormat::Variant(_, _, f) => f.match_bounds_recursive(open),
@@ -763,6 +773,7 @@ impl TypedFormat<GenType> {
             | TypedFormat::Apply(gt, ..) => Some(Cow::Borrowed(gt)),
             #[cfg(feature = "format_enforce")]
             TypedFormat::Enforce(gt, ..) => Some(Cow::Borrowed(gt)),
+            TypedFormat::SkipTo(gt, ..) => Some(Cow::Borrowed(gt)),
         }
     }
 }
@@ -1521,6 +1532,7 @@ mod __impls {
                 #[cfg(feature = "format_enforce")]
                 TypedFormat::Enforce(_, inner) => Format::Enforce(rebox(inner)),
                 TypedFormat::Permit(_, inner, dft) => Format::Permit(rebox(inner), rebox(dft)),
+                TypedFormat::SkipTo(_, inner) => Format::SkipTo(rebox(inner)),
             }
         }
     }

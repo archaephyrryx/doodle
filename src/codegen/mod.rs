@@ -961,6 +961,10 @@ impl CodeGen {
                 let cl_inner = self.translate(inner.get_dec());
                 CaseLogic::Other(OtherLogic::Hint(hint.clone(), Box::new(cl_inner)))
             }
+            TypedDecoder::SkipTo((nt, _), inner) => {
+                let cl_inner = self.translate(inner.get_dec());
+                CaseLogic::Derived(DerivedLogic::CountedSkipTo(*nt, Box::new(cl_inner)))
+            }
             TypedDecoder::Match(_t, scrutinee, cases) => {
                 let scrutinized = embed_expr_nat(scrutinee);
                 let head = match scrutinee.get_type().unwrap().as_ref() {
@@ -3471,8 +3475,9 @@ impl GenBlock {
                     ret: Some(ret),
                 }
             } else {
+                // Callers always inspect the result as a `PResult`, even when the block cannot fail
                 Self {
-                    ret: Some(ret),
+                    ret: Some(ret.wrap_ok(Some("PResult"))),
                     ..self
                 }
             }
@@ -4470,6 +4475,7 @@ enum DerivedLogic<ExprT> {
     Permit(Box<CaseLogic<ExprT>>, Box<RustExpr>),
     #[cfg(feature = "format_enforce")]
     Enforce(Box<CaseLogic<ExprT>>),
+    CountedSkipTo(NumType, Box<CaseLogic<ExprT>>),
 }
 
 impl ToAst for DerivedLogic<GTExpr> {
@@ -4539,6 +4545,48 @@ impl ToAst for DerivedLogic<GTExpr> {
                 let if_false = GenBlock::simple_expr(RustExpr::local("None"));
                 let ctrl = model::simplifying_if((**is_present).clone(), if_true, Some(if_false));
                 GenBlock::single_expr(ctrl)
+            }
+            DerivedLogic::CountedSkipTo(count_type, inner_cl) => {
+                let inner_block = inner_cl.to_ast(ctxt);
+                let attempt = GenStmt::assign(model::SKIP_RES, inner_block.abstracted_try());
+
+                let dispatch = {
+                    let on_ok = {
+                        let teardown =
+                            GenStmt::Embed(RustStmt::Expr(model::try_close_scan(ctxt.parser())));
+                        let yield_result = GenStmt::Embed(RustStmt::Return(
+                            ReturnKind::Keyword,
+                            RustExpr::local_tuple([model::SKIP_COUNT, model::SKIP_OK_BIND])
+                                .wrap_ok(Some("PResult")),
+                        ));
+                        GenBlock::from_parts(vec![teardown, yield_result], None)
+                    };
+                    let on_err = {
+                        let reset =
+                            GenStmt::Embed(RustStmt::Expr(model::try_retry_scan(ctxt.parser())));
+                        let increment = GenStmt::Embed(model::incr_counter(model::SKIP_COUNT));
+                        GenBlock::from_parts(vec![reset, increment], None)
+                    };
+                    RustControl::Match(
+                        Box::new(RustExpr::local(model::SKIP_RES)),
+                        RustMatchBody::Irrefutable(
+                            [
+                                (model::match_case_ok_bind(model::SKIP_OK_BIND), on_ok),
+                                (model::match_case_err_bind(model::SKIP_ERR_BIND), on_err),
+                            ]
+                            .to_vec(),
+                        ),
+                    )
+                };
+                let loop_body = GenBlock::from_parts(
+                    vec![attempt, GenStmt::Expr(GenExpr::Control(Box::new(dispatch)))],
+                    None,
+                );
+                let init_counter =
+                    GenStmt::Embed(model::let_mut_counter(model::SKIP_COUNT, *count_type));
+                let setup = GenStmt::Embed(RustStmt::Expr(model::open_scan(ctxt.parser())));
+                let ctrl = GenStmt::Expr(GenExpr::Control(Box::new(RustControl::Loop(loop_body))));
+                GenBlock::from_parts(vec![init_counter, setup, ctrl], None).local_try()
             }
             DerivedLogic::Permit(inner, expr) => {
                 let rhs = inner.to_ast(ctxt).abstracted_try();
@@ -4679,6 +4727,8 @@ impl ToAst for DerivedLogic<GTExpr> {
         match self {
             // false cases - ignore ctxt and read from value-level data-stream
             DerivedLogic::DecodeBytes(..) | DerivedLogic::ParseView(..) => false,
+            // advances the parser between attempts even when `inner` reads no input
+            DerivedLogic::CountedSkipTo(..) => true,
             // inductive cases
             DerivedLogic::Maybe(_, inner)
             | DerivedLogic::Where(.., inner)
@@ -5387,8 +5437,6 @@ impl<'a> Elaborator<'a> {
                 self.codegen.name_gen.ctxt.escape();
                 TypedFormat::FormatCall(gt, *level, t_args, t_views, t_inner)
             }
-            // FIXME[codegen-gap] - SkipTo is interpreter-only for now; no TypedFormat/decoder exists for it
-            Format::SkipTo(_) => unimplemented!("codegen does not yet support Format::SkipTo"),
             Format::RecVar(_) => unreachable!(
                 "Format::RecVar is rewritten to ItemVar at batch registration; never appears in a stored Format"
             ),
@@ -5819,6 +5867,14 @@ impl<'a> Elaborator<'a> {
 
                 let gt = self.get_gt_from_index(index);
                 TypedFormat::Phantom(gt, Box::new(t_inner))
+            }
+            Format::SkipTo(inner) => {
+                let index = self.get_and_increment_index();
+                // increment to account for count-slot in return value
+                self.increment_index();
+                let t_inner = self.elaborate_format(inner, dyn_scope);
+                let gt = self.get_gt_from_index(index);
+                TypedFormat::SkipTo(gt, Box::new(t_inner))
             }
         }
     }

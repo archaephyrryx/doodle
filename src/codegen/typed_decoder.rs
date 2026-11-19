@@ -79,6 +79,7 @@ impl<TypeRep> CallIndices for TypedDecoderExt<TypeRep> {
             | TypedDecoder::LiftedOption(_, Some(d))
             | TypedDecoder::LetView(_, _, d)
             | TypedDecoder::ParseFromView(_, _, d)
+            | TypedDecoder::SkipTo(_, d)
             | TypedDecoder::Permit(_, d, _) => d.for_each_call_mut(f),
             #[cfg(feature = "format_enforce")]
             TypedDecoder::Enforce(_, d) => d.for_each_call_mut(f),
@@ -138,6 +139,12 @@ impl TypedDecoder<GenType> {
                 NumType::U(m_uint) => Some(Cow::Owned(GenType::Inline(RustType::from(*m_uint)))),
                 NumType::I(m_sint) => Some(Cow::Owned(GenType::Inline(RustType::from(*m_sint)))),
             },
+            TypedDecoder::SkipTo((n, t), _) => {
+                Some(Cow::Owned(GenType::Inline(RustType::AnonTuple(vec![
+                    RustType::from(*n),
+                    t.clone(),
+                ]))))
+            }
             TypedDecoder::Call(t, ..)
             | TypedDecoder::Variant(t, ..)
             | TypedDecoder::Parallel(t, ..)
@@ -329,6 +336,7 @@ pub(crate) enum TypedDecoder<TypeRep> {
         Box<TypedDecoderExt<TypeRep>>,
         Box<TypedExpr<TypeRep>>,
     ),
+    SkipTo((NumType, RustType), Box<TypedDecoderExt<TypeRep>>),
 }
 
 #[derive(Clone, Debug)]
@@ -343,6 +351,11 @@ impl TypedProgram<GenType> {
     }
 }
 
+/// Type alias for an item pushed onto the `compile_queue` of a `GTCompiler`.
+///
+/// If crossing from [`TypedFormat::FormatCall`] into the underlying (elaborated)
+/// format at the corresponding level, the types of any and all argument-variables
+/// are carried over to preserve type-scoping information.
 type QueueItem<'a> = (
     &'a GTFormat,
     Option<Vec<(Label, GenType)>>,
@@ -357,6 +370,8 @@ pub struct GTCompiler<'a> {
     /// keyed on the level and the (possibly truncated, possibly `Next::Empty`) continuation the
     /// call is compiled against.
     decoder_map: HashMap<(usize, Rc<Next<'a>>), usize>,
+    /// Compilation queue for module-registered format-levels we have witnessed
+    /// but not yet compiled into the corresponding decoder.
     compile_queue: Vec<QueueItem<'a>>,
     next_dependence: NextDependence<'a>,
 }
@@ -434,6 +449,10 @@ impl<'a> GTCompiler<'a> {
         Rc::new(Next::Repeat(MaybeTyped::Typed(format), next))
     }
 
+    /// Compiles an elaborated [`GTFormat`] into a [`GTDecoderExt`]
+    ///
+    /// Accepts an optional parameter `args` so that the types of dep-format arguments
+    /// can be fed into the final `TypedDecoderExt` when lifting the raw `TypedDecoder`.
     fn compile_gt_format(
         &mut self,
         format: &'a GTFormat,
@@ -494,7 +513,34 @@ impl<'a> GTCompiler<'a> {
                 let da = Box::new(self.compile_gt_format(f, None, Rc::new(Next::Empty))?);
                 Ok(TypedDecoder::ParseFromView(gt.clone(), view.clone(), da))
             }
-
+            TypedFormat::SkipTo(gt, inner) => {
+                // The inner match is followed by whatever follows the `SkipTo`, as in the interpreter
+                let da = Box::new(self.compile_gt_format(inner, None, next.clone())?);
+                let (len_t, inner_t) = if let GenType::Inline(RustType::AnonTuple(ts)) = &gt
+                    && let [l, t] = &ts[..]
+                {
+                    (l, t)
+                } else {
+                    unreachable!("TypedFormat::SkipTo: expected inline anon-tuple, found {gt:?}");
+                };
+                let nt = match len_t.try_as_num() {
+                    Some(num_t) => match num_t {
+                        NumType::U(_) => num_t,
+                        NumType::I(m_sint) => {
+                            log::debug!(
+                                "signed-integer type inferred for len-param of Format::SkipTo: {m_sint}"
+                            );
+                            num_t
+                        }
+                    },
+                    None => {
+                        unreachable!(
+                            "non-numeric type ascription for len-param of Format::SkipTo: {len_t:?}"
+                        )
+                    }
+                };
+                Ok(TypedDecoder::SkipTo((nt, inner_t.clone()), da))
+            }
             TypedFormat::Fail => Ok(TypedDecoder::Fail),
             TypedFormat::EndOfInput => Ok(TypedDecoder::EndOfInput),
             TypedFormat::SkipRemainder => Ok(TypedDecoder::SkipRemainder),

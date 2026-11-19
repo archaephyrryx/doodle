@@ -314,7 +314,7 @@ mod elaboration {
             RepeatBetween(_, _, f) => vec![boxed(f)],
             RepeatUntilLast(_, _, f) | RepeatUntilSeq(_, _, f) => vec![boxed(f)],
             Maybe(_, _, f) => vec![boxed(f)],
-            Peek(_, f) | PeekNot(_, f) => vec![boxed(f)],
+            Peek(_, f) | PeekNot(_, f) | SkipTo(_, f) => vec![boxed(f)],
             Slice(_, _, f) => vec![boxed(f)],
             Bits(_, f) => vec![boxed(f)],
             WithRelativeOffset(_, _, _, f) => vec![boxed(f)],

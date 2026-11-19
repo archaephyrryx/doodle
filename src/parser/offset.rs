@@ -409,6 +409,20 @@ impl ViewStack {
         }
         Err(StateError::Parser(ParserStateError::NoRecovery.logged()))
     }
+
+    /// Removes the topmost `Lens::Scan` and every lens above it, returning its checkpoint and the lenses above it.
+    fn unstack_scan(&mut self) -> Result<(ByteOffset, Vec<Lens>), StateError> {
+        let ix = self
+            .stack
+            .iter()
+            .rposition(|l| matches!(l, Lens::Scan { .. }))
+            .ok_or(StateError::Parser(ParserStateError::NoScan.logged()))?;
+        let above = self.stack.split_off(ix + 1);
+        let Some(Lens::Scan { checkpoint }) = self.stack.pop() else {
+            unreachable!()
+        };
+        Ok((checkpoint, above))
+    }
 }
 
 /// Control structure that manages state for individual parse-operations that change how the buffer is viewed or processed.
@@ -438,6 +452,11 @@ pub enum Lens {
         /// The original offset at the time when we began processing [`Format::PeekNot`](crate::Format::PeekNot)
         ///
         /// This is a 'recovery'-point, in that we return to it if the current parse we are attempting hits a failure at any point.
+        checkpoint: ByteOffset,
+    },
+    /// Lens generated when processing `Format::SkipTo`: the start of the current match attempt.
+    /// A recovery point, advancing forward by one position after each failed attempt.
+    Scan {
         checkpoint: ByteOffset,
     },
     /// Random-access Seek, pushed onto the `ViewStack` whenever a seek is performed.
@@ -483,7 +502,9 @@ impl Lens {
     /// recovery to propagate down the ViewStack to outer contexts that may permit recovery.
     pub(crate) fn recover(&self) -> Option<ByteOffset> {
         match self {
-            Lens::Alts { checkpoint } | Lens::PeekNot { checkpoint } => Some(*checkpoint),
+            Lens::Alts { checkpoint }
+            | Lens::PeekNot { checkpoint }
+            | Lens::Scan { checkpoint } => Some(*checkpoint),
             Lens::Peek { .. } | Lens::Slice { .. } | Lens::Seek { .. } => None,
         }
     }
@@ -497,7 +518,7 @@ impl Lens {
             Lens::Peek { checkpoint } | Lens::Seek { checkpoint, .. } => Some(*checkpoint),
             Lens::Slice { .. } => None,
             // NOTE - despite having starting-offsets, Alts and PeekNot are return-on-fail rather than return-on-success
-            Lens::Alts { .. } | Lens::PeekNot { .. } => None,
+            Lens::Alts { .. } | Lens::PeekNot { .. } | Lens::Scan { .. } => None,
         }
     }
 
@@ -755,7 +776,8 @@ impl BufferOffset {
                     ..
                 }
                 | Lens::PeekNot { .. }
-                | Lens::Peek { .. } => {
+                | Lens::Peek { .. }
+                | Lens::Scan { .. } => {
                     return Err(ParseError::InternalError(StateError::Parser(
                         ParserStateError::UnfinishedLensAboveSlice(top).logged(),
                     )));
@@ -783,25 +805,69 @@ impl BufferOffset {
         Ok(endpoint)
     }
 
-    /// Creates and pushes a new [`Lens::Peek`] to the internal `ViewStack`.
+    /// Creates and pushes a new [`Lens::Peek`] to the internal [`ViewStack`].
     pub(crate) fn open_peek(&mut self) {
         let checkpoint = self.current_offset;
         let peek = Lens::Peek { checkpoint };
         self.view_stack.push_lens(peek);
     }
 
-    /// Creates and pushes a new [`Lens::PeekNot`] to the internal `ViewStack`.
+    /// Creates and pushes a new [`Lens::PeekNot`] to the internal [`ViewStack`].
     pub(crate) fn open_peek_not(&mut self) {
         let checkpoint = self.current_offset;
         let peeknot = Lens::PeekNot { checkpoint };
         self.view_stack.push_lens(peeknot);
     }
 
-    /// Creates and pushes a new [`Lens::Alts`] to the internal `ViewStack`.
+    /// Creates and pushes a new [`Lens::Alts`] to the internal [`ViewStack`].
     pub(crate) fn open_parallel(&mut self) {
         let checkpoint = self.current_offset;
         let parallel = Lens::Alts { checkpoint };
         self.view_stack.push_lens(parallel);
+    }
+
+    /// Creates and pushes a new [`Lens::Scan`] to the internal [`ViewStack`]
+    pub(crate) fn open_scan(&mut self) {
+        let checkpoint = self.current_offset;
+        let scan = Lens::Scan { checkpoint };
+        self.view_stack.push_lens(scan);
+    }
+
+    /// After each failed parse of `F` in `SkipTo(F)`, drop any lenses left open
+    /// while processing `F` itself, and return to the last checkpoint,
+    /// advancing it forward by one position (one byte, or one bit in bits mode) to allow for future parses to rebound
+    /// to the correct position.
+    ///
+    /// If we have reached the end of the buffer and cannot advance any further,
+    /// the scan lens is not put back, and the overrun error propagates as the failure
+    /// of the entire SkipTo
+    pub(crate) fn retry_scan(&mut self) -> PResult<()> {
+        let (checkpoint, _abandoned) = self.view_stack.unstack_scan()?;
+        self.current_offset = checkpoint;
+        self.try_increment(1)?;
+        self.open_scan();
+        Ok(())
+    }
+
+    /// After a successful parse of `F` for `SkipTo(f)`, drop the Scan lens while
+    /// preserving the current offset.
+    pub(crate) fn close_scan(&mut self) -> PResult<()> {
+        let (_, above) = self.view_stack.unstack_scan()?;
+        for lens in above {
+            match lens {
+                Lens::Alts { .. }
+                | Lens::Seek {
+                    is_transparent: true,
+                    ..
+                } => continue,
+                other => {
+                    return Err(ParseError::InternalError(StateError::Parser(
+                        ParserStateError::UnfinishedLensAboveScan(other).logged(),
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Gracefully closes a speculative parse (generally, [`Lens::Peek`]).

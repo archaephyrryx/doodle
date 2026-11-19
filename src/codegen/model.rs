@@ -189,6 +189,11 @@ pub const WHERE_CHECK: &str = "is_valid";
 
 pub const PERMIT_BIND: &str = "res";
 pub const PERMIT_ERR: &str = "err";
+
+pub const SKIP_COUNT: &str = "skipped";
+pub const SKIP_RES: &str = "res";
+pub const SKIP_OK_BIND: &str = "inner";
+pub const SKIP_ERR_BIND: &str = "_e";
 // !SECTION
 
 // !SECTION
@@ -401,6 +406,39 @@ pub fn open_peek_not(parser: RustExpr) -> RustExpr {
 /// Model RustExpr for post-parse teardown of `Format::PeekNot` in the Parser model (if the anti-pattern is not seen).
 pub fn try_close_peek_not(parser: RustExpr) -> RustExpr {
     try_(call!(parser, close_peek_not_context))
+}
+
+/// Model RustExpr for setup of `Format::SkipTo` parse-context in the Parser model
+pub fn open_scan(parser: RustExpr) -> RustExpr {
+    call!(parser, open_scan)
+}
+
+/// Model RustExpr for advancing `Format::SkipTo` past a failed attempt (try-call)
+pub fn try_retry_scan(parser: RustExpr) -> RustExpr {
+    try_(call!(parser, retry_scan))
+}
+
+/// Model RustExpr for teardown of `Format::SkipTo` after a successful attempt (try-call)
+pub fn try_close_scan(parser: RustExpr) -> RustExpr {
+    try_(call!(parser, close_scan))
+}
+
+/// RustStmt for `<ident> = <ident> + 1;`
+pub fn incr_counter(ident: &'static str) -> RustStmt {
+    RustStmt::Reassign(
+        lbl(ident),
+        RustExpr::add(RustExpr::local(ident), RustExpr::num_lit(1usize)),
+    )
+}
+
+/// RustStmt for `let mut <ident> : <ty> = 0;`
+pub fn let_mut_counter(ident: &'static str, ty: NumType) -> RustStmt {
+    RustStmt::Let(
+        Mut::Mutable,
+        lbl(ident),
+        Some(RustType::from(ty)),
+        RustExpr::num_lit(0usize),
+    )
 }
 
 /// Model RustExpr for handling `Format::WithRelativeOffset` in the Parser model (seeking to absolute-offset `target`).
