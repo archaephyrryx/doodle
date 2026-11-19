@@ -1694,10 +1694,14 @@ pub fn slice(len: Expr, inner: Format) -> Format {
     Format::Slice(Box::new(len), Box::new(inner))
 }
 
-/// Helper that returns a format whose parse succeeds, yielding a unit-value, if and only if
-/// some parse within `formats` succeeded.
+/// Helper for matching one of several formats, where only overall success/failure matters, and the return-value
+/// (and identity) of a successful parse need not be preserved.
 ///
-/// The individual formats in `formats` are allowed to overlap.
+/// Attempts to parse each of the formats in `formats` in turn, stopping at the first one that
+/// succeeds and returning a unit-value. The bytes processed by the successful format are left consumed.
+///
+/// The individual formats in `formats` are composed into `UnionNondet`, so they may describe overlapping
+/// parses.
 pub fn any_of(formats: impl IntoIterator<Item = Format>) -> Format {
     Format::UnionNondet(formats.into_iter().map(void).collect())
 }

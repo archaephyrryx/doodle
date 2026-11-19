@@ -4340,7 +4340,8 @@ mod test {
         let stmt = RustStmt::LetPattern(pair_pattern(), value, unreachable_stmt());
         let rendered = format!("{}", stmt.to_fragment());
         assert!(
-            rendered.starts_with("let (a, b) = ({") && rendered.ends_with("}) else { unreachable!(); };"),
+            rendered.starts_with("let (a, b) = ({")
+                && rendered.ends_with("}) else { unreachable!(); };"),
             "block-valued let-else scrutinee not parenthesized: {rendered}"
         );
     }
@@ -4917,7 +4918,9 @@ pub mod var_container {
                 RustStmt::Let(.., value) => value.contains_var_ref(var),
                 RustStmt::LetPattern(_, value, else_stmt) => {
                     value.contains_var_ref(var)
-                        || else_stmt.as_ref().is_some_and(|stmt| stmt.contains_var_ref(var))
+                        || else_stmt
+                            .as_ref()
+                            .is_some_and(|stmt| stmt.contains_var_ref(var))
                 }
                 RustStmt::Reassign(binding, value) => {
                     binding == var.as_ref() || value.contains_var_ref(var)
