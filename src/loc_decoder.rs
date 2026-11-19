@@ -935,11 +935,20 @@ impl Decoder {
         // as in `loc_parse_parallel`: the recursion limit only rules out an offset outside any
         // recursive decoder
         let limit_is_fatal = recursion_depth() > 0;
+        let start = input.offset;
         let mut input = input;
         loop {
             match d.parse_with_loc(program, scope, input) {
-                // the value spans only the match, not the bytes skipped before it
-                Ok(p) => return Ok(p),
+                // the count spans the skipped bytes, the inner value spans the match, and the
+                // tuple spans both
+                Ok(p) => {
+                    let skipped = input.offset - start;
+                    return Ok(p.map(|(v, rest)| {
+                        let count = ParsedValue::new_flat(Value::from_pos(skipped), start, skipped);
+                        let total = rest.offset - start;
+                        (ParsedValue::new_tuple(vec![count, v], start, total), rest)
+                    }));
+                }
                 Err(err) if limit_is_fatal && err.is_recursion_limit() => return Err(err),
                 Err(_) => {}
             }

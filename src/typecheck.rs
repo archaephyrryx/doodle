@@ -3792,9 +3792,18 @@ impl TypeChecker {
                 Ok(newvar)
             }
             Format::SkipTo(inner) => {
+                // (count, value), with `count` typed as `Format::Pos` is
                 let newvar = self.get_new_uvar();
+                let count_var = self.get_new_uvar();
+                self.unify_var_baseset(
+                    count_var,
+                    BaseSet::U(UintSet::any_default(BitWidth::Bits64)),
+                )?;
                 let inner_t = self.infer_utype_format(inner, ctxt)?;
-                self.unify_var_utype(newvar, inner_t)?;
+                self.unify_var_utype(
+                    newvar,
+                    Rc::new(UType::Tuple(vec![Rc::new(UType::Var(count_var)), inner_t])),
+                )?;
                 Ok(newvar)
             }
             Format::PeekNot(peek) => {

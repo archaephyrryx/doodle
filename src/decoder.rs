@@ -1061,10 +1061,16 @@ impl Decoder {
         // As in `parse_parallel`: inside a recursive decoder, hitting the recursion limit
         // rejects the input; outside one it only rules out the current offset.
         let limit_is_fatal = recursion_depth() > 0;
+        let start = input.offset;
         let mut input = input;
         loop {
             match d.parse(program, scope, input) {
-                Ok(p) => return Ok(p),
+                Ok(p) => {
+                    let skipped = input.offset - start;
+                    return Ok(
+                        p.map(|(v, rest)| (Value::Tuple(vec![Value::from_pos(skipped), v]), rest))
+                    );
+                }
                 Err(err) if limit_is_fatal && err.is_recursion_limit() => return Err(err),
                 Err(_) => {}
             }

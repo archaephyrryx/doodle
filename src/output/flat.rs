@@ -329,7 +329,12 @@ impl<'module, W: io::Write> Context<'module, W> {
             },
             Format::DecodeBytes(_bytes, format) => self.write_flat(value, format),
             Format::ParseFromView(_view, format) => self.write_flat(value, format),
-            Format::Peek(format) | Format::SkipTo(format) => self.write_flat(value, format),
+            Format::Peek(format) => self.write_flat(value, format),
+            // (count, value): only the value has flat structure
+            Format::SkipTo(format) => match value {
+                Value::Tuple(values) if values.len() == 2 => self.write_flat(&values[1], format),
+                _ => panic!("expected (count, value) tuple, found {value:?}"),
+            },
             Format::PeekNot(format) => self.write_flat(value, format),
             Format::Slice(_, format) => self.write_flat(value, format),
             Format::Bits(format) => self.write_flat(value, format),

@@ -143,8 +143,13 @@ pub enum Format {
     SkipRemainder,
     /// Skip bytes up to the first offset at which the format matches, then parse it there
     ///
-    /// Equivalent to `S := UnionNondet[f, ANY_BYTE ~ S]`, but decoded by iteration rather than
-    /// recursion, so neither the number of bytes skipped nor the lookahead of `f` is bounded.
+    /// Yields `(count, value)`: the number of bytes skipped before the match, and the value of
+    /// the format parsed there. `count` is typed as [`Format::Pos`] is (an unsigned integer
+    /// defaulting to 64 bits).
+    ///
+    /// Equivalent to `S := UnionNondet[f, ANY_BYTE ~ S]` (with `count` incremented per skipped
+    /// byte), but decoded by iteration rather than recursion, so neither the number of bytes
+    /// skipped nor the lookahead of `f` is bounded.
     SkipTo(Box<Format>),
     /// Given an expression corresponding to a byte-sequence, decode it again using the provided Format. This can be used to reparse the initial decode of formats that output `Vec<u8>` or similar
     DecodeBytes(Box<Expr>, Box<Format>),

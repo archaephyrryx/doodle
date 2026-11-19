@@ -1596,7 +1596,11 @@ impl FormatModule {
             },
             Format::Peek(a) => self.infer_format_type(scope, a),
             Format::PeekNot(_a) => Ok(ValueType::Tuple(vec![])),
-            Format::SkipTo(a) => self.infer_format_type(scope, a),
+            // (count, value), with `count` typed as `Format::Pos` is
+            Format::SkipTo(a) => Ok(ValueType::Tuple(vec![
+                ValueType::NumericHole,
+                self.infer_format_type(scope, a)?,
+            ])),
             Format::Slice(len, a) => match len.infer_type(scope)? {
                 t if t.is_unsigned_or_auto() => self.infer_format_type(scope, a),
                 other => Err(anyhow!(
@@ -4499,13 +4503,14 @@ mod test {
     /// `(input, ok)` pair decodes (or fails to) as expected. Building it through
     /// `MatchTree::build` (via `compile_program`) puts the `ItemVar`s inside `top` on the
     /// `CycleGuard`'s path, which a single top-level `Tuple` never would.
-    /// `SkipTo(f)` decodes as `f` does at the first offset where `f` matches, or fails if there
-    /// is none. `f` here needs unbounded lookahead (`Repeat1` of digits), which a
+    /// `SkipTo(f)` decodes as `f` does at the first offset where `f` matches, paired with that
+    /// offset (the number of bytes skipped), or fails if there is none. `f` here needs unbounded lookahead (`Repeat1` of digits), which a
     /// `PeekNot`-guarded skip cannot compile, and one input skips more bytes than the default
     /// recursion limit, which a recursive `UnionNondet[f, ANY_BYTE ~ S]` cannot get past.
     #[test]
     fn skip_to_decodes_as_format_at_first_match() {
         use crate::helper::{byte_in, is_bytes, monad_seq, repeat1};
+        use crate::loc_decoder as loc;
 
         let f = || monad_seq(is_bytes(b"%PDF-"), repeat1(byte_in(b'0'..=b'9')));
         let mut module = FormatModule::new();
@@ -4542,11 +4547,35 @@ mod test {
                     let (v_direct, rest_direct) = prog_direct
                         .run(ReadCtxt::new(&input[*start..]))
                         .expect("f must match at the expected offset");
-                    assert_eq!(v_skip, v_direct, "value decoding {what:?}");
+                    let Value::Tuple(parts) = v_skip else {
+                        panic!("SkipTo must yield a (count, value) tuple, found {v_skip:?}");
+                    };
+                    let (count, v_match) = decoder::extract_pair(parts);
+                    assert_eq!(
+                        count.try_as_usize().unwrap(),
+                        *start,
+                        "count decoding {what:?}"
+                    );
+                    assert_eq!(v_match, v_direct, "value decoding {what:?}");
                     assert_eq!(rest_skip.offset, rest_direct.offset + start, "{what:?}");
-                    let (_, rest_loc) =
+                    let (pv_loc, rest_loc) =
                         skipped_loc.unwrap_or_else(|e| panic!("{what:?} with locations: {e:?}"));
                     assert_eq!(rest_loc.offset, rest_skip.offset, "{what:?} with locations");
+                    // the pair spans everything consumed, and its count spans the skipped bytes
+                    let loc::ParsedValue::Tuple(pair) = &pv_loc else {
+                        panic!("SkipTo with locations must yield a tuple, found {pv_loc:?}");
+                    };
+                    let in_buffer = |offset, length| loc::ParseLoc::InBuffer { offset, length };
+                    assert_eq!(
+                        pair.loc,
+                        in_buffer(0, rest_skip.offset),
+                        "{what:?} pair span"
+                    );
+                    assert_eq!(
+                        pair.inner[0].get_loc(),
+                        in_buffer(0, *start),
+                        "{what:?} count span"
+                    );
                 }
             }
         }

@@ -141,7 +141,9 @@ impl<'module> TreePrinter<'module> {
             Format::AccumUntil(..) => false,
             Format::ForEach(..) => false,
             Format::Maybe(..) => false,
-            Format::Peek(format) | Format::SkipTo(format) => self.is_implied_value_format(format),
+            Format::Peek(format) => self.is_implied_value_format(format),
+            // the skipped-byte count is not implied by the format
+            Format::SkipTo(_) => false,
             Format::PeekNot(_) => true,
             Format::Bits(format) => self.is_implied_value_format(format),
             Format::WithRelativeOffset(.., format) => self.is_implied_value_format(format),
@@ -563,9 +565,15 @@ impl<'module> TreePrinter<'module> {
                 },
                 _ => panic!("expected Option, found {value:?}"),
             },
-            Format::Peek(format) | Format::SkipTo(format) => {
-                self.compile_decoded_parsedvalue(value, format)
-            }
+            Format::Peek(format) => self.compile_decoded_parsedvalue(value, format),
+            // (count, value), shown as a tuple whose count is displayed as a `Pos` would be
+            Format::SkipTo(format) => match value {
+                ParsedValue::Tuple(parsed_tuple) => {
+                    let formats = [Format::Pos, (**format).clone()];
+                    self.compile_parsed_tuple(parsed_tuple, Some(&formats))
+                }
+                _ => panic!("expected (count, value) tuple, found {value:?}"),
+            },
             Format::PeekNot(_format) => self.compile_parsed_value(value),
             Format::Slice(_, format) => self.compile_decoded_parsedvalue(value, format),
             Format::Bits(format) => self.compile_decoded_parsedvalue(value, format),
@@ -812,9 +820,15 @@ impl<'module> TreePrinter<'module> {
                 },
                 _ => panic!("expected Option, found {value}"),
             },
-            Format::Peek(format) | Format::SkipTo(format) => {
-                self.compile_decoded_value(value, format)
-            }
+            Format::Peek(format) => self.compile_decoded_value(value, format),
+            // (count, value), shown as a tuple whose count is displayed as a `Pos` would be
+            Format::SkipTo(format) => match value {
+                Value::Tuple(values) => {
+                    let formats = [Format::Pos, (**format).clone()];
+                    self.compile_tuple(values, Some(&formats))
+                }
+                _ => panic!("expected (count, value) tuple, found {value}"),
+            },
             Format::PeekNot(_format) => self.compile_value(value),
             Format::Slice(_, format) => self.compile_decoded_value(value, format),
             Format::Bits(format) => self.compile_decoded_value(value, format),
