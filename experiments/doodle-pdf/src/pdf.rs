@@ -68,7 +68,7 @@ fn decimal_value(digits: Expr) -> Expr {
 }
 
 /// Daedalus `NatN len`: exactly `len` decimal digits, read as a u64
-fn nat_n(len: u32) -> Format {
+fn read_nat(len: u32) -> Format {
     map(
         repeat_count(Expr::U32(len), Format::Byte(DIGIT)),
         lambda("ds", decimal_value(var("ds"))),
@@ -85,8 +85,14 @@ fn octal_val() -> Format {
 fn octal_num_u8() -> Format {
     let raw = union([
         repeat_count(Expr::U8(3), octal_val()),
-        excluding(repeat_count(Expr::U8(3), byte_in(b'0'..=b'7')), repeat_count(Expr::U8(2), octal_val())),
-        excluding(repeat_count(Expr::U8(2), byte_in(b'0'..=b'7')), seq([octal_val()])),
+        excluding(
+            repeat_count(Expr::U8(3), byte_in(b'0'..=b'7')),
+            repeat_count(Expr::U8(2), octal_val()),
+        ),
+        excluding(
+            repeat_count(Expr::U8(2), byte_in(b'0'..=b'7')),
+            seq([octal_val()]),
+        ),
     ]);
 
     map(
@@ -148,25 +154,30 @@ fn interpret(assocs: impl IntoIterator<Item = (Format, Expr)>) -> Format {
 }
 
 /// Skips bytes up to the first offset at which `f` matches, then parses `f` there.
+///
+/// If `f` can be parsed without skipping any bytes, equivalent to parsing `f`.
+///
+/// Projects the value of `f` out of `Format::SkipTo`'s `(count, value)`.
 fn skip_to(f: Format) -> Format {
-    Format::SkipTo(Box::new(f))
+    map(
+        Format::SkipTo(Box::new(f)),
+        lambda("skipped", tuple_proj(var("skipped"), 1)),
+    )
 }
 
-/// Daedalus `CountTo P 0`: consumes bytes up to the first offset at which `p` matches,
-/// leaving `p` unconsumed, and returns the number of bytes consumed.
+/// Daedalus `CountTo P 0`: like [`skip_to`], but the returned value is the number of
+/// leading bytes that were skipped, and the value of parsing `p` is discarded.
 ///
-/// `p` must have bounded lookahead (`PeekNot` rejects unbounded lookahead). Daedalus
-/// `CountTo (KW s)` only needs `Match s` here, since the trailing `Many AnyWS` of `KW`
-/// always succeeds.
+/// `p` itself is consumed, along with however many leading bytes were skipped.
 ///
-/// A recursive `CountTo` (one call per byte) would hit the recursion limit, so this
-/// repeats a guarded byte instead and measures the result. The skipped bytes are
-/// materialized only to be counted.
+/// If `p` can be parsed immediately, this parse will yield `0`.
+///
+/// Projects the count out of `Format::SkipTo`'s `(count, value)`, so it is typed as
+/// `Format::Pos` is, and `p` may need unbounded lookahead.
 fn count_to(p: Format) -> Format {
-    chain(
-        repeat(monad_seq(Format::PeekNot(Box::new(p)), ANY_BYTE)),
-        "_skipped",
-        compute(seq_length(var("_skipped"))),
+    map(
+        Format::SkipTo(Box::new(p)),
+        lambda("skipped", tuple_proj(var("skipped"), 0)),
     )
 }
 
@@ -588,11 +599,12 @@ fn between(open: &[u8], close: &[u8], f: Format, any_ws: FormatRef) -> Format {
 }
 
 /// Daedalus `Stream (val : Value)`. `val` is a whole `Value` (as passed by `pdf.top_decl`), and
-/// `header = val is dict` narrows it. Like the Daedalus definition, this leaves the `endstream`
-/// keyword unconsumed.
+/// `header = val is dict` narrows it. As in the Daedalus definition, `CountTo` consumes the
+/// `endstream` keyword, and `body` is taken from the view saved before it.
 fn stream(
     module: &mut FormatModule,
     simple_eol: FormatRef,
+    any_ws: FormatRef,
     value_type: ValueType,
 ) -> DepFormat<1, 0> {
     module.register_format_args(
@@ -624,7 +636,7 @@ fn stream(
                 let_view(
                     "start",
                     chain(
-                        count_to(match_str(b"endstream")),
+                        count_to(kw(b"endstream", any_ws)),
                         "len",
                         with_view(vvar("start"), capture_bytes(var("len"))),
                     ),
@@ -648,10 +660,10 @@ fn cross_ref_section(
     let entry = module.define_format(
         "pdf.xref.entry",
         record_auto([
-            ("offset", nat_n(10)),
-            ("__sp0", is_byte(b' ')),
-            ("gen", nat_n(5)),
-            ("__sp1", is_byte(b' ')),
+            ("offset", read_nat(10)),
+            ("__sp0", byte_in(SIMPLE_WS)),
+            ("gen", read_nat(5)),
+            ("__sp1", byte_in(SIMPLE_WS)),
             (
                 "in_use",
                 interpret([
@@ -661,10 +673,10 @@ fn cross_ref_section(
             ),
             (
                 "__eol",
-                union([
-                    void(is_bytes(b" \r")),
-                    void(is_bytes(b" \n")),
-                    void(is_bytes(b"\r\n")),
+                // { $simpleWS; $cr <| $lf } <| { $cr; $lf }
+                any_of([
+                    tuple([byte_in(SIMPLE_WS), byte_in([ASCII_CR, ASCII_LF])]),
+                    byte_seq(&[ASCII_CR, ASCII_LF]),
                 ]),
             ),
         ]),
@@ -687,7 +699,14 @@ fn cross_ref_section(
 
     module.define_format(
         "pdf.xref",
-        monad_seq(kw(b"xref", any_ws), repeat1(subsection.call())),
+        let_view(
+            "xref_view",
+            record_auto([
+                // omitted: offset = Offset
+                ("__marker", kw(b"xref", any_ws)),
+                ("entries", repeat1(subsection.call())),
+            ]),
+        ),
     )
 }
 
@@ -705,16 +724,12 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
 
     let [pdf_value, pdf_dict] = pdf_value(module, any_ws, eol, natural, number, v_name);
     let pdf_value_type = module.get_format_type(pdf_value.get_level()).clone();
-    let stream = stream(module, simple_eol, pdf_value_type.clone());
+    let stream = stream(module, simple_eol, any_ws, pdf_value_type.clone());
     let top_decl_def = module.define_format_args(
         "pdf.top_decl",
         vec![(Label::Borrowed("val"), pdf_value_type)],
         alts([
-            ("stream", chain(
-                stream.invoke_args([var("val")]),
-                "s",
-                monad_seq(kw(b"endstream", any_ws), compute(var("s"))),
-            )),
+            ("stream", stream.invoke_args([var("val")])),
             ("value", compute(var("val"))),
         ]),
     );
@@ -759,6 +774,7 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
             ),
             ("__ws", repeat(any_ws.call())),
             ("chunks", repeat(pdf_chunk.call())),
+            // adding `Many AnyWS` here breaks matchtree because pdf_chunk can end in whitespace
         ])),
     )
 }
@@ -783,7 +799,7 @@ mod tests {
     }
 
     /// `pdf.stream` accepts a dict followed by `stream`, an EOL, and a body running up to
-    /// `endstream` (consumed by the test, not by `pdf.stream`), and rejects a non-dict value.
+    /// `endstream`, and rejects a non-dict value.
     #[test]
     fn stream_after_dict() {
         let mut module = FormatModule::new();
@@ -796,17 +812,13 @@ mod tests {
         let number = number(&mut module, natural);
         let [value, _dict] = pdf_value(&mut module, any_ws, eol, natural, number, v_name);
         let value_type = module.get_format_type(value.get_level()).clone();
-        let stream = stream(&mut module, simple_eol, value_type);
+        let stream = stream(&mut module, simple_eol, any_ws, value_type);
         let top = module.define_format(
             "test.stream",
             only(chain(
                 value.call_args(vec![Expr::U64(32)]),
                 "val",
-                chain(
-                    stream.invoke_args([var("val")]),
-                    "s",
-                    monad_seq(match_str(b"endstream"), compute(var("s"))),
-                ),
+                stream.invoke_args([var("val")]),
             )),
         );
         let prog = Compiler::compile_program(&module, &top.call()).expect("stream must compile");
@@ -843,8 +855,14 @@ mod tests {
         let prog = Compiler::compile_program(&module, &top.call()).expect("xref must compile");
         let cases: &[(&[u8], bool)] = &[
             (b"xref\n0 1\n0000000000 65535 f\r\n", true),
-            (b"xref\n0 2\n0000000000 65535 f \n0000000017 00000 n \r", true),
-            (b"xref\n0 1\n0000000000 65535 f\r\n3 1\n0000000123 00002 n\r\n", true),
+            (
+                b"xref\n0 2\n0000000000 65535 f \n0000000017 00000 n \r",
+                true,
+            ),
+            (
+                b"xref\n0 1\n0000000000 65535 f\r\n3 1\n0000000123 00002 n\r\n",
+                true,
+            ),
             (b"xref\n0 0\n", true),
             (b"xref\n", false),
             (b"xref\n0 2\n0000000000 65535 f\r\n", false),
