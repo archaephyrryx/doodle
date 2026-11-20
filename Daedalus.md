@@ -210,6 +210,8 @@ The concept of a `Stream` is effectively one-to-one with `View`s within the `For
 * `SetStream` has no direct equivalent, but `WithStream` is analogous to `WithView` or `ParseFromView`
 * `Chunk n P` is equivalent to `Slice(n, P)`
 * `Lookahead P` is equivalent to `Peek(P)`
+* `WithStream s P`, where `s` is a computed byte-sequence rather than a sub-stream of the input (e.g. the output of a decompression filter), is `DecodeBytes(s, P)`
+* There is no backward search: `SkipTo` finds the *first* match going forward. Finding a structure near the end of the input (e.g. PDF's last `startxref`) can be emulated by taking the input length (`Peek(SkipRemainder; Pos)`), then running `SkipTo` from a fixed-size window before the end via `WithRelativeOffset`
 
 ### Example
 
@@ -268,3 +270,23 @@ repetitions as well as for more explicit alternations over N branches. Nondeterm
 
 The last two usages are more of a band-aid against unwanted parse-failure, and are similar in usage
 to `Format::Permit`. The PDF prototype (`experiments/doodle-pdf`) also uses them.
+
+### On-demand resolution
+
+DaeDaLus PDF specifications resolve indirect references (`n g R`) on demand, through the host primitive
+`ResolveRef` (`formats/pdf/new/pdf-cos-spec/PdfDecl.ddl`): any lookup into a dictionary may jump
+to an arbitrary object elsewhere in the file, and references may form cycles. `doodle` can only
+resolve eagerly: parse the cross-reference table first, pass it as an argument, and parse the target
+object at its offset with `WithRelativeOffset`. Recursion depth must be bounded explicitly (e.g. a `lim`
+argument), and cycles cannot be handled. A reference whose resolution depends on the structure being
+parsed (e.g. an xref stream whose own `/Length` is an indirect reference into that same xref stream)
+cannot be resolved at all.
+
+## External primitives
+
+DaeDaLus allows bodiless declarations such as `def Decrypt (body : stream) : stream`, whose
+implementation is supplied by the host. The PDF specifications use them for `ResolveRef`, `Decrypt`,
+`FlateDecode` and `LZWDecode`. `doodle` has no counterpart: every operation must be expressed as a
+`Format` or `Expr`. `FlateDecode` is within reach because deflate/zlib are written as `doodle` formats
+(`doodle-formats/src/format/{deflate,zlib}.rs`) and can be applied with `DecodeBytes`. The others would
+have to be written out in the grammar (LZW, in principle), or are out of reach in practice (decryption).
