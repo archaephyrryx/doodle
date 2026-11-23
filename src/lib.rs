@@ -5296,6 +5296,70 @@ mod test {
         assert!(prog.run(ReadCtxt::new(b"SaZ")).is_ok());
     }
 
+    /// A numeric cast whose operand's type is not yet known when the cast is inferred (a lambda
+    /// or pattern variable) leaves the operand's type to the rest of inference, rather than
+    /// giving it the cast's (`u8` here, not `u16`); and an operand nothing else determines (an
+    /// `Auto` constant) still takes the cast's (`TypeChecker::apply_cast_defaults`).
+    #[test]
+    fn cast_operand_type_comes_from_its_binding() {
+        use crate::helper::{
+            bind, chain, compute, expr_match, lambda_tuple, left_fold, numeric, repeat, var,
+        };
+        use crate::numeric::core::{CastOp, Expr as NExpr};
+        use crate::numeric::{MachineRep, TypedConst};
+
+        let into_u16 = |name: &'static str| {
+            numeric(NExpr::Cast(
+                CastOp::arith(MachineRep::U16),
+                Box::new(NExpr::NumVar(Label::Borrowed(name))),
+            ))
+        };
+        let u16_type = ValueType::Base(BaseType::U16);
+        let bodies: [(&str, Format, ValueType); 3] = [
+            (
+                "test.lambda_bound",
+                chain(
+                    repeat(Format::ANY_BYTE),
+                    "bs",
+                    compute(left_fold(
+                        lambda_tuple(["v", "b"], into_u16("b")),
+                        Expr::U16(0),
+                        u16_type.clone(),
+                        var("bs"),
+                    )),
+                ),
+                u16_type.clone(),
+            ),
+            (
+                "test.pattern_bound",
+                chain(
+                    Format::ANY_BYTE,
+                    "x",
+                    compute(expr_match(var("x"), [(bind("b"), into_u16("b"))])),
+                ),
+                u16_type.clone(),
+            ),
+            (
+                "test.auto_const",
+                compute(numeric(NExpr::Cast(
+                    CastOp::arith(MachineRep::U8),
+                    Box::new(NExpr::Const(TypedConst::new_auto(7))),
+                ))),
+                ValueType::Base(BaseType::U8),
+            ),
+        ];
+        for (name, body, expected) in bodies {
+            let mut module = FormatModule::new();
+            let [f] = module.define_batch_with_args(
+                [(name, vec![])],
+                [Box::new(move |_: &[FormatRef; 1]| body.clone())],
+            );
+            assert_eq!(module.get_format_type(f.get_level()), &expected, "{name}");
+            typecheck::TypeChecker::infer_module(&module, &f.call())
+                .unwrap_or_else(|e| panic!("{name}: whole-module inference fails: {e:?}"));
+        }
+    }
+
     /// A tuple or record type annotation that contains a union is unified as the whole type,
     /// so it is solved even when nothing else constrains the value: here the fold's element
     /// type is known only through the accumulator's annotation, since the sequence is empty.

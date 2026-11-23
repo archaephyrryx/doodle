@@ -740,6 +740,15 @@ pub struct TypeChecker {
     /// The `Expr`-level inference that meets most annotations has no access to the module, so
     /// these are resolved by [`Self::resolve_pending_recs`], from the entry points that do.
     pending_recs: Vec<(UVar, usize)>,
+    /// Operands of numeric casts whose representation was not yet known when the cast was
+    /// inferred, with the cast's output representation, as `(operand, rep)`.
+    ///
+    /// A cast says nothing about its operand's representation, but an operand that nothing else
+    /// determines (such as an `Auto` constant) needs one, and takes the cast's. That can only be
+    /// decided once inference is otherwise done, by [`Self::apply_cast_defaults`]: pinning the
+    /// operand when the cast is inferred would also pin a variable whose type is merely not yet
+    /// known (such as a lambda parameter), and conflict with the type it has.
+    pending_cast_defaults: Vec<(UVar, NumRep)>,
     // /// Scaffolding for compartmentalized external type inference in the arithmetic extension grammar
     // sub_extension: EmbeddedResolver,
 }
@@ -766,6 +775,7 @@ impl TypeChecker {
             void_table: OnceCell::new(),
             nominal_cycles_only: true,
             pending_recs: Vec::new(),
+            pending_cast_defaults: Vec::new(),
             // sub_extension: EmbeddedResolver::new(),
         }
     }
@@ -3044,7 +3054,9 @@ impl TypeChecker {
                 let m_rep = cast_op.out_rep;
                 let cast_rep = NumRep::Concrete(m_rep);
                 if inner_rep.is_auto() {
-                    self.unify_var_rep(inner_var, cast_rep)?;
+                    // not yet known; see `pending_cast_defaults`
+                    self.check_var_is_numeric(inner_var)?;
+                    self.pending_cast_defaults.push((inner_var, cast_rep));
                 }
                 self.unify_var_rep(this_var, cast_rep)?;
                 (this_var, cast_rep)
@@ -4034,6 +4046,17 @@ impl TypeChecker {
         Ok(())
     }
 
+    /// Gives each [`Self::pending_cast_defaults`] operand that is still without a
+    /// representation the representation of its cast. Allocates no `UVar`s.
+    fn apply_cast_defaults(&mut self) -> TCResult<()> {
+        for (uv, rep) in std::mem::take(&mut self.pending_cast_defaults) {
+            if self.get_var_numrep(uv)?.is_auto() {
+                self.unify_var_rep(uv, rep)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn infer_module(module: &FormatModule, top_format: &Format) -> TCResult<Self> {
         let mut this = Self::new();
         let scope = UScope::Empty;
@@ -4067,6 +4090,7 @@ impl TypeChecker {
             seen_levels = all_seen_levels;
         }
         this.resolve_pending_recs(module)?;
+        this.apply_cast_defaults()?;
         this.check_unique_solutions()?;
         Ok(this)
     }
@@ -4097,6 +4121,7 @@ impl TypeChecker {
             this.infer_unreached_level(level, module)?;
         }
         this.resolve_pending_recs(module)?;
+        this.apply_cast_defaults()?;
 
         let mut level_of: HashMap<UVar, Vec<usize>> = HashMap::new();
         for (&level, &uv) in this.level_vars.iter() {
@@ -4700,6 +4725,7 @@ pub fn typecheck(module: &FormatModule, f: &Format) -> TCResult<Option<ValueType
     let ctxt = Ctxt::new(module, &scope);
     let _ut = tc.infer_utype_format(f, ctxt)?;
     tc.resolve_pending_recs(module)?;
+    tc.apply_cast_defaults()?;
     // FIXME - there should be a lot more that goes on under the covers here, especially since we want to detect errors
     let ret = Ok(tc.reify(_ut).map(|aug_t| aug_t.into()));
     tc.check_uvar_sanity();
