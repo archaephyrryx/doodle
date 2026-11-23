@@ -5245,6 +5245,42 @@ mod test {
         down
     }
 
+    /// A tuple or record type annotation that contains a union is unified as the whole type,
+    /// so it is solved even when nothing else constrains the value: here the fold's element
+    /// type is known only through the accumulator's annotation, since the sequence is empty.
+    #[test]
+    fn tuple_record_annotation_with_union_is_solved() {
+        use crate::helper::{compute, expr_none, expr_some, lambda_tuple, left_fold, var};
+        let union = ValueType::Union(std::collections::BTreeMap::from([(
+            Label::Borrowed("A"),
+            ValueType::U8,
+        )]));
+        let annotations = [
+            ValueType::Tuple(vec![ValueType::U8, union.clone()]),
+            ValueType::Record(vec![
+                (Label::Borrowed("a"), ValueType::U8),
+                (Label::Borrowed("b"), union),
+            ]),
+        ];
+        for vt in annotations {
+            let acc_type = ValueType::Option(Box::new(vt));
+            let expected = acc_type.clone();
+            let mut module = FormatModule::new();
+            let [annotated] = module.define_batch_with_args(
+                [("test.annotated", vec![])],
+                [Box::new(move |_: &[FormatRef; 1]| {
+                    compute(left_fold(
+                        lambda_tuple(["acc", "x"], expr_some(var("x"))),
+                        expr_none(),
+                        acc_type,
+                        Expr::Seq(vec![]),
+                    ))
+                })],
+            );
+            assert_eq!(module.get_format_type(annotated.get_level()), &expected);
+        }
+    }
+
     #[test]
     fn define_batch_with_args_self_recursive_decodes() {
         let mut module = FormatModule::new();

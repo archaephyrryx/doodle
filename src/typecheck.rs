@@ -2048,19 +2048,29 @@ impl TypeChecker {
                 ValueType::Union(branches) => {
                     self.unify_var_valuetype_union(uv, branches)?;
                 }
+                // An annotation states the whole type, so a record or tuple is unified as one
+                // (not as projections onto its fields, which only say that `uv` has them and
+                // leave the shape unsolved if nothing else gives it). One `UVar` per field or
+                // element, as before, so the `Elaborator`'s lockstep count is unaffected.
                 ValueType::Record(fs) => {
+                    let mut fields = Vec::with_capacity(fs.len());
                     for (lbl, fvt) in fs.iter() {
                         let fld_var = self.get_new_uvar();
-                        self.unify_var_proj_field(uv, lbl.clone(), fld_var)?;
                         self.unify_var_valuetype(fld_var, fvt)?;
+                        fields.push((lbl.clone(), Rc::new(UType::Var(fld_var))));
                     }
+                    let _tmp = ("unify_var_valuetype", uv, format!("{:?}", vt));
+                    try_with!(self.unify_var_utype(uv, Rc::new(UType::Record(fields))) => _tmp);
                 }
                 ValueType::Tuple(ts) => {
-                    for (ix, t) in ts.iter().enumerate() {
+                    let mut elems = Vec::with_capacity(ts.len());
+                    for t in ts.iter() {
                         let ix_var = self.get_new_uvar();
-                        self.unify_var_proj_index(uv, ix, ix_var)?;
                         self.unify_var_valuetype(ix_var, t)?;
+                        elems.push(Rc::new(UType::Var(ix_var)));
                     }
+                    let _tmp = ("unify_var_valuetype", uv, format!("{:?}", vt));
+                    try_with!(self.unify_var_utype(uv, Rc::new(UType::Tuple(elems))) => _tmp);
                 }
                 ValueType::Seq(inner) => {
                     let elem_v = self.get_new_uvar();
