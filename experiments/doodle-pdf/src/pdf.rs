@@ -402,8 +402,6 @@ fn number(module: &mut FormatModule, natural: FormatRef) -> FormatRef {
 /// The digits are folded in the Numeric model, with `Auto` rep, so the value isn't bounded by
 /// a machine type until the final conversion, which is where a value over `u64::MAX` is
 /// rejected (as DaeDaLus does with `as? uint 64`, e.g. in `LookupSize`).
-// Not yet called outside the tests; it is for the cross-reference-stream work (#347).
-#[cfg_attr(not(test), allow(dead_code))]
 fn number_as_nat(number: Expr) -> Expr {
     // Phases of the fold, in the order they can occur
     const START: u8 = 0;
@@ -464,15 +462,7 @@ fn number_as_nat(number: Expr) -> Expr {
     ]);
 
     // The only conversion out of the Numeric model, and so the only overflow check
-    let to_u64 = |val: Expr| {
-        expr_match(
-            val.clone(),
-            [
-                (Pattern::ZRange((0u64..).into()), expr_some(as_u64(val))),
-                (Pattern::Wildcard, expr_none()),
-            ],
-        )
-    };
+    let to_u64 = numeric_to_u64;
     let finished =
         |neg: Pattern, val: Pattern, phase: u8| Pattern::Tuple(vec![neg, val, Pattern::U8(phase)]);
     let zero = || Pattern::ZConst(0.into());
@@ -500,9 +490,39 @@ fn number_as_nat(number: Expr) -> Expr {
     )
 }
 
+/// `Some` of the Numeric value `val` as a `u64`, or `None` if it is negative or too large: the
+/// one conversion out of the Numeric model for a computation, and so its only overflow check.
+fn numeric_to_u64(val: Expr) -> Expr {
+    expr_match(
+        val.clone(),
+        [
+            (Pattern::ZRange((0u64..).into()), expr_some(as_u64(val))),
+            (Pattern::Wildcard, expr_none()),
+        ],
+    )
+}
+
+/// Whether the value of `key` in `dict` is the name `name` (both written without the leading
+/// `/`), as a `Bool`. DaeDaLus `LookupName key dict == name`, without resolving a reference
+/// (#355).
+fn dict_name_is(key: &[u8], name: &[u8], dict: Expr, value_type: ValueType) -> Expr {
+    expr_match(
+        dict_lookup(key, dict, value_type),
+        [
+            (
+                pat_some(Pattern::Variant(
+                    "name".into(),
+                    Box::new(pattern_bytestring(&[b"/", name].concat())),
+                )),
+                Expr::Bool(true),
+            ),
+            (Pattern::Wildcard, Expr::Bool(false)),
+        ],
+    )
+}
+
 /// DaeDaLus `NatValue v`: `v` (a `pdf.value`) must be a number, and [`number_as_nat`] of
 /// it must succeed; fails otherwise.
-#[cfg_attr(not(test), allow(dead_code))]
 fn nat_value(value: Expr) -> Format {
     fmt_match(
         value,
@@ -527,7 +547,6 @@ fn nat_value(value: Expr) -> Format {
 ///
 /// DaeDaLus `LookupNat` also resolves an indirect reference (`LookupResolve`). That isn't
 /// supported yet (#355), so a reference here gives `dflt`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn lookup_nat_or(key: &[u8], dict: Expr, dflt: u64, value_type: ValueType) -> Expr {
     expr_match(
         dict_lookup(key, dict, value_type),
@@ -545,7 +564,6 @@ fn lookup_nat_or(key: &[u8], dict: Expr, dflt: u64, value_type: ValueType) -> Ex
 /// of a `/FlateDecode` filter, where `param` is the filter's `/DecodeParms` entry as an
 /// `Option` of a `pdf.value.dict` result (DaeDaLus `FilterParam`, which maps `null` to
 /// `nothing`). Absent entries, and an absent `param`, take the defaults `1`, `1`, `8` and `1`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn flate_decode_params(param: Expr, value_type: ValueType) -> Expr {
     const DEFAULTS: [(&str, &[u8], u64); 4] = [
         ("predictor", b"Predictor", 1),
@@ -575,7 +593,6 @@ fn flate_decode_params(param: Expr, value_type: ValueType) -> Expr {
 
 /// DaeDaLus `supportedPredictor`, over a [`flate_decode_params`] record: no prediction
 /// (`1`), or a PNG predictor (`10..=15`) with sensible `colors`, `bpc` and `columns`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn supported_predictor(params: Expr) -> Expr {
     let field = |label: &'static str| record_proj(params.clone(), label);
     let bpc_ok = [1, 2, 4, 8, 16]
@@ -610,7 +627,6 @@ fn supported_predictor(params: Expr) -> Expr {
 ///
 /// Like the PNG predictors themselves, the PDF predictor value (`10` to `15`) is only a hint:
 /// each row's own tag selects its filter.
-#[cfg_attr(not(test), allow(dead_code))]
 fn png_unpredict(params: Expr) -> Format {
     let field = |label: &'static str| compute(record_proj(params.clone(), label));
     // Computed in the Numeric model, so that the only overflow check is the conversion to u64
@@ -745,7 +761,6 @@ fn png_unpredict(params: Expr) -> Format {
 ///
 /// Fails when `supported_predictor` rejects `params`, the case in which DaeDaLus
 /// `TryApplyFilter` reports the filter as unsupported instead of applying it.
-#[cfg_attr(not(test), allow(dead_code))]
 fn flate_decode(zlib: FormatRef, params: Expr, body: Expr) -> Format {
     let inflate = decode_bytes(
         body,
@@ -968,8 +983,6 @@ fn pdf_value(
 /// DaeDaLus builds a dictionary with `insert`, so a later duplicate key replaces an earlier
 /// one. `pdf.value.dict` keeps every entry, so this returns the value of the *last* entry
 /// whose key is `key`.
-// Not yet called outside the tests; it is for the cross-reference-stream work (#347).
-#[cfg_attr(not(test), allow(dead_code))]
 fn dict_lookup(key: &[u8], dict: Expr, value_type: ValueType) -> Expr {
     let name = [b"/", key].concat();
     left_fold(
@@ -994,7 +1007,6 @@ fn dict_lookup(key: &[u8], dict: Expr, value_type: ValueType) -> Expr {
 
 /// DaeDaLus `Lookup key dict`: like [`dict_lookup`], but as a parser that fails when `dict`
 /// has no entry for `key`, so a `Default`-style fallback can catch the failure.
-#[cfg_attr(not(test), allow(dead_code))]
 fn dict_get(key: &[u8], dict: Expr, value_type: ValueType) -> Format {
     fmt_match(
         dict_lookup(key, dict, value_type),
@@ -1253,17 +1265,407 @@ fn trailer_dict(dict: Expr, value_type: ValueType) -> Format {
     ])
 }
 
-/// DaeDaLus `CrossRef`: the cross-reference section found at an offset.
+/// DaeDaLus `BEBytes n`: `n` bytes read as a big-endian natural number, which must fit in a
+/// `u64` (DaeDaLus allows any width, as its integers are unbounded; see #359).
+fn be_bytes(n: Expr) -> Format {
+    // Each byte as an Auto-rep constant (as `number_as_nat` does with digits), so that the
+    // accumulation stays in the Numeric model instead of taking on a machine rep
+    let byte = expr_match(
+        var("byte"),
+        (0..=255u8).map(|k| (Pattern::U8(k), poly_const(k))),
+    );
+    let step = lambda_tuple(
+        ["v", "byte"],
+        expr_match(byte, [(bind("b"), numeric(numexpr!("v" * 256 + "b")))]),
+    );
+    chain(
+        repeat_count(n, Format::ANY_BYTE),
+        "bytes",
+        fmt_match(
+            numeric_to_u64(left_fold(
+                step,
+                poly_const(0u8),
+                ValueType::NumericHole,
+                var("bytes"),
+            )),
+            [
+                (pat_some(bind("v")), compute(var("v"))),
+                (pat_none(), Format::Fail), // "field too wide"
+            ],
+        ),
+    )
+}
+
+/// DaeDaLus `XRefFieldWithDefault dflt n`: `dflt` for a field of width `0`, otherwise
+/// [`be_bytes`].
+fn xref_field_or(dflt: u64, width: Expr) -> Format {
+    if_then_else(
+        expr_eq(width.clone(), Expr::U64(0)),
+        compute(Expr::U64(dflt)),
+        be_bytes(width),
+    )
+}
+
+/// DaeDaLus `XRefFieldRequired n`: [`be_bytes`], failing for a field of width `0`.
+fn xref_field_required(width: Expr) -> Format {
+    if_then_else(
+        expr_eq(width.clone(), Expr::U64(0)),
+        Format::Fail, // "required field has width 0"
+        be_bytes(width),
+    )
+}
+
+/// DaeDaLus `XRefObjEntry`: one entry of a cross-reference stream, given the
+/// [`xref_widths`] record `widths`. It takes `width` bytes, of which the fields use the first
+/// `b1 + b2 + b3`.
 ///
-/// Only the classic form (`CrossRefAndTrailer`: an `xref` table, then `trailer` and its dict)
-/// is supported so far. DaeDaLus also accepts a cross-reference stream (`XRefObj`) here, and
-/// until that is added, a link to one fails the parse.
+/// The type field (of width `b1`) defaults to `1`. As in DaeDaLus, type `0` is `free`, `1` is
+/// `in_use`, `2` is `compressed`, and any other type is `null` (a reference to it is to the
+/// null object).
+fn xref_entry(widths: Expr) -> Format {
+    let w = |label: &'static str| record_proj(widths.clone(), label);
+    let entry = |name: &'static str, field2: &'static str, field3: &'static str| {
+        fmt_variant(
+            name,
+            record_auto([
+                (field2, xref_field_required(w("b2"))),
+                (field3, xref_field_or(0, w("b3"))),
+            ]),
+        )
+    };
+    slice(
+        w("width"),
+        chain(
+            xref_field_or(1, w("b1")),
+            "type",
+            fmt_match(
+                var("type"),
+                [
+                    (Pattern::U64(0), entry("free", "obj", "gen")),
+                    (Pattern::U64(1), entry("in_use", "offset", "gen")),
+                    // the generation is implicitly 0
+                    (
+                        Pattern::U64(2),
+                        entry("compressed", "container_obj", "obj_index"),
+                    ),
+                    (Pattern::Wildcard, fmt_variant("null", compute(Expr::UNIT))),
+                ],
+            ),
+        ),
+    )
+}
+
+/// DaeDaLus `XRefIndex`, given the stream dictionary `header`: the subsections of a
+/// cross-reference stream, as `first_id` and `num` (entry count) pairs. They come from
+/// `/Index`, an array of pairs, or if `/Index` is absent or isn't an array of natural
+/// numbers, the single pair `0 /Size`. An `/Index` of odd length fails.
+///
+/// DaeDaLus resolves an indirect `/Size`, `/Index` or element of it; until #355 that makes
+/// `/Size` fail and `/Index` take its default.
+fn xref_index(header: Expr, value_type: ValueType) -> Format {
+    let u64_seq = ValueType::Seq(Box::new(ValueType::Base(BaseType::U64)));
+    // DaeDaLus `LookupNats "Index" header`, as an `Option`
+    let index_nats = expr_match(
+        dict_lookup(b"Index", header.clone(), value_type.clone()),
+        [
+            (
+                pat_some(Pattern::Variant("array".into(), Box::new(bind("vs")))),
+                left_fold(
+                    lambda_tuple(
+                        ["acc", "v"],
+                        expr_match(
+                            Expr::Tuple(vec![var("acc"), var("v")]),
+                            [
+                                (
+                                    Pattern::Tuple(vec![
+                                        pat_some(bind("ns")),
+                                        Pattern::Variant("number".into(), Box::new(bind("n"))),
+                                    ]),
+                                    expr_option_map_or(
+                                        expr_none(),
+                                        |k| expr_some(append(var("ns"), Expr::Seq(vec![k]))),
+                                        number_as_nat(var("n")),
+                                    ),
+                                ),
+                                (Pattern::Wildcard, expr_none()),
+                            ],
+                        ),
+                    ),
+                    expr_some(Expr::Seq(vec![])),
+                    ValueType::Option(Box::new(u64_seq)),
+                    var("vs"),
+                ),
+            ),
+            (Pattern::Wildcard, expr_none()),
+        ],
+    );
+    let ix = |offset: u32| {
+        index_unchecked(
+            var("arr"),
+            add(mul(var("i"), Expr::U32(2)), Expr::U32(offset)),
+        )
+    };
+    chain(
+        chain(
+            dict_get(b"Size", header, value_type),
+            "size",
+            nat_value(var("size")),
+        ),
+        "size",
+        chain(
+            compute(expr_option_map_or(
+                Expr::Seq(vec![Expr::U64(0), var("size")]),
+                |ns| ns,
+                index_nats,
+            )),
+            "arr",
+            if_then_else(
+                expr_eq(rem(seq_length(var("arr")), Expr::U32(2)), Expr::U32(0)),
+                for_each(
+                    enum_from_to(Expr::U32(0), div(seq_length(var("arr")), Expr::U32(2))),
+                    "i",
+                    record_auto([("first_id", compute(ix(0))), ("num", compute(ix(1)))]),
+                ),
+                Format::Fail, // "odd /Index length"
+            ),
+        ),
+    )
+}
+
+/// DaeDaLus `XRefFormat`, given the stream dictionary `header`: the widths `b1`, `b2` and `b3`
+/// of the fields of an entry (from `/W`, `0` for any it doesn't give), and the `width` of a
+/// whole entry, the sum of all of `/W`. `/W` must be an array of natural numbers.
+///
+/// DaeDaLus resolves an indirect `/W`; until #355 that fails here.
+fn xref_widths(header: Expr, value_type: ValueType) -> Format {
+    let b = |i: u32| {
+        compute(expr_option_map_or(
+            Expr::U64(0),
+            |x| x,
+            index_checked(var("_ws"), Expr::U32(i)),
+        ))
+    };
+    // DaeDaLus sums unbounded integers, then checks the total fits (`as? uint 64`). The widths
+    // are already `u64`s here, so the typed model sums in `u64`; the interpreter computes the
+    // Numeric sum exactly, and `numeric_to_u64` is the check.
+    let sum = left_fold(
+        lambda_tuple(["s", "w"], numeric(numexpr!("s" + ("w" into u64)))),
+        poly_const(0u8),
+        ValueType::NumericHole,
+        var("_ws"),
+    );
+    record_auto([
+        (
+            "_w",
+            fmt_match(
+                dict_lookup(b"W", header, value_type),
+                [
+                    (
+                        pat_some(Pattern::Variant("array".into(), Box::new(bind("vs")))),
+                        compute(var("vs")),
+                    ),
+                    (Pattern::Wildcard, Format::Fail), // "/W is not an array"
+                ],
+            ),
+        ),
+        ("_ws", for_each(var("_w"), "x", nat_value(var("x")))),
+        ("b1", b(0)),
+        ("b2", b(1)),
+        ("b3", b(2)),
+        (
+            "width",
+            fmt_match(
+                numeric_to_u64(sum),
+                [
+                    (pat_some(bind("n")), compute(var("n"))),
+                    (pat_none(), Format::Fail), // "entry too wide"
+                ],
+            ),
+        ),
+    ])
+}
+
+/// DaeDaLus `ApplyFilters` for a cross-reference stream, given its dictionary `header` and
+/// its raw bytes `raw`: the decoded bytes.
+///
+/// DaeDaLus exempts a stream of `/Type /XRef` from decryption, and that is the only kind used
+/// here. Of the filters, only a single `/FlateDecode` (as a name, or alone in an array) is
+/// supported, as in [`flate_decode`]; no filter (or an empty array) leaves `raw` as it is, and
+/// any other filter, or more than one, fails. A `/DecodeParms` that is `null` (or absent) gives
+/// the defaults, and one that isn't a dict, `null`, or an array whose first element is one
+/// of those, fails, as DaeDaLus `FilterParam` does.
+fn xref_stream_filters(zlib: FormatRef, header: Expr, raw: Expr, value_type: ValueType) -> Format {
+    let null = || Pattern::Variant("null".into(), Box::new(Pattern::Wildcard));
+    let dict = || Pattern::Variant("dict".into(), Box::new(bind("d")));
+    // DaeDaLus `FilterParam` of the first element of `OneOrArray`, defaulting to `null`
+    let param = fmt_match(
+        dict_lookup(b"DecodeParms", header.clone(), value_type.clone()),
+        [
+            (pat_none(), compute(expr_none())),
+            (pat_some(null()), compute(expr_none())),
+            (pat_some(dict()), compute(expr_some(var("d")))),
+            (
+                pat_some(Pattern::Variant("array".into(), Box::new(bind("ps")))),
+                fmt_match(
+                    index_checked(var("ps"), Expr::U32(0)),
+                    [
+                        (pat_none(), compute(expr_none())),
+                        (pat_some(null()), compute(expr_none())),
+                        (pat_some(dict()), compute(expr_some(var("d")))),
+                        (Pattern::Wildcard, Format::Fail), // "bad /DecodeParms"
+                    ],
+                ),
+            ),
+            (Pattern::Wildcard, Format::Fail), // "bad /DecodeParms"
+        ],
+    );
+    let flate = chain(
+        param,
+        "param",
+        flate_decode(
+            zlib,
+            flate_decode_params(var("param"), value_type.clone()),
+            raw.clone(),
+        ),
+    );
+    let flate_name =
+        || Pattern::Variant("name".into(), Box::new(pattern_bytestring(b"/FlateDecode")));
+    fmt_match(
+        dict_lookup(b"Filter", header, value_type),
+        [
+            (pat_none(), compute(raw.clone())),
+            (
+                pat_some(Pattern::Variant(
+                    "array".into(),
+                    Box::new(Pattern::Seq(vec![])),
+                )),
+                compute(raw),
+            ),
+            (pat_some(flate_name()), flate.clone()),
+            (
+                pat_some(Pattern::Variant(
+                    "array".into(),
+                    Box::new(Pattern::Seq(vec![flate_name()])),
+                )),
+                flate,
+            ),
+            (Pattern::Wildcard, Format::Fail), // "unsupported filter"
+        ],
+    )
+}
+
+/// DaeDaLus `XRefObj`: a cross-reference stream object (PDF 1.5), with its `xref` subsections
+/// (each a `first_id` and its `entries`, see [`xref_entry`]) and its `trailer` (the stream
+/// dictionary, as [`trailer_dict`]), like the classic form.
+///
+/// As DaeDaLus `StreamBody` does, the body is the `/Length` bytes after the `stream` line,
+/// decoded by [`xref_stream_filters`], and the table is read from the decoded bytes, ignoring
+/// any after the last entry. DaeDaLus resolves an indirect `/Length`; until #355 that fails.
+fn xref_obj(
+    module: &mut FormatModule,
+    any_ws: FormatRef,
+    simple_eol: FormatRef,
+    natural: FormatRef,
+    pdf_value: FormatRef,
+    zlib: FormatRef,
+    value_type: ValueType,
+) -> FormatRef {
+    let header = || var("_header");
+    module.define_format(
+        "pdf.xref_obj",
+        record_auto([
+            // DaeDaLus `TopDecl`, which must be a `stream`
+            ("__ws", repeat(any_ws.call())),
+            ("__id", token(natural_u64(natural), any_ws)),
+            ("__gen", token(natural_u64(natural), any_ws)),
+            ("__kw_obj", kw(b"obj", any_ws)),
+            ("_val", pdf_value.call_args(vec![Expr::U64(32)])),
+            (
+                "_header",
+                fmt_match(
+                    var("_val"),
+                    [
+                        (
+                            Pattern::Variant("dict".into(), Box::new(bind("d"))),
+                            compute(var("d")),
+                        ),
+                        (Pattern::Wildcard, Format::Fail), // "not a stream"
+                    ],
+                ),
+            ),
+            ("__kw_stream", match_str(b"stream")),
+            ("__eol", simple_eol.call()),
+            (
+                "_len",
+                chain(
+                    dict_get(b"Length", header(), value_type.clone()),
+                    "len",
+                    nat_value(var("len")),
+                ),
+            ),
+            (
+                "_body",
+                token(
+                    slice(
+                        var("_len"),
+                        chain(
+                            repeat(Format::ANY_BYTE),
+                            "raw",
+                            xref_stream_filters(zlib, header(), var("raw"), value_type.clone()),
+                        ),
+                    ),
+                    any_ws,
+                ),
+            ),
+            ("__kw_endstream", kw(b"endstream", any_ws)),
+            ("__kw_endobj", match_str(b"endobj")),
+            // DaeDaLus `XRefMeta`
+            (
+                "__type",
+                if_then_else(
+                    dict_name_is(b"Type", b"XRef", header(), value_type.clone()),
+                    Format::EMPTY,
+                    Format::Fail, // "not /Type /XRef"
+                ),
+            ),
+            ("_index", xref_index(header(), value_type.clone())),
+            ("_widths", xref_widths(header(), value_type.clone())),
+            // DaeDaLus `XRefObjTable`
+            (
+                "xref",
+                decode_bytes(
+                    var("_body"),
+                    for_each(
+                        var("_index"),
+                        "idx",
+                        record_auto([
+                            ("first_id", compute(record_proj(var("idx"), "first_id"))),
+                            (
+                                "entries",
+                                repeat_count(
+                                    record_proj(var("idx"), "num"),
+                                    xref_entry(var("_widths")),
+                                ),
+                            ),
+                        ]),
+                    ),
+                ),
+            ),
+            ("trailer", trailer_dict(header(), value_type)),
+        ]),
+    )
+}
+
+/// DaeDaLus `CrossRef`: the cross-reference section found at an offset, either `old_xref`
+/// (`CrossRefAndTrailer`: an `xref` table, then `trailer` and its dict) or `new_xref` (a
+/// cross-reference stream, [`xref_obj`]), trying them in that order (DaeDaLus `First`).
 fn cross_ref(
     module: &mut FormatModule,
     any_ws: FormatRef,
     eol: FormatRef,
     xref_table: FormatRef,
     pdf_dict: FormatRef,
+    xref_obj: FormatRef,
     value_type: ValueType,
 ) -> FormatRef {
     let just_white = union([void(byte_in(SIMPLE_WS)), eol.call()]);
@@ -1276,7 +1678,10 @@ fn cross_ref(
         ("_dict", pdf_dict.call_args(vec![Expr::U64(32)])),
         ("trailer", trailer_dict(var("_dict"), value_type)),
     ]);
-    module.define_format("pdf.cross_ref", fmt_variant("old_xref", old_xref))
+    module.define_format(
+        "pdf.cross_ref",
+        alts_nondet([("old_xref", old_xref), ("new_xref", xref_obj.call())]),
+    )
 }
 
 /// The cross-reference sections reachable from the one at `offset` (relative to `base`, the
@@ -1333,10 +1738,12 @@ fn xref_chain(module: &mut FormatModule, cross_ref: FormatRef) -> FormatRef {
             let trailer = || {
                 expr_match(
                     var("section"),
-                    [(
-                        Pattern::Variant("old_xref".into(), Box::new(bind("x"))),
-                        record_proj(var("x"), "trailer"),
-                    )],
+                    ["old_xref", "new_xref"].map(|form| {
+                        (
+                            Pattern::Variant(form.into(), Box::new(bind("x"))),
+                            record_proj(var("x"), "trailer"),
+                        )
+                    }),
                 )
             };
             let visited_here = || append(var("visited"), Expr::Seq(vec![var("offset")]));
@@ -1459,12 +1866,24 @@ fn top_formats(module: &mut FormatModule) -> [FormatRef; 2] {
 
     // `pdf.cos`, the end-driven parse, alongside the front-to-back `pdf.main`
     let pdf_end = pdf_end(module, eol, natural);
+    let deflate = doodle_formats::format::deflate::main(module);
+    let zlib = doodle_formats::format::zlib::main(module, deflate);
+    let xref_obj = xref_obj(
+        module,
+        any_ws,
+        simple_eol,
+        natural,
+        pdf_value,
+        zlib,
+        pdf_value_type.clone(),
+    );
     let cross_ref = cross_ref(
         module,
         any_ws,
         eol,
         cross_ref_section,
         pdf_dict,
+        xref_obj,
         pdf_value_type.clone(),
     );
     let xref_chain = xref_chain(module, cross_ref);
@@ -2093,21 +2512,57 @@ mod tests {
         }
     }
 
-    /// A classic cross-reference section for [`build_pdf`], identified by its trailer's
-    /// `/Size`, with optional `/Prev` and `/XRefStm` links to other sections by index. An index
-    /// past the last section stands for an offset past the end of the file.
+    /// A cross-reference section for [`build_pdf`], identified by its trailer's `/Size`, with
+    /// optional `/Prev` and `/XRefStm` links to other sections by index. An index past the last
+    /// section stands for an offset past the end of the file.
+    ///
+    /// It is a classic section, or with `stream`, a cross-reference stream object.
     struct Sec {
         size: u64,
         prev: Option<usize>,
         xrefstm: Option<usize>,
+        stream: Option<Stm>,
     }
 
-    const fn sec(size: u64, prev: Option<usize>, xrefstm: Option<usize>) -> Sec {
+    /// The rest of a cross-reference stream's dictionary (other than `/Size` and the links),
+    /// and its raw body. `/Length` is the body's length unless `dict` gives one.
+    struct Stm {
+        dict: String,
+        data: Vec<u8>,
+    }
+
+    fn sec(size: u64, prev: Option<usize>, xrefstm: Option<usize>) -> Sec {
         Sec {
             size,
             prev,
             xrefstm,
+            stream: None,
         }
+    }
+
+    fn stm(size: u64, prev: Option<usize>, dict: &str, data: &[u8]) -> Sec {
+        Sec {
+            size,
+            prev,
+            xrefstm: None,
+            stream: Some(Stm {
+                dict: dict.to_string(),
+                data: data.to_vec(),
+            }),
+        }
+    }
+
+    /// The fields of each entry, as big-endian numbers of the widths `w`
+    fn be_rows(w: &[usize], entries: &[&[u64]]) -> Vec<u8> {
+        entries
+            .iter()
+            .flat_map(|fields| {
+                w.iter()
+                    .zip(fields.iter())
+                    .flat_map(|(&w, &f)| f.to_be_bytes()[8 - w.min(8)..].to_vec())
+                    .collect::<Vec<u8>>()
+            })
+            .collect()
     }
 
     /// `prefix`, a `%PDF-1.4` header, the sections `secs`, then a `startxref` block for each
@@ -2123,13 +2578,31 @@ mod tests {
                 ),
                 None => String::new(),
             };
-            format!(
-                "xref\n0 1\n0000000000 65535 f\r\ntrailer\n<< /Size {}{}{} >>\n",
-                sec.size,
-                link("Prev", sec.prev),
-                link("XRefStm", sec.xrefstm)
-            )
-            .into_bytes()
+            let links = format!("{}{}", link("Prev", sec.prev), link("XRefStm", sec.xrefstm));
+            match &sec.stream {
+                None => format!(
+                    "xref\n0 1\n0000000000 65535 f\r\ntrailer\n<< /Size {}{links} >>\n",
+                    sec.size,
+                )
+                .into_bytes(),
+                Some(Stm { dict, data }) => {
+                    let len = if dict.contains("/Length") {
+                        String::new()
+                    } else {
+                        format!(" /Length {}", data.len())
+                    };
+                    [
+                        format!(
+                            "9 0 obj\n<< /Size {}{links} {dict}{len} >>\nstream\n",
+                            sec.size
+                        )
+                        .as_bytes(),
+                        data,
+                        b"\nendstream\nendobj\n",
+                    ]
+                    .concat()
+                }
+            }
         };
         let mut offsets = Vec::new();
         let mut at = HEADER.len();
@@ -2298,6 +2771,274 @@ mod tests {
                     [
                         (
                             Pattern::Seq(sizes_expected.iter().map(|n| Pattern::U64(*n)).collect()),
+                            Format::EMPTY,
+                        ),
+                        (Pattern::Wildcard, Format::Fail),
+                    ],
+                ),
+                None => Format::EMPTY,
+            };
+            let top = chain(pdf_cos.call(), "cos", check);
+            let prog = Compiler::compile_program(&module, &top).expect("must compile");
+            assert_eq!(
+                prog.run(ReadCtxt::new(&input)).is_ok(),
+                expected.is_some(),
+                "{name}: expecting {expected:?} from {:?}",
+                String::from_utf8_lossy(&input)
+            );
+        }
+    }
+
+    /// [`HELLO_Z`]-style fixtures: four entries `0 0 0`, `1 15 0`, `1 300 0` and `2 3 1` with
+    /// `/W [1 2 1]`, zlib-compressed plainly, and as PNG Up rows (predictor 12, 4 columns).
+    const XREF_ROWS_Z: &[u8] = &[
+        0x78, 0xda, 0x63, 0x60, 0x60, 0x60, 0x60, 0x64, 0xe0, 0x67, 0x60, 0x64, 0xd4, 0x61, 0x60,
+        0x62, 0x60, 0x66, 0x04, 0x00, 0x01, 0xd8, 0x00, 0x45,
+    ];
+    const XREF_ROWS_UP_Z: &[u8] = &[
+        0x78, 0xda, 0x63, 0x62, 0x00, 0x02, 0x26, 0x46, 0x06, 0x7e, 0x06, 0x26, 0x06, 0x46, 0x59,
+        0x20, 0xeb, 0xff, 0x75, 0x46, 0x00, 0x06, 0xbd, 0x02, 0x0f,
+    ];
+
+    /// `pdf.cos` reads cross-reference streams (DaeDaLus `XRefObj`), alone and linked with
+    /// classic sections either way. Each case gives, for each section in precedence order, its
+    /// `/Size`, then (for a stream) each subsection's first object number followed by its
+    /// entries as `type field2 field3` (`9 0 0` for a `null` entry), or `None` for a failure.
+    #[test]
+    fn pdf_cos_reads_xref_streams() {
+        const W121: &str = "/Type /XRef /W [1 2 1]";
+        let four: &[&[u64]] = &[&[0, 0, 0], &[1, 15, 0], &[1, 300, 0], &[2, 3, 1]];
+        let four_out: Vec<u64> = vec![0, 0, 0, 0, 1, 15, 0, 1, 300, 0, 2, 3, 1];
+        let rows = |w: &[usize], es: &[&[u64]]| be_rows(w, es);
+        let one = |dict: &str, data: &[u8]| build_pdf(b"", &[stm(4, None, dict, data)], &[0], b"");
+        let with = |head: &[u64], tail: &[u64]| [head, tail].concat();
+        let cases: Vec<(&str, Vec<u8>, Option<Vec<u64>>)> = vec![
+            (
+                "an uncompressed stream, with the default /Index",
+                one(W121, &rows(&[1, 2, 1], four)),
+                Some(with(&[4], &four_out)),
+            ),
+            (
+                "/FlateDecode",
+                one(&format!("{W121} /Filter /FlateDecode"), XREF_ROWS_Z),
+                Some(with(&[4], &four_out)),
+            ),
+            (
+                "/FlateDecode in an array, with PNG Up rows",
+                one(
+                    &format!(
+                        "{W121} /Filter [/FlateDecode] /DecodeParms << /Predictor 12 /Columns 4 >>"
+                    ),
+                    XREF_ROWS_UP_Z,
+                ),
+                Some(with(&[4], &four_out)),
+            ),
+            (
+                "/DecodeParms in an array",
+                one(
+                    &format!(
+                        "{W121} /Filter [/FlateDecode] /DecodeParms [<< /Predictor 12 /Columns 4 >>]"
+                    ),
+                    XREF_ROWS_UP_Z,
+                ),
+                Some(with(&[4], &four_out)),
+            ),
+            (
+                "/Index with two subsections",
+                one(
+                    &format!("{W121} /Index [5 1 10 2]"),
+                    &rows(&[1, 2, 1], &[&[1, 7, 0], &[1, 8, 0], &[2, 3, 4]]),
+                ),
+                Some(vec![4, 5, 1, 7, 0, 10, 1, 8, 0, 2, 3, 4]),
+            ),
+            (
+                "a type of width 0 defaults to 1, a third field of width 0 to 0",
+                one(
+                    "/Type /XRef /W [0 2 0] /Index [0 2]",
+                    &rows(&[2], &[&[15], &[300]]),
+                ),
+                Some(vec![4, 0, 1, 15, 0, 1, 300, 0]),
+            ),
+            (
+                "an unknown type is null",
+                one(
+                    &format!("{W121} /Index [0 1]"),
+                    &rows(&[1, 2, 1], &[&[7, 1, 1]]),
+                ),
+                Some(vec![4, 0, 9, 0, 0]),
+            ),
+            (
+                "a fourth /W width is skipped, and bytes after the entries are ignored",
+                one(
+                    "/Type /XRef /W [1 2 1 3] /Index [0 2]",
+                    &[
+                        rows(&[1, 2, 1, 3], &[&[1, 15, 0, 99], &[1, 300, 0, 99]]),
+                        b"junk".to_vec(),
+                    ]
+                    .concat(),
+                ),
+                Some(vec![4, 0, 1, 15, 0, 1, 300, 0]),
+            ),
+            (
+                "a 9-byte field that fits in a u64",
+                one(
+                    "/Type /XRef /W [1 9 1] /Index [0 1]",
+                    &[&[1, 0][..], &u64::MAX.to_be_bytes(), &[0]].concat(),
+                ),
+                Some(vec![4, 0, 1, u64::MAX, 0]),
+            ),
+            (
+                "a 9-byte field that doesn't fit in a u64",
+                one(
+                    "/Type /XRef /W [1 9 1] /Index [0 1]",
+                    &[&[1, 1][..], &[0; 8], &[0]].concat(),
+                ),
+                None,
+            ),
+            (
+                "a required field of width 0",
+                one(
+                    "/Type /XRef /W [1 0 1] /Index [0 1]",
+                    &rows(&[1, 1], &[&[1, 0]]),
+                ),
+                None,
+            ),
+            (
+                "too few bytes for the entries",
+                one(W121, &rows(&[1, 2, 1], &four[..3])),
+                None,
+            ),
+            (
+                "an /Index of odd length",
+                one(&format!("{W121} /Index [0 4 9]"), &rows(&[1, 2, 1], four)),
+                None,
+            ),
+            (
+                "not /Type /XRef",
+                one("/Type /ObjStm /W [1 2 1]", &rows(&[1, 2, 1], four)),
+                None,
+            ),
+            (
+                "an indirect /Length (until #355)",
+                one(&format!("{W121} /Length 5 0 R"), &rows(&[1, 2, 1], four)),
+                None,
+            ),
+            (
+                "an unsupported filter",
+                one(
+                    &format!("{W121} /Filter /ASCIIHexDecode"),
+                    &rows(&[1, 2, 1], four),
+                ),
+                None,
+            ),
+            (
+                "two filters",
+                one(
+                    &format!("{W121} /Filter [/FlateDecode /FlateDecode]"),
+                    XREF_ROWS_Z,
+                ),
+                None,
+            ),
+            (
+                "a stream's /Prev to a classic section",
+                build_pdf(
+                    b"",
+                    &[
+                        sec(1, None, None),
+                        stm(4, Some(0), W121, &rows(&[1, 2, 1], four)),
+                    ],
+                    &[1],
+                    b"",
+                ),
+                Some(with(&with(&[4], &four_out), &[1])),
+            ),
+            (
+                "a classic section's /XRefStm to a stream (a hybrid file)",
+                build_pdf(
+                    b"",
+                    &[
+                        stm(4, None, W121, &rows(&[1, 2, 1], four)),
+                        sec(2, None, Some(0)),
+                    ],
+                    &[1],
+                    b"",
+                ),
+                Some(with(&[2, 4], &four_out)),
+            ),
+        ];
+        let mut module = FormatModule::new();
+        let [_pdf_main, pdf_cos] = top_formats(&mut module);
+        let seq1 = |e: Expr| Expr::Seq(vec![e]);
+        let entry = |name: &'static str, f2: &'static str, f3: &'static str| {
+            (
+                Pattern::Variant(name.into(), Box::new(bind("e"))),
+                Expr::Seq(vec![
+                    Expr::U64(match name {
+                        "free" => 0,
+                        "in_use" => 1,
+                        _ => 2,
+                    }),
+                    record_proj(var("e"), f2),
+                    record_proj(var("e"), f3),
+                ]),
+            )
+        };
+        let entries = flat_map(
+            lambda(
+                "entry",
+                expr_match(
+                    var("entry"),
+                    [
+                        entry("free", "obj", "gen"),
+                        entry("in_use", "offset", "gen"),
+                        entry("compressed", "container_obj", "obj_index"),
+                        (
+                            Pattern::Variant("null".into(), Box::new(Pattern::Wildcard)),
+                            Expr::Seq(vec![Expr::U64(9), Expr::U64(0), Expr::U64(0)]),
+                        ),
+                    ],
+                ),
+            ),
+            record_proj(var("sub"), "entries"),
+        );
+        let summary = flat_map(
+            lambda(
+                "s",
+                expr_match(
+                    var("s"),
+                    [
+                        (
+                            Pattern::Variant("old_xref".into(), Box::new(bind("x"))),
+                            seq1(record_lens(var("x"), &["trailer", "size"])),
+                        ),
+                        (
+                            Pattern::Variant("new_xref".into(), Box::new(bind("x"))),
+                            append(
+                                seq1(record_lens(var("x"), &["trailer", "size"])),
+                                flat_map(
+                                    lambda(
+                                        "sub",
+                                        append(
+                                            seq1(record_proj(var("sub"), "first_id")),
+                                            entries.clone(),
+                                        ),
+                                    ),
+                                    record_proj(var("x"), "xref"),
+                                ),
+                            ),
+                        ),
+                    ],
+                ),
+            ),
+            record_proj(var("cos"), "sections"),
+        );
+        for (name, input, expected) in cases {
+            let check = match &expected {
+                Some(out) => fmt_match(
+                    summary.clone(),
+                    [
+                        (
+                            Pattern::Seq(out.iter().map(|n| Pattern::U64(*n)).collect()),
                             Format::EMPTY,
                         ),
                         (Pattern::Wildcard, Format::Fail),
