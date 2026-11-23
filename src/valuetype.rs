@@ -331,14 +331,21 @@ impl ValueType {
         self.unify_rec(other, rec_types, &mut HashSet::new())
     }
 
-    /// Low-level helper for [`Self::unify_with`]. `assumed` holds the pairs of `Rec` levels
-    /// already being unified further up the call-stack, which are taken to unify (coinductively),
-    /// so that unifying two recursive types terminates.
+    /// Low-level helper for [`Self::unify_with`]. `assumed` holds the pairs of types, at least
+    /// one of them a `Rec`, already being unified further up the call-stack. These are taken to
+    /// unify (coinductively), so that unifying two recursive types terminates.
+    ///
+    /// Pairs with only one `Rec` side are recorded too, not just pairs of `Rec` levels. Members of
+    /// a recursive batch are expanded to different depths, so the walk can alternate between
+    /// unfolding the left side and unfolding the right side without ever meeting two `Rec`s at
+    /// once (e.g. a member's `Rec(v)` against another member's expansion of `v`, which refers back
+    /// to that other member). Every type in a recorded pair is one of the inputs, or a part of one
+    /// of them or of `rec_types`, so there are finitely many such pairs.
     fn unify_rec(
         &self,
         other: &ValueType,
         rec_types: &[ValueType],
-        assumed: &mut HashSet<(usize, usize)>,
+        assumed: &mut HashSet<(ValueType, ValueType)>,
     ) -> Result<ValueType, UnificationError<ValueType>> {
         let unfold = |level: usize| {
             rec_types
@@ -359,14 +366,26 @@ impl ValueType {
             (lhs, ValueType::NumericHole) if lhs.is_numeric() => Ok(lhs.clone()),
 
             (ValueType::Rec(l1), ValueType::Rec(l2)) => {
-                if l1 == l2 || !assumed.insert((*l1, *l2)) {
+                if l1 == l2 || !assumed.insert((self.clone(), other.clone())) {
                     Ok(ValueType::Rec(*l1))
                 } else {
                     unfold(*l1)?.unify_rec(unfold(*l2)?, rec_types, assumed)
                 }
             }
-            (ValueType::Rec(level), rhs) => unfold(*level)?.unify_rec(rhs, rec_types, assumed),
-            (lhs, ValueType::Rec(level)) => lhs.unify_rec(unfold(*level)?, rec_types, assumed),
+            (ValueType::Rec(level), rhs) => {
+                if !assumed.insert((self.clone(), rhs.clone())) {
+                    Ok(ValueType::Rec(*level))
+                } else {
+                    unfold(*level)?.unify_rec(rhs, rec_types, assumed)
+                }
+            }
+            (lhs, ValueType::Rec(level)) => {
+                if !assumed.insert((lhs.clone(), other.clone())) {
+                    Ok(ValueType::Rec(*level))
+                } else {
+                    lhs.unify_rec(unfold(*level)?, rec_types, assumed)
+                }
+            }
 
             (ValueType::ViewObj, ValueType::ViewObj) => Ok(ValueType::ViewObj),
             (ValueType::Base(b1), ValueType::Base(b2)) => {
@@ -600,5 +619,59 @@ pub(crate) mod augmented {
                 AugValueType::PhantomData(t) => ValueType::PhantomData(Box::new(From::from(*t))),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn union(branches: impl IntoIterator<Item = (&'static str, ValueType)>) -> ValueType {
+        ValueType::Union(
+            branches
+                .into_iter()
+                .map(|(l, t)| (Label::Borrowed(l), t))
+                .collect(),
+        )
+    }
+
+    fn seq(t: ValueType) -> ValueType {
+        ValueType::Seq(Box::new(t))
+    }
+
+    /// Unifying a `Rec` against a batch member's expansion of the same type terminates when the
+    /// two are unrolled to different depths, so that the walk never has a `Rec` on both sides.
+    ///
+    /// Level 0 is `value = arr: [value] | dict: [value]`, and level 1 is `dict`, expanded one
+    /// step further, as `[arr: [value] | dict: dict]`. Unifying `Rec(0)` with the element of
+    /// level 1 unfolds level 0, then (in the `dict` branch) level 1, and returns to the start.
+    #[test]
+    fn unify_misaligned_rec_terminates() {
+        let value = union([
+            ("arr", seq(ValueType::Rec(0))),
+            ("dict", seq(ValueType::Rec(0))),
+        ]);
+        let dict_elem = union([("arr", seq(ValueType::Rec(0))), ("dict", ValueType::Rec(1))]);
+        let rec_types = [value, seq(dict_elem.clone())];
+
+        // The two types are equal up to unfolding, so unification succeeds in either order
+        // (the exact unrolling of the result depends on the order).
+        assert!(ValueType::Rec(0).unify_with(&dict_elem, &rec_types).is_ok());
+        assert!(dict_elem.unify_with(&ValueType::Rec(0), &rec_types).is_ok());
+    }
+
+    /// The coinductive assumption doesn't make unequal recursive types unify.
+    #[test]
+    fn unify_misaligned_rec_mismatch_fails() {
+        let value = union([
+            ("arr", seq(ValueType::Rec(0))),
+            ("dict", seq(ValueType::Rec(0))),
+        ]);
+        let other = union([
+            ("arr", seq(ValueType::Base(BaseType::U8))),
+            ("dict", ValueType::Rec(1)),
+        ]);
+        let rec_types = [value, seq(other.clone())];
+        assert!(ValueType::Rec(0).unify_with(&other, &rec_types).is_err());
     }
 }
