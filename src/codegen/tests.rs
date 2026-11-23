@@ -1206,6 +1206,89 @@ mod fixture_gen {
         write!(f, "{}", frag).unwrap();
     }
 
+    /// `FindByKey` in each mode, on integer keys and on byte-string keys both owned (`Vec<u8>`, from
+    /// a `RepeatCount`) and borrowed (a slice, from `CaptureBytes`): the key closures and prelude
+    /// calls must type-check, or `tests/find_by_key/mod.rs` fails to compile, and pick the entry
+    /// `tests/find_by_key/codegen_tests.rs` expects.
+    ///
+    /// The borrowed keys are searched for a borrowed query (`q`, also captured): the query and key
+    /// types are unified, borrow hint included, and an owned literal would make the key field's type
+    /// `Vec<u8>`, which its slice decoder does not produce (as it would for any join of the two).
+    #[test]
+    fn find_by_key_behavior_test() {
+        let mut module = FormatModule::new();
+        let owned = module.define_format(
+            "test.owned",
+            record([("k", repeat_count(Expr::U8(2), u8())), ("n", u8())]),
+        );
+        let borrowed = module.define_format(
+            "test.borrowed",
+            record([
+                ("k", capture_bytes_from_here(Expr::U8(2))),
+                ("_k", repeat_count(Expr::U8(2), u8())),
+                ("n", u8()),
+            ]),
+        );
+        let lit = |bytes: &[u8]| Expr::Seq(bytes.iter().copied().map(Expr::U8).collect());
+        let searches = |entries: &'static str, hit: Expr, miss: Expr| {
+            let by_k = |mode: KeySearch, query: Expr| {
+                compute(find_by_key(
+                    mode,
+                    |e| record_proj(e, "k"),
+                    query,
+                    var(entries),
+                ))
+            };
+            vec![
+                ("sorted", by_k(KeySearch::Sorted, hit.clone())),
+                ("first", by_k(KeySearch::First, hit.clone())),
+                ("last", by_k(KeySearch::Last, hit)),
+                ("sorted_missing", by_k(KeySearch::Sorted, miss.clone())),
+                ("last_missing", by_k(KeySearch::Last, miss)),
+            ]
+        };
+        let mut fields = vec![
+            ("owned", repeat_count(Expr::U8(3), owned.call())),
+            ("borrowed", repeat_count(Expr::U8(3), borrowed.call())),
+            // the borrowed queries, "ab" and "ac"
+            ("q_hit", capture_bytes_from_here(Expr::U8(2))),
+            ("_q_hit", repeat_count(Expr::U8(2), u8())),
+            ("q_miss", capture_bytes_from_here(Expr::U8(2))),
+            ("_q_miss", repeat_count(Expr::U8(2), u8())),
+        ];
+        fields.extend(
+            searches("owned", lit(b"ab"), lit(b"ac"))
+                .into_iter()
+                .map(|(name, f)| (["owned_", name].concat().leak() as &'static str, f)),
+        );
+        fields.extend(
+            searches("borrowed", var("q_hit"), var("q_miss"))
+                .into_iter()
+                .map(|(name, f)| (["borrowed_", name].concat().leak() as &'static str, f)),
+        );
+        for (name, mode) in [
+            ("n_sorted", KeySearch::Sorted),
+            ("n_first", KeySearch::First),
+            ("n_last", KeySearch::Last),
+        ] {
+            fields.push((
+                name,
+                compute(find_by_key(
+                    mode,
+                    |e| record_proj(e, "n"),
+                    Expr::U8(7),
+                    var("owned"),
+                )),
+            ));
+        }
+        let main = module.define_format("test.main", record(fields));
+        let top = main.call();
+        let frag = generate_code(&module, &top).to_fragment();
+        const TEST_PATH: &str = "tests/find_by_key/mod.rs";
+        let mut f = File::create(TEST_PATH).unwrap();
+        write!(f, "{}", frag).unwrap();
+    }
+
     #[test]
     #[ignore = "running this test clobbers the manually-edited test file for permit_state_error"]
     /// Test to pre-generate a Permit-parse of a slice we will peek within and manually remove the 'close_peek' within to cause a state-error we want to see

@@ -641,6 +641,13 @@ pub enum Constraint {
     Proj(ProjShape),
     /// Constraints applied to a known-numeric node
     NumTree(IntSet),
+    /// The type of an `Expr::FindByKey` key: an unsigned integer (`Elem(BaseSet::UAny)`) or a byte
+    /// string (`Seq(U8)`).
+    ///
+    /// Every other constraint is compatible with at most one of the two, so a unification with any
+    /// non-vacuous constraint decides between them, and the result does not depend on the order of
+    /// unification (see `unify_ordkey`). If nothing decides, it is read as `Elem(BaseSet::UAny)`.
+    OrdKey,
 }
 
 impl Constraint {
@@ -1002,6 +1009,7 @@ impl TypeChecker {
                 match &self.constraints[v0.0] {
                     Constraints::Invariant(Constraint::Equiv(ut)) => self.to_whnf_vtype(ut.clone()),
                     Constraints::Invariant(Constraint::Elem(bs)) => VType::Base(*bs),
+                    Constraints::Invariant(Constraint::OrdKey) => VType::Base(BaseSet::UAny),
                     Constraints::Invariant(Constraint::Proj(ps)) => self.proj_shape_to_vtype(ps),
                     Constraints::Invariant(Constraint::NumTree(is)) => VType::Int(*is),
                     Constraints::Variant(vmid) => VType::IndefiniteUnion(*vmid),
@@ -1390,7 +1398,7 @@ impl TypeChecker {
                 Ok(())
             }
             Constraints::Invariant(c) => match c {
-                Constraint::Elem(_) | Constraint::NumTree(_) => Ok(()),
+                Constraint::Elem(_) | Constraint::NumTree(_) | Constraint::OrdKey => Ok(()),
                 // Direct type-equivalence, not an embedding - carries `indirected` through
                 // unchanged, same as plain `Var`-forwarding in `occurs_in` below.
                 Constraint::Equiv(t) => self.occurs_in(v, t, indirected, visited),
@@ -1626,6 +1634,11 @@ impl TypeChecker {
             Constraints::Variant(_) => unreachable!("cannot solve tuple projection on union"),
             Constraints::Invariant(c) => match c {
                 Constraint::Elem(_) => unreachable!("cannot solve tuple projection on base-set"),
+                Constraint::OrdKey => Err(UnificationError::Unsatisfiable(
+                    Constraint::OrdKey,
+                    Constraint::Proj(ProjShape::TupleWith(BTreeMap::from([(ix, ix_var)]))),
+                )
+                .into()),
                 Constraint::NumTree(_) => unreachable!("cannot solve tuple projection on int-set"),
                 Constraint::Equiv(ut) => match ut.as_ref() {
                     UType::Tuple(ts) => {
@@ -1673,6 +1686,14 @@ impl TypeChecker {
             Constraints::Variant(_) => unreachable!("cannot solve record projection on union"),
             Constraints::Invariant(c) => match c {
                 Constraint::Elem(_) => unreachable!("cannot solve record projection on base-set"),
+                Constraint::OrdKey => Err(UnificationError::Unsatisfiable(
+                    Constraint::OrdKey,
+                    Constraint::Proj(ProjShape::RecordWith(BTreeMap::from([(
+                        fname.clone(),
+                        fld_var,
+                    )]))),
+                )
+                .into()),
                 Constraint::NumTree(_) => unreachable!("cannot solve record projection on int-set"),
                 Constraint::Equiv(ut) => match ut.as_ref() {
                     UType::Record(fs) => {
@@ -1739,6 +1760,11 @@ impl TypeChecker {
             }
             Constraints::Invariant(c) => match c {
                 Constraint::Elem(_) => unreachable!("cannot solve param projection on base-set"),
+                Constraint::OrdKey => Err(UnificationError::Unsatisfiable(
+                    Constraint::OrdKey,
+                    Constraint::Proj(ProjShape::OptOf(param_v)),
+                )
+                .into()),
                 Constraint::NumTree(_) => unreachable!("cannot solve param projection on int-set"),
                 Constraint::Equiv(ut) => match ut.as_ref() {
                     UType::Option(inner) => {
@@ -1786,6 +1812,13 @@ impl TypeChecker {
             Constraints::Variant(_) => unreachable!("cannot solve elem projection on union"),
             Constraints::Invariant(c) => match c {
                 Constraint::Elem(_) => unreachable!("cannot solve elem projection on base-set"),
+                // the byte-string case of a key
+                Constraint::OrdKey => {
+                    self.constraints[can_v.0] =
+                        Constraints::Invariant(Constraint::Proj(ProjShape::seq_of(elem_v)));
+                    self.unify_var_baseset(elem_v, BaseSet::Single(BaseType::U8))?;
+                    Ok(())
+                }
                 Constraint::NumTree(_) => unreachable!("cannot solve elem projection on int-set"),
                 Constraint::Equiv(ut) => match ut.as_ref() {
                     UType::Seq(inner, _) => {
@@ -2142,6 +2175,39 @@ impl TypeChecker {
         Ok(())
     }
 
+    /// Unifies `Constraint::OrdKey` with `c`, which decides between its two cases, an unsigned
+    /// integer and a byte string, unless `c` is vacuous or `OrdKey` itself.
+    ///
+    /// Returns the constraint that represents their unified form.
+    fn unify_ordkey(&mut self, c: Constraint) -> TCResult<Constraint> {
+        let unsatisfiable = |c: Constraint| -> TCResult<Constraint> {
+            Err(UnificationError::Unsatisfiable(Constraint::OrdKey, c).into())
+        };
+        match c {
+            Constraint::OrdKey => Ok(Constraint::OrdKey),
+            // the integer case
+            Constraint::Elem(bs) => Ok(bs.unify(BaseSet::UAny)?.to_constraint()),
+            Constraint::NumTree(is) => self.unify_baseset_intset(BaseSet::UAny, is),
+            // the byte-string case: its elements are `U8`, and its shape is kept as it is
+            Constraint::Proj(ProjShape::SeqOf(elem_v)) => {
+                self.unify_var_baseset(elem_v, BaseSet::Single(BaseType::U8))?;
+                Ok(Constraint::Proj(ProjShape::SeqOf(elem_v)))
+            }
+            c @ Constraint::Proj(_) => unsatisfiable(c),
+            Constraint::Equiv(ut) => match ut.as_ref() {
+                UType::Var(v) => self.unify_var_constraint(*v, Constraint::OrdKey),
+                // vacuous (`Empty` is the type of `Format::Fail`), so nothing is decided
+                UType::Hole | UType::Empty => Ok(Constraint::OrdKey),
+                UType::Base(_) | UType::Int(_) => self.unify_utype_baseset(ut, BaseSet::UAny),
+                UType::Seq(elem_t, _) => {
+                    self.unify_utype_baseset(elem_t.clone(), BaseSet::Single(BaseType::U8))?;
+                    Ok(Constraint::Equiv(ut))
+                }
+                _ => unsatisfiable(Constraint::Equiv(ut)),
+            },
+        }
+    }
+
     /// Takes two standalone `Constraint` objects and attempts to unify them, unifying any intermediate
     /// constraints that may occur in the same position in their expansion.
     ///
@@ -2150,6 +2216,7 @@ impl TypeChecker {
     /// If any subordinate unification results in an error, short-circuits and returns this error to the caller instead.
     fn unify_constraint_pair(&mut self, c1: Constraint, c2: Constraint) -> TCResult<Constraint> {
         match (c1, c2) {
+            (Constraint::OrdKey, c) | (c, Constraint::OrdKey) => self.unify_ordkey(c),
             // SECTION - homogenous recursive unification
             (Constraint::Equiv(t1), Constraint::Equiv(t2)) => {
                 if t1 == t2 {
@@ -2835,13 +2902,13 @@ impl TypeChecker {
 
                 newvar
             }
-            Expr::FindByKey(_is_sorted, f_get_key, query_key, seq_expr) => {
-                // NOTE - (is-sorted) ~> (x -> key) -> key -> [x] -> Option(T)
+            Expr::FindByKey(_mode, f_get_key, query_key, seq_expr) => {
+                // NOTE - KeySearch ~> (x -> key) -> key -> [x] -> Option(T), where key ~ OrdKey
                 let newvar = self.get_new_uvar();
 
                 let (elem_var, ret_var) = self.infer_vars_expr_lambda(f_get_key, scope)?;
                 let key_var = self.infer_var_expr(query_key, scope)?;
-                self.unify_var_baseset(key_var, BaseSet::UAny)?;
+                self.unify_var_constraint(key_var, Constraint::OrdKey)?;
                 let xs_var = self.infer_var_expr(seq_expr, scope)?;
 
                 let x_var = self.get_new_uvar();
@@ -3139,7 +3206,8 @@ impl TypeChecker {
                 Constraint::Proj(_proj) => {
                     return Err(TCErrorKind::NonNumeric(var, cx.clone()).into());
                 }
-                Constraint::NumTree(..) => {}
+                // read as `Elem(BaseSet::UAny)` until decided
+                Constraint::NumTree(..) | Constraint::OrdKey => {}
             },
         }
         Ok(())
@@ -3224,6 +3292,8 @@ impl TypeChecker {
                     },
                 },
                 Constraint::Proj(..) => Err(TCErrorKind::NonNumeric(uv, cx.clone()).into()),
+                // read as `Elem(BaseSet::UAny)` until decided, which has several solutions
+                Constraint::OrdKey => Ok(NumRep::Auto),
                 Constraint::NumTree(is) => match is {
                     IntSet::Single(pt) => {
                         let rep = MachineRep::from(*pt);
@@ -3286,6 +3356,7 @@ impl TypeChecker {
             Constraints::Invariant(c) => match c {
                 Constraint::Equiv(ut) => Some(self.to_whnf_vtype(ut.clone())),
                 Constraint::Elem(bs) => Some(VType::Base(*bs)),
+                Constraint::OrdKey => Some(VType::Base(BaseSet::UAny)),
                 Constraint::NumTree(is) => Some(VType::Int(*is)),
                 Constraint::Proj(ps) => Some(self.proj_shape_to_vtype(ps)),
             },
@@ -4255,6 +4326,7 @@ impl TypeChecker {
                 Constraint::Elem(BaseSet::U(us)) => us
                     .as_singleton()
                     .map_or(ValueType::NumericHole, ValueType::Base),
+                Constraint::OrdKey => ValueType::NumericHole,
                 &Constraint::NumTree(IntSet::Single(prim)) => ValueType::from(prim),
                 Constraint::NumTree(IntSet::Z(zs)) => zs
                     .as_singleton()
@@ -4287,6 +4359,10 @@ impl TypeChecker {
             match constraints {
                 Constraints::Invariant(Constraint::Elem(bs)) => {
                     bs.get_unique_solution(v)?;
+                }
+                // an undecided key, read as `Elem(BaseSet::UAny)` (which has no unique solution)
+                Constraints::Invariant(Constraint::OrdKey) => {
+                    BaseSet::UAny.get_unique_solution(v)?;
                 }
                 Constraints::Invariant(Constraint::NumTree(is)) => {
                     is.get_unique_solution(v)?;
@@ -4507,6 +4583,10 @@ impl TypeChecker {
                     Ok(b) => Expansion::Base(b),
                     Err(e) => unreachable!("{e} (should be caught by check_unique_solutions)"),
                 },
+                Constraint::OrdKey => match BaseSet::UAny.get_unique_solution(v) {
+                    Ok(b) => Expansion::Base(b),
+                    Err(e) => unreachable!("{e} (should be caught by check_unique_solutions)"),
+                },
                 Constraint::NumTree(is) => match is.get_unique_solution(v) {
                     Ok(i) => Expansion::Int(i),
                     Err(e) => unreachable!("{e} (should be caught by check_unique_solutions)"),
@@ -4696,7 +4776,7 @@ impl TypeChecker {
                 .any(|(_, ut)| self.utype_inhabited_step(ut, inhabited)),
             Constraints::Invariant(constraint) => match constraint {
                 Constraint::Equiv(ut) => self.utype_inhabited_step(ut, inhabited),
-                Constraint::Elem(..) | Constraint::NumTree(..) => true,
+                Constraint::Elem(..) | Constraint::NumTree(..) | Constraint::OrdKey => true,
                 Constraint::Proj(proj_shape) => match proj_shape {
                     ProjShape::TupleWith(ix_vars) => ix_vars.values().all(var_inhabited),
                     ProjShape::RecordWith(fld_vars) => fld_vars.values().all(var_inhabited),
@@ -4790,6 +4870,7 @@ mod __impl {
                 Constraint::Equiv(ut) => write!(f, "= {ut:?}"),
                 Constraint::Elem(bs) => write!(f, "∈ {bs}"),
                 Constraint::NumTree(is) => write!(f, "∈ {is}"),
+                Constraint::OrdKey => write!(f, "∈ OrdKey"),
                 Constraint::Proj(ps) => match ps {
                     ProjShape::TupleWith(ts) => write!(
                         f,
@@ -5126,6 +5207,205 @@ mod tests {
         ]);
         assert_eq!(output, expected);
         Ok(())
+    }
+
+    /// Unifies `OrdKey` with the constraint `other` builds, in both orders on fresh `TypeChecker`s,
+    /// checks that the two agree, and returns the result (with the `TypeChecker` and the variable
+    /// `other` was given, if any).
+    fn meet_ordkey(
+        other: impl Fn(&mut TypeChecker, UVar) -> Constraint,
+    ) -> TCResult<(TypeChecker, UVar, Constraint)> {
+        let mut results = Vec::new();
+        for ordkey_first in [true, false] {
+            let mut tc = TypeChecker::new();
+            let v = tc.get_new_uvar();
+            let inner = tc.get_new_uvar();
+            let c = other(&mut tc, inner);
+            let order = if ordkey_first {
+                [Constraint::OrdKey, c]
+            } else {
+                [c, Constraint::OrdKey]
+            };
+            let mut out = None;
+            for c in order {
+                out = Some(tc.unify_var_constraint(v, c));
+            }
+            results.push((tc, inner, out.unwrap()));
+        }
+        let (tc2, _, r2) = results.pop().unwrap();
+        let (tc1, inner, r1) = results.pop().unwrap();
+        match (r1, r2) {
+            (Ok(c1), Ok(c2)) => {
+                assert_eq!(c1, c2, "order-dependent result");
+                let resolved = |tc: &TypeChecker| tc.substitute_uvar_vtype(inner).ok().flatten();
+                assert_eq!(
+                    resolved(&tc1),
+                    resolved(&tc2),
+                    "order-dependent inner variable"
+                );
+                Ok((tc1, inner, c1))
+            }
+            (Err(e), Err(_)) => Err(e),
+            (r1, r2) => panic!("order-dependent outcome: {r1:?} vs {r2:?}"),
+        }
+    }
+
+    fn is_u8(tc: &TypeChecker, v: UVar) -> bool {
+        match &tc.constraints[tc.get_canonical_uvar(v).0] {
+            Constraints::Invariant(c) => {
+                c.clone().normalize() == Constraint::Elem(BaseSet::Single(BaseType::U8))
+            }
+            _ => false,
+        }
+    }
+
+    /// `OrdKey` meets every other kind of constraint as `unify_ordkey` specifies, with the same
+    /// outcome in either order.
+    #[test]
+    fn ordkey_collapses_by_partner() -> TCResult<()> {
+        let u = |b| Rc::new(UType::Base(b));
+        // the integer case
+        let (_, _, c) = meet_ordkey(|_, _| Constraint::Elem(BaseSet::Single(BaseType::U16)))?;
+        assert_eq!(
+            c.normalize(),
+            Constraint::Elem(BaseSet::Single(BaseType::U16))
+        );
+        let (_, _, c) = meet_ordkey(|_, _| Constraint::Equiv(u(BaseType::U32)))?;
+        assert_eq!(
+            c.normalize(),
+            Constraint::Elem(BaseSet::Single(BaseType::U32))
+        );
+        let (_, _, c) = meet_ordkey(|_, _| Constraint::NumTree(IntSet::ZAny))?;
+        assert!(
+            matches!(c, Constraint::Elem(_) | Constraint::NumTree(_)),
+            "{c:?}"
+        );
+        assert!(meet_ordkey(|_, _| Constraint::Elem(BaseSet::Single(BaseType::Bool))).is_err());
+        assert!(meet_ordkey(|_, _| Constraint::Equiv(u(BaseType::Char))).is_err());
+        // the byte-string case: the element becomes `U8`, and the shape is kept
+        let (tc, e, c) = meet_ordkey(|_, e| {
+            Constraint::Equiv(Rc::new(UType::Seq(
+                Rc::new(UType::Var(e)),
+                Default::default(),
+            )))
+        })?;
+        assert!(matches!(c, Constraint::Equiv(_)) && is_u8(&tc, e), "{c:?}");
+        let (tc, e, c) = meet_ordkey(|_, e| Constraint::Proj(ProjShape::SeqOf(e)))?;
+        assert_eq!(c, Constraint::Proj(ProjShape::SeqOf(e)));
+        assert!(is_u8(&tc, e));
+        assert!(
+            meet_ordkey(|_, _| Constraint::Equiv(Rc::new(UType::Seq(
+                u(BaseType::U16),
+                Default::default()
+            ))))
+            .is_err()
+        );
+        // neither case
+        assert!(meet_ordkey(|_, p| Constraint::Proj(ProjShape::OptOf(p))).is_err());
+        assert!(meet_ordkey(|_, _| Constraint::Equiv(Rc::new(UType::Tuple(vec![])))).is_err());
+        // vacuous, so undecided
+        let (_, _, c) = meet_ordkey(|_, _| Constraint::Equiv(Rc::new(UType::Empty)))?;
+        assert_eq!(c, Constraint::OrdKey);
+        // through a variable, which is then decided
+        let (tc, e, _) = meet_ordkey(|_, e| Constraint::Equiv(Rc::new(UType::Var(e))))?;
+        assert!(matches!(
+            tc.substitute_uvar_vtype(e),
+            Ok(Some(VType::Base(BaseSet::UAny)))
+        ));
+        Ok(())
+    }
+
+    /// Once one case of `OrdKey` is decided, the other is excluded.
+    #[test]
+    fn ordkey_decided_excludes_other_case() {
+        let mut tc = TypeChecker::new();
+        let v = tc.get_new_uvar();
+        let e = tc.get_new_uvar();
+        tc.unify_var_constraint(v, Constraint::OrdKey).unwrap();
+        tc.unify_var_proj_elem(v, e).unwrap();
+        assert!(is_u8(&tc, e));
+        assert!(
+            tc.unify_var_constraint(v, Constraint::Elem(BaseSet::UAny))
+                .is_err()
+        );
+
+        let mut tc = TypeChecker::new();
+        let v = tc.get_new_uvar();
+        let e = tc.get_new_uvar();
+        tc.unify_var_constraint(v, Constraint::OrdKey).unwrap();
+        tc.unify_var_constraint(v, Constraint::Elem(BaseSet::UAny))
+            .unwrap();
+        assert!(
+            tc.unify_var_constraint(v, Constraint::Proj(ProjShape::SeqOf(e)))
+                .is_err()
+        );
+    }
+
+    /// A projection other than a sequence element's is an error on an undecided key, not a panic.
+    #[test]
+    fn ordkey_rejects_other_projections() {
+        let mut tc = TypeChecker::new();
+        let v = tc.get_new_uvar();
+        let w = tc.get_new_uvar();
+        tc.unify_var_constraint(v, Constraint::OrdKey).unwrap();
+        assert!(tc.unify_var_proj_param(v, w).is_err());
+        assert!(tc.unify_var_proj_index(v, 0, w).is_err());
+        assert!(tc.unify_var_proj_field(v, Label::Borrowed("k"), w).is_err());
+    }
+
+    /// `FindByKey` keys: a byte string whose element type nothing else gives is `U8` (here every key
+    /// is empty), an integer key takes its type from the other side, and anything else is rejected.
+    #[test]
+    fn find_by_key_key_types() {
+        use crate::KeySearch;
+        use crate::helper::{find_by_key, poly_zero, record, tuple_proj, var};
+        let infer = |entries: Expr, query: Expr| {
+            let f: Format = record([
+                ("entries", compute(entries)),
+                (
+                    "found",
+                    compute(find_by_key(
+                        KeySearch::Last,
+                        |e| tuple_proj(e, 0),
+                        query,
+                        var("entries"),
+                    )),
+                ),
+            ]);
+            let mut tc = TypeChecker::new();
+            let module = FormatModule::new();
+            let scope = UScope::new();
+            let ut = tc.infer_utype_format(&f, Ctxt::new(&module, &scope))?;
+            tc.check_unique_solutions()?;
+            Ok::<_, TCError>(tc.reify(ut).expect("reify returned None"))
+        };
+        let entry = |k: Expr| Expr::Tuple(vec![k, Expr::U8(0)]);
+        // the key type of the `found` entry
+        let key_type = |t: AugValueType| match t {
+            AugValueType::Record(fields) => match &fields[1].1 {
+                AugValueType::Option(entry) => match entry.as_ref() {
+                    AugValueType::Tuple(ts) => ts[0].clone(),
+                    other => panic!("unexpected entry {other:?}"),
+                },
+                other => panic!("unexpected found {other:?}"),
+            },
+            other => panic!("unexpected record {other:?}"),
+        };
+        let empty = || Expr::Seq(vec![]);
+        let k = key_type(infer(Expr::Seq(vec![entry(empty())]), empty()).unwrap());
+        assert!(
+            matches!(&k, AugValueType::Seq(e, _) if **e == AugValueType::from(BaseType::U8)),
+            "{k:?}"
+        );
+        let k = key_type(infer(Expr::Seq(vec![entry(Expr::U16(1))]), poly_zero()).unwrap());
+        assert_eq!(k, AugValueType::from(BaseType::U16));
+        // not a key
+        assert!(infer(Expr::Seq(vec![entry(Expr::Bool(true))]), Expr::Bool(true)).is_err());
+        assert!(infer(Expr::Seq(vec![entry(Expr::UNIT)]), Expr::UNIT).is_err());
+        let u16s = Expr::Seq(vec![Expr::U16(1)]);
+        assert!(infer(Expr::Seq(vec![entry(u16s.clone())]), u16s).is_err());
+        // an integer and a byte string
+        assert!(infer(Expr::Seq(vec![entry(empty())]), Expr::U8(1)).is_err());
     }
 
     /// Checks that an auto-ascribed node that is never pinned to a specific Rep causes `infer_module`

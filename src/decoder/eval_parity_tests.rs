@@ -16,7 +16,7 @@ use std::rc::Rc;
 use super::{MultiScope, Scope, SeqKind, Value};
 use crate::loc_decoder::{LocMultiScope, LocScope, ParsedValue};
 use crate::numeric::core::{MachineRep, NumRep, TypedConst};
-use crate::{Arith, Expr, IntRel, Label, Pattern, TypeHint, ValueType};
+use crate::{Arith, Expr, IntRel, KeySearch, Label, Pattern, TypeHint, ValueType};
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
@@ -379,7 +379,7 @@ fn cases() -> Vec<Case> {
         parity(
             "find_by_key_unsorted",
             Expr::FindByKey(
-                false,
+                KeySearch::First,
                 b(lam("x", var("x"))),
                 b(Expr::U8(2)),
                 b(seq_u8(&[3, 2, 1])),
@@ -388,7 +388,7 @@ fn cases() -> Vec<Case> {
         parity(
             "find_by_key_sorted_hit",
             Expr::FindByKey(
-                true,
+                KeySearch::Sorted,
                 b(lam("x", var("x"))),
                 b(Expr::U8(2)),
                 b(seq_u8(&[1, 2, 3])),
@@ -397,10 +397,28 @@ fn cases() -> Vec<Case> {
         parity(
             "find_by_key_missing",
             Expr::FindByKey(
-                true,
+                KeySearch::Sorted,
                 b(lam("x", var("x"))),
                 b(Expr::U8(9)),
                 b(seq_u8(&[1, 2, 3])),
+            ),
+        ),
+        parity(
+            "find_by_key_bytes_last",
+            Expr::FindByKey(
+                KeySearch::Last,
+                b(lam("x", var("x"))),
+                b(seq_u8(b"ab")),
+                b(Expr::Seq(vec![seq_u8(b"a"), seq_u8(b"ab"), seq_u8(b"b")])),
+            ),
+        ),
+        parity(
+            "find_by_key_bytes_sorted",
+            Expr::FindByKey(
+                KeySearch::Sorted,
+                b(lam("x", var("x"))),
+                b(seq_u8(b"ab")),
+                b(Expr::Seq(vec![seq_u8(b"a"), seq_u8(b"ab"), seq_u8(b"b")])),
             ),
         ),
         // -- pattern-matching

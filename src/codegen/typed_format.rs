@@ -16,8 +16,8 @@ use crate::numeric::elaborator::TypedExpr as TypedNumExpr;
 use crate::recursion::{OpenSet, RecursiveBounds, guarded_bounds};
 use crate::validation::TypedCondition;
 use crate::{
-    Arith, BaseKind, Endian, FormatRef, IntRel, Label, RepeatRange, StyleHint, TypeHint, UnaryOp,
-    format::LookaheadEffect,
+    Arith, BaseKind, Endian, FormatRef, IntRel, KeySearch, Label, RepeatRange, StyleHint, TypeHint,
+    UnaryOp, format::LookaheadEffect,
 };
 
 pub(crate) mod variables;
@@ -969,7 +969,7 @@ where
     ),
     FindByKey(
         TypeRep,
-        bool,
+        KeySearch,
         Box<TypedExpr<TypeRep, VarId>>,
         Box<TypedExpr<TypeRep, VarId>>,
         Box<TypedExpr<TypeRep, VarId>>,
@@ -1095,8 +1095,8 @@ impl<TypeRep> std::hash::Hash for TypedExpr<TypeRep> {
                 acc.hash(state);
                 seq.hash(state);
             }
-            TypedExpr::FindByKey(_, is_sorted, f, key, seq) => {
-                is_sorted.hash(state);
+            TypedExpr::FindByKey(_, mode, f, key, seq) => {
+                mode.hash(state);
                 f.hash(state);
                 key.hash(state);
                 seq.hash(state);
@@ -1419,8 +1419,8 @@ mod __impls {
                 TypedExpr::LeftFold(_, lambda, acc, vt, seq) => {
                     Expr::LeftFold(rebox(lambda), rebox(acc), vt, rebox(seq))
                 }
-                TypedExpr::FindByKey(_, is_sorted, lambda, key, seq) => {
-                    Expr::FindByKey(is_sorted, rebox(lambda), rebox(key), rebox(seq))
+                TypedExpr::FindByKey(_, mode, lambda, key, seq) => {
+                    Expr::FindByKey(mode, rebox(lambda), rebox(key), rebox(seq))
                 }
                 TypedExpr::FlatMapList(_, lambda, vt, seq) => {
                     Expr::FlatMapList(rebox(lambda), vt, rebox(seq))

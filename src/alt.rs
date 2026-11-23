@@ -1741,8 +1741,13 @@ mod __impls {
                                 ValueTypeExt::Base(b) if b.is_numeric() => {
                                     Ok(ValueTypeExt::Option(t))
                                 }
+                                ValueTypeExt::Seq(b)
+                                    if matches!(b.as_ref(), ValueTypeExt::Base(BaseType::U8)) =>
+                                {
+                                    Ok(ValueTypeExt::Option(t))
+                                }
                                 other => Err(anyhow!(
-                                    "FindByKey: expected numeric key type, found {other:?}"
+                                    "FindByKey: expected an unsigned or byte-string key type, found {other:?}"
                                 )),
                             }
                         }

@@ -145,6 +145,20 @@ pub enum UnaryOp {
     IntPred,
 }
 
+/// How [`Expr::FindByKey`] searches its sequence, and so which element it returns when several
+/// have the query key.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize)]
+pub enum KeySearch {
+    /// Binary search, for a sequence sorted by key (ascending). Of several matches, the first
+    /// (leftmost) is returned.
+    Sorted,
+    /// Linear search from the start: the first match is returned.
+    First,
+    /// Linear search from the end: the last match is returned (as when a later entry overrides an
+    /// earlier one, e.g. a PDF dictionary key).
+    Last,
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize)]
 #[serde(tag = "tag", content = "data")]
 pub enum Expr {
@@ -201,8 +215,10 @@ pub enum Expr {
     FlatMapAccum(Box<Expr>, Box<Expr>, TypeHint, Box<Expr>),
     /// FlatMapList :: ((\[U\], T) -> \[U\]) -> TypeRep U -> \[T\] -> \[U\] (lambda call yields a run of values to append to the final list)
     FlatMapList(Box<Expr>, TypeHint, Box<Expr>),
-    /// FindByKey :: (is-sorted) -> (T -> K) -> K -> \[T\] ->  Option(T) (is-sorted indicates whether the values are sorted w.r.t. the keying function in question; only simple types can be keys for now)
-    FindByKey(bool, Box<Expr>, Box<Expr>, Box<Expr>),
+    /// FindByKey :: KeySearch -> (T -> K) -> K -> \[T\] -> Option(T), returning the element whose key
+    /// (by the keying function) equals the query, as chosen by the [`KeySearch`] mode. A key is an
+    /// unsigned integer or a byte string (`Seq(U8)`, ordered lexicographically for `Sorted`).
+    FindByKey(KeySearch, Box<Expr>, Box<Expr>, Box<Expr>),
 
     /// EnumFromTo :: (Num, Num) -> \[Num\]
     EnumFromTo(Box<Expr>, Box<Expr>),
@@ -269,6 +285,20 @@ fn bool_or_any(t: &ValueType) -> bool {
 
 /// The element type of a sequence type `t`: `Any` or `Empty` if `t` is itself, or `None` if `t`
 /// is not a sequence.
+/// Whether `t` can be an [`Expr::FindByKey`] key: an unsigned integer or a byte string, where `Any`
+/// (a not-yet-known type) and `Empty` (never produced) pass, here and as the byte type.
+fn is_key_type_or_any(t: &ValueType) -> bool {
+    match t {
+        ValueType::Seq(elem) => matches!(
+            elem.as_ref(),
+            ValueType::Base(BaseType::U8) | ValueType::Any | ValueType::Empty
+        ),
+        ValueType::Base(b) => b.is_numeric(),
+        ValueType::Any | ValueType::Empty => true,
+        _ => false,
+    }
+}
+
 fn seq_elem_or_any(t: ValueType) -> Option<ValueType> {
     match t {
         ValueType::Seq(elem) => Some(*elem),
@@ -634,14 +664,13 @@ impl Expr {
                         let key_type = query_key.infer_type(scope)?;
                         let mut child_scope = TypeScope::child(scope);
                         child_scope.push(name.clone(), t.clone());
-                        match scope.unify(&expr.infer_type(&child_scope)?, &key_type)? {
-                            ValueType::Base(b) if b.is_numeric() => {
-                                Ok(ValueType::Option(Box::new(t)))
-                            }
-                            ValueType::Any => Ok(ValueType::Option(Box::new(t))),
-                            other => Err(anyhow!(
-                                "FindByKey: expected numeric key type, found {other:?}"
-                            )),
+                        let key_type = scope.unify(&expr.infer_type(&child_scope)?, &key_type)?;
+                        if is_key_type_or_any(&key_type) {
+                            Ok(ValueType::Option(Box::new(t)))
+                        } else {
+                            Err(anyhow!(
+                                "FindByKey: expected an unsigned or byte-string key type, found {key_type:?}"
+                            ))
                         }
                     }
                     None => Err(anyhow!(

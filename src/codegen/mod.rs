@@ -10,8 +10,8 @@ use trace::get_and_increment_seed;
 
 use crate::{
     Arith, BaseType, CommonOp, DynFormat, Expr, FixedReadKind, Format, FormatModule, FormatRef,
-    IntRel, IntoLabel, Label, MatchTree, Pattern, RepeatRange, StyleHint, UnaryOp, ViewExpr,
-    ViewFormat,
+    IntRel, IntoLabel, KeySearch, Label, MatchTree, Pattern, RepeatRange, StyleHint, UnaryOp,
+    ViewExpr, ViewFormat,
     bounds::Bounds,
     byte_set::ByteSet,
     codegen::typed_format::TypedFixedReadKind,
@@ -1774,23 +1774,41 @@ fn embed_expr(expr: &GTExpr, info: ExprInfo) -> RustExpr {
                 embed_lambda_dft(f, ClosureKind::PairBorrowOwned, true),
             ])
             .wrap_try(),
-        TypedExpr::FindByKey(ty, is_sorted, f, query, seq) => {
-            let method = if *is_sorted {
-                "find_by_key_sorted"
+        TypedExpr::FindByKey(ty, mode, f, query, seq) => {
+            // A byte-string key is borrowed as a slice (by the key closure, and for the query), and
+            // any other key, an unsigned integer, is copied
+            let is_bytes = query
+                .get_type()
+                .is_some_and(|t| t.to_rust_type().is_seq_or_slice());
+            let method = match (mode, is_bytes) {
+                (KeySearch::Sorted, false) => "find_by_key_sorted",
+                (KeySearch::First, false) => "find_by_key_unsorted",
+                (KeySearch::Last, false) => "find_by_key_last",
+                (KeySearch::Sorted, true) => "find_by_bytes_key_sorted",
+                (KeySearch::First, true) => "find_by_bytes_key_first",
+                (KeySearch::Last, true) => "find_by_bytes_key_last",
+            };
+            let (key_kind, query) = if is_bytes {
+                (
+                    ClosureKind::ExtractKeyRef,
+                    embed_expr(query, ExprInfo::Natural).vec_as_slice(),
+                )
             } else {
-                "find_by_key_unsorted"
+                (
+                    ClosureKind::ExtractKey,
+                    embed_expr(query, ExprInfo::Natural),
+                )
             };
             fn mk_name() -> &'static str {
                 "tmp"
             }
             embed_expr_nat(seq).use_as_persistent(
                 |seq| {
+                    // The prelude searches a slice. A `Vec`-typed sequence may be an owned `Vec` (e.g.
+                    // decoded locally) or a slice (a decoder argument), and `vec_as_slice` suits both.
+                    let seq = seq.vec_as_slice();
                     RustExpr::local(method)
-                        .call_with([
-                            embed_lambda_dft(f, ClosureKind::ExtractKey, false),
-                            embed_expr(query, ExprInfo::Natural),
-                            seq,
-                        ])
+                        .call_with([embed_lambda_dft(f, key_kind, false), query, seq])
                         .owned_opt_ref(ty.to_rust_type())
                 },
                 mk_name,
@@ -2365,6 +2383,20 @@ pub(crate) enum ClosureKind {
     /// data-member of the argument, e.g. a field or positional argument thereof, `FindByKey` is preferred over `Predicate`. For boolean predicates or
     /// general computations that don't uniquely identify the argument, `Predicate` is preferred.
     ExtractKey,
+    /// Category for closures that extract a byte-string key from a borrowed complex type, borrowing it
+    /// as a slice rather than copying it out, for `Expr::FindByKey` on `Seq(U8)` keys: `|_: &T| -> &[u8]`
+    ExtractKeyRef,
+}
+
+impl ClosureKind {
+    /// Shapes the embedded body of a closure of this kind: an `ExtractKeyRef` body is borrowed as a
+    /// slice, which is valid whether it is a `Vec<u8>` or already a slice.
+    fn shape_body(self, body: RustExpr) -> RustExpr {
+        match self {
+            ClosureKind::ExtractKeyRef => body.vec_as_slice(),
+            _ => body,
+        }
+    }
 }
 
 /// Transcribes `GTExpr::Lambda` instances into RustExpr values.
@@ -2385,8 +2417,8 @@ pub(crate) enum ClosureKind {
 fn embed_lambda(expr: &GTExpr, kind: ClosureKind, needs_ok: bool, info: ExprInfo) -> RustExpr {
     match expr {
         TypedExpr::Lambda((head_t, _), head, body) => match kind {
-            ClosureKind::Predicate | ClosureKind::ExtractKey => {
-                let expansion = embed_expr(body, info);
+            ClosureKind::Predicate | ClosureKind::ExtractKey | ClosureKind::ExtractKeyRef => {
+                let expansion = kind.shape_body(embed_expr(body, info));
                 // NOTE - despite the name, `new_predicate` also applies for ExtractKey-style closures
                 RustExpr::Closure(RustClosure::new_predicate(
                     head.clone(),
@@ -2511,12 +2543,14 @@ impl GenLambda {
         match param.as_local() {
             Some(outer) => {
                 if **outer == *self.head {
-                    embed_expr(&self.body, body_info)
+                    self.kind.shape_body(embed_expr(&self.body, body_info))
                 } else if let Some(rebound) = self.try_alpha_convert(outer) {
-                    embed_expr(&rebound.body, body_info)
+                    self.kind.shape_body(embed_expr(&rebound.body, body_info))
                 } else {
                     let bind_param_and_head = match self.kind {
-                        ClosureKind::Predicate | ClosureKind::ExtractKey => {
+                        ClosureKind::Predicate
+                        | ClosureKind::ExtractKey
+                        | ClosureKind::ExtractKeyRef => {
                             let bind_param_to_head =
                                 RustStmt::assign(self.head.clone(), RustExpr::borrow_of(param));
                             vec![bind_param_to_head]
@@ -2556,7 +2590,7 @@ impl GenLambda {
                             vec![bind_param_to_tuple, bind_tuple_to_head]
                         }
                     };
-                    let expansion = embed_expr(&self.body, body_info);
+                    let expansion = self.kind.shape_body(embed_expr(&self.body, body_info));
                     RustExpr::BlockScope(bind_param_and_head, Box::new(expansion))
                 }
             }
@@ -2733,7 +2767,7 @@ impl GenLambda {
             (ClosureKind::PairOwnedBorrow, true) => {
                 self.__apply_pair(param0, RustExpr::borrow_of(param1), body_info)
             }
-            (other @ ClosureKind::ExtractKey, true) => {
+            (other @ (ClosureKind::ExtractKey | ClosureKind::ExtractKeyRef), true) => {
                 unreachable!("unexpected ClosureKind for apply_pair: {other:?}")
             }
         }
@@ -2778,8 +2812,8 @@ impl GenLambda {
 
     fn embed(&self, info: ExprInfo) -> RustExpr {
         match self.kind {
-            ClosureKind::Predicate | ClosureKind::ExtractKey => {
-                let expansion = embed_expr(&self.body, info);
+            ClosureKind::Predicate | ClosureKind::ExtractKey | ClosureKind::ExtractKeyRef => {
+                let expansion = self.kind.shape_body(embed_expr(&self.body, info));
                 RustExpr::Closure(RustClosure::new_predicate(
                     self.head.clone(),
                     Some(self.head_type.clone().to_rust_type()),
@@ -6247,7 +6281,7 @@ impl<'a> Elaborator<'a> {
                     Box::new(t_seq),
                 )
             }
-            Expr::FindByKey(_is_sorted, f_get_key, query_key, seq) => {
+            Expr::FindByKey(mode, f_get_key, query_key, seq) => {
                 self.codegen.name_gen.ctxt.push_atom(NameAtom::DeadEnd);
                 let t_f_get_key = self.elaborate_expr_lambda(f_get_key);
                 self.codegen.name_gen.ctxt.escape();
@@ -6266,7 +6300,7 @@ impl<'a> Elaborator<'a> {
 
                 TypedExpr::FindByKey(
                     gt,
-                    *_is_sorted,
+                    *mode,
                     Box::new(t_f_get_key),
                     Box::new(t_query_key),
                     Box::new(t_seq),

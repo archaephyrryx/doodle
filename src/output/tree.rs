@@ -2,6 +2,7 @@ use core::panic;
 use std::{fmt, io, rc::Rc};
 
 use crate::FixedReadKind;
+use crate::KeySearch;
 use crate::precedence::{Precedence, cond_paren};
 use crate::validation::{Condition, Severity};
 use crate::{
@@ -2116,12 +2117,12 @@ impl<'module> TreePrinter<'module> {
                 prec,
                 Precedence::FUN_APPLICATION,
             ),
-            Expr::FindByKey(is_sorted, keying_fn, query, seq) => cond_paren(
+            Expr::FindByKey(search, keying_fn, query, seq) => cond_paren(
                 Self::prefix_op(
-                    if *is_sorted {
-                        "binary-search"
-                    } else {
-                        "linear-search"
+                    match search {
+                        KeySearch::Sorted => "binary-search",
+                        KeySearch::First => "linear-search",
+                        KeySearch::Last => "linear-search-last",
                     },
                     Some(&[keying_fn, query]),
                     seq,

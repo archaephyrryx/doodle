@@ -35,6 +35,11 @@ path = "tests/recursive_args/mod.rs"
 test = true
 
 [[test]]
+name = "find_by_key"
+path = "tests/find_by_key/mod.rs"
+test = true
+
+[[test]]
 name = "permit_state_error"
 path = "tests/permit_state_error/mod.rs"
 test = true

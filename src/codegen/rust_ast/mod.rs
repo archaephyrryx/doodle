@@ -972,6 +972,17 @@ impl RustType {
         }
     }
 
+    /// Whether `self` is a sequence: a `Vec`, or a borrowed slice or `Vec`.
+    pub(crate) fn is_seq_or_slice(&self) -> bool {
+        match self {
+            RustType::Atom(AtomType::Comp(CompType::Vec(..) | CompType::RawSlice(..))) => true,
+            RustType::Atom(AtomType::Comp(CompType::Borrow(_, _, inner))) => {
+                inner.is_seq_or_slice()
+            }
+            _ => false,
+        }
+    }
+
     /// Returns the most natural form of `self` to be used when being borrowed, as
     /// in `[T]` to replace `Vec<T>`.
     fn deref_tgt(self) -> RustType {

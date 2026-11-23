@@ -14,7 +14,7 @@ use std::borrow::Cow;
 use crate::error::EvalError;
 use crate::numeric::core::{CoerceValueError, StrictValue};
 use crate::scope::{GMultiScope, GScope, GSingleScope};
-use crate::{Expr, Label, Pattern};
+use crate::{Expr, KeySearch, Label, Pattern};
 
 use super::seq_kind::{SeqBoundsOp, ValueSeq, sub_range};
 use super::value::{Coerced, IntTag, Value};
@@ -387,7 +387,7 @@ impl Expr {
                     _ => panic!("LeftFold: expected Seq"),
                 }
             }
-            Expr::FindByKey(is_sorted, f_get_key, query_key, seq) => {
+            Expr::FindByKey(mode, f_get_key, query_key, seq) => {
                 match seq
                     .eval_generic(scope)?
                     .coerce_mapped_value()
@@ -396,21 +396,28 @@ impl Expr {
                     Some(ValueSeq::ValueSeq(values)) => {
                         let query = query_key.eval_value_generic(scope)?;
                         // `search` is shared with `decoder`/`loc_decoder` and expects an infallible evaluator, so
-                        // the first error is stashed here (the sentinel `query` key makes the search terminate
-                        // immediately)
+                        // the first error is stashed here and a sentinel `query` key returned in its place (a
+                        // linear search stops there; a binary search may evaluate more keys)
                         let eval_err = std::cell::Cell::new(None);
                         let eval =
                             |lambda: &Expr, arg: &V| match lambda.eval_lambda_generic(scope, arg) {
                                 Ok(key) => key,
                                 Err(err) => {
-                                    eval_err.set(Some(err));
+                                    let first = eval_err.take().unwrap_or(err);
+                                    eval_err.set(Some(first));
                                     query.clone()
                                 }
                             };
-                        let found = if *is_sorted {
-                            search::find_index_by_key_sorted(f_get_key, &query, values, eval)
-                        } else {
-                            search::find_index_by_key_unsorted(f_get_key, &query, values, eval)
+                        let found = match mode {
+                            KeySearch::Sorted => {
+                                search::find_index_by_key_sorted(f_get_key, &query, values, eval)
+                            }
+                            KeySearch::First => search::find_index_by_key_linear(
+                                f_get_key, &query, values, eval, false,
+                            ),
+                            KeySearch::Last => search::find_index_by_key_linear(
+                                f_get_key, &query, values, eval, true,
+                            ),
                         };
                         // A key-lambda error takes priority, as it may have caused a spurious comparison error
                         if let Some(err) = eval_err.take() {
@@ -745,6 +752,119 @@ mod tests {
         );
     }
 
+    /// `(key, tag)` entries, searched by `key` with mode `mode` for `query`; returns the matched
+    /// entry's `tag`, or `None`.
+    fn find_tag(mode: KeySearch, query: Expr, entries: Vec<(Expr, u8)>) -> Option<u8> {
+        let seq = Expr::Seq(
+            entries
+                .into_iter()
+                .map(|(k, t)| Expr::Tuple(vec![k, Expr::U8(t)]))
+                .collect(),
+        );
+        let key = lam("e", Expr::TupleProj(b(var("e")), 0));
+        match eval_ok(&Expr::FindByKey(mode, b(key), b(query), b(seq))) {
+            Value::Option(None) => None,
+            Value::Option(Some(entry)) => match *entry {
+                Value::Tuple(fields) => match fields[1] {
+                    Value::U8(t) => Some(t),
+                    ref other => panic!("unexpected tag {other:?}"),
+                },
+                other => panic!("unexpected entry {other:?}"),
+            },
+            other => panic!("unexpected result {other:?}"),
+        }
+    }
+
+    /// Each mode picks its specified element when keys are duplicated: `Sorted` and `First` the
+    /// first, `Last` the last (including when the duplicates span the middle of a binary search).
+    #[test]
+    fn find_by_key_duplicates_follow_the_mode() {
+        let entries = || {
+            [(1, 0), (2, 1), (2, 2), (2, 3), (3, 4)]
+                .map(|(k, t)| (Expr::U8(k), t))
+                .to_vec()
+        };
+        assert_eq!(find_tag(KeySearch::Sorted, Expr::U8(2), entries()), Some(1));
+        assert_eq!(find_tag(KeySearch::First, Expr::U8(2), entries()), Some(1));
+        assert_eq!(find_tag(KeySearch::Last, Expr::U8(2), entries()), Some(3));
+        for mode in [KeySearch::Sorted, KeySearch::First, KeySearch::Last] {
+            assert_eq!(find_tag(mode, Expr::U8(1), entries()), Some(0));
+            assert_eq!(find_tag(mode, Expr::U8(3), entries()), Some(4));
+            assert_eq!(find_tag(mode, Expr::U8(0), entries()), None);
+            assert_eq!(find_tag(mode, Expr::U8(4), entries()), None);
+            assert_eq!(find_tag(mode, Expr::U8(2), vec![]), None);
+        }
+        // every key equal: the leftmost, from either end of the binary search
+        let same = || (0..6).map(|t| (Expr::U8(7), t)).collect::<Vec<_>>();
+        assert_eq!(find_tag(KeySearch::Sorted, Expr::U8(7), same()), Some(0));
+        assert_eq!(find_tag(KeySearch::Last, Expr::U8(7), same()), Some(5));
+    }
+
+    /// Byte-string keys are compared by content, and ordered lexicographically for `Sorted` (a
+    /// proper prefix first).
+    #[test]
+    fn find_by_key_byte_string_keys() {
+        let keys: [&[u8]; 6] = [b"", b"a", b"ab", b"abc", b"b", b"ba"];
+        let entries = || {
+            keys.iter()
+                .enumerate()
+                .map(|(t, k)| (seq_u8(k), t as u8))
+                .collect::<Vec<_>>()
+        };
+        for mode in [KeySearch::Sorted, KeySearch::First, KeySearch::Last] {
+            for (t, k) in keys.iter().enumerate() {
+                assert_eq!(
+                    find_tag(mode, seq_u8(k), entries()),
+                    Some(t as u8),
+                    "{mode:?} {k:?}"
+                );
+            }
+            for k in [&b"aa"[..], b"abcd", b"c", b"bb"] {
+                assert_eq!(find_tag(mode, seq_u8(k), entries()), None, "{mode:?} {k:?}");
+            }
+        }
+        // a later duplicate overrides an earlier one only under `Last`
+        let dict = || vec![(seq_u8(b"/W"), 0), (seq_u8(b"/N"), 1), (seq_u8(b"/W"), 2)];
+        assert_eq!(find_tag(KeySearch::First, seq_u8(b"/W"), dict()), Some(0));
+        assert_eq!(find_tag(KeySearch::Last, seq_u8(b"/W"), dict()), Some(2));
+    }
+
+    /// A key or key byte read from parsed data may be wrapped (`Mapped`, `Branch`), and is compared
+    /// as the value it wraps.
+    #[test]
+    fn find_by_key_sees_through_wrapped_keys() {
+        let wrap = |v: Value| {
+            Value::Branch(
+                0,
+                Box::new(Value::Mapped(Box::new(Value::U8(0)), Box::new(v))),
+            )
+        };
+        let key = Value::Seq(SeqKind::Strict(vec![
+            wrap(Value::U8(b'/')),
+            wrap(Value::U8(b'W')),
+        ]));
+        let entries = Value::Seq(SeqKind::Strict(vec![wrap(key)]));
+        let root = Scope::Empty;
+        let mut multi = crate::decoder::MultiScope::with_capacity(&root, 1);
+        multi.push_owned("entries", entries);
+        let scope = Scope::Multi(&multi);
+        for mode in [KeySearch::Sorted, KeySearch::First, KeySearch::Last] {
+            let expr = Expr::FindByKey(
+                mode,
+                b(lam("e", var("e"))),
+                b(seq_u8(b"/W")),
+                b(var("entries")),
+            );
+            assert!(
+                matches!(
+                    expr.eval_value_generic(&scope).unwrap(),
+                    Value::Option(Some(_))
+                ),
+                "{mode:?}"
+            );
+        }
+    }
+
     /// Regression test for the `FindByKey` rework (items 5/9): the matched element's *real*
     /// parse-location should survive, not get flattened to `Value` and re-synthesized.
     #[test]
@@ -766,7 +886,12 @@ mod tests {
         multi.push("seq", &seq_value);
         let scope = LocScope::Multi(&multi);
 
-        let expr = Expr::FindByKey(true, b(lam("x", var("x"))), b(Expr::U8(2)), b(var("seq")));
+        let expr = Expr::FindByKey(
+            KeySearch::Sorted,
+            b(lam("x", var("x"))),
+            b(Expr::U8(2)),
+            b(var("seq")),
+        );
         let result = expr.eval_generic(&scope).unwrap().into_owned();
         let ParsedValue::Option(Some(matched)) = result else {
             panic!("expected Option(Some(_)), got {result:?}");

@@ -1,30 +1,53 @@
 use crate::Expr;
-use crate::decoder::{EvalError, Value, seq_kind::SeqKind};
+use crate::decoder::{
+    EvalError, Value,
+    seq_kind::{SeqKind, ValueSeq},
+};
 
 /// Trait providing key-comparison functionality used in binary search to an interpreter value-node,
 /// notably `Value` and `ParsedValue`. Used to implement `find_index_by_key_sorted`
 pub(crate) trait AsKey {
-    /// Compares two values as keys, using natural order on the types being represented.
-    ///
-    /// Currently, only applies to strictly-numeric Value kinds (U8, etc.)
+    /// Compares two values as keys, using natural order on the types being represented: numeric
+    /// order on integers, and lexicographic order on byte strings (`Seq(U8)`, a proper prefix
+    /// ordered first).
     ///
     /// Returns an error if a `Numeric` key cannot be coerced to the type of the other key
     /// (e.g. `-1` against a `U8`).
     fn compare_as_key(&self, other: &Self) -> Result<std::cmp::Ordering, EvalError>;
 
-    /// Tests equality over two values as keys, using natural equality on the types being represented.
-    ///
-    /// Currently, only applies to strictly-numeric Value kinds (U8, etc.), to mirror `compare_as_key`
-    /// (even though more complex equalities can be established on value-kinds without natural ordering).
+    /// Tests equality over two values as keys, mirroring `compare_as_key`.
     ///
     /// Returns an error under the same conditions as `compare_as_key`.
     fn eq_key(&self, other: &Self) -> Result<bool, EvalError>;
 }
 
+/// The elements of a byte-string key, or `None` if `v` is not a sequence.
+fn key_elems(v: &Value) -> Option<&SeqKind<Value>> {
+    match v.get_sequence()? {
+        ValueSeq::ValueSeq(elems) => Some(elems),
+        ValueSeq::IntRange(..) => unimplemented!("FindByKey: unimplemented on IntRange keys"),
+    }
+}
+
 impl AsKey for Value {
     fn compare_as_key(&self, other: &Self) -> Result<std::cmp::Ordering, EvalError> {
+        // A key read from parsed data may be wrapped (e.g. `Mapped` or `Branch`), as may each of
+        // its bytes.
+        let (this, that) = (
+            self.coerce_mapped_value().into_inner(),
+            other.coerce_mapped_value().into_inner(),
+        );
+        if let (Some(xs), Some(ys)) = (key_elems(this), key_elems(that)) {
+            for (x, y) in xs.iter().zip(ys.iter()) {
+                let ord = x.compare_as_key(y)?;
+                if ord.is_ne() {
+                    return Ok(ord);
+                }
+            }
+            return Ok(xs.len().cmp(&ys.len()));
+        }
         let (this, that) =
-            Value::to_uniform_integer_pair(self, other).map_err(EvalError::NumericConvert)?;
+            Value::to_uniform_integer_pair(this, that).map_err(EvalError::NumericConvert)?;
         Ok(match (this.as_ref(), that.as_ref()) {
             (Value::U8(a), Value::U8(b)) => a.cmp(b),
             (Value::U16(a), Value::U16(b)) => a.cmp(b),
@@ -39,8 +62,23 @@ impl AsKey for Value {
     }
 
     fn eq_key(&self, other: &Self) -> Result<bool, EvalError> {
+        let (this, that) = (
+            self.coerce_mapped_value().into_inner(),
+            other.coerce_mapped_value().into_inner(),
+        );
+        if let (Some(xs), Some(ys)) = (key_elems(this), key_elems(that)) {
+            if xs.len() != ys.len() {
+                return Ok(false);
+            }
+            for (x, y) in xs.iter().zip(ys.iter()) {
+                if !x.eq_key(y)? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
         let (this, that) =
-            Value::to_uniform_integer_pair(self, other).map_err(EvalError::NumericConvert)?;
+            Value::to_uniform_integer_pair(this, that).map_err(EvalError::NumericConvert)?;
         Ok(match (this.as_ref(), that.as_ref()) {
             (Value::U8(a), Value::U8(b)) => a == b,
             (Value::U16(a), Value::U16(b)) => a == b,
@@ -69,6 +107,8 @@ impl<T> KeyCache<T> {
     }
 }
 
+/// Binary search for `query` in `values`, which are sorted (ascending) by key. Of several matching
+/// elements, returns the index of the first (leftmost), as `KeySearch::Sorted` specifies.
 pub(crate) fn find_index_by_key_sorted<'a, V, V0, Eval>(
     f_get_key: &Expr,
     query: &V,
@@ -81,11 +121,6 @@ where
     V0: Clone,
 {
     use std::cmp::Ordering;
-    // If values is empty, search is trivial
-    if values.is_empty() {
-        return Ok(None);
-    }
-
     let len = values.len();
 
     // cache to store keys we have seen after computing them once
@@ -93,70 +128,40 @@ where
     // helper closure to keep code below lightweight and more implementation-agnostic
     let get_key_at_index = |ix: usize| cache.get_or_init(ix, || evaluate(f_get_key, &values[ix]));
 
-    // check boundaries, once only, at very start
-    let lower_bound = get_key_at_index(0);
-
-    // don't bother evaluating upper_bound if query <= lower-bound
-    match query.compare_as_key(lower_bound)? {
-        Ordering::Less => return Ok(None),
-        Ordering::Equal => return Ok(Some(0)),
-        Ordering::Greater => {
-            // skip computing 'upper bound' on singleton list
-            if len <= 1 {
-                return Ok(None);
-            }
+    // The partition point: the first index whose key is not less than `query`.
+    let (mut lo, mut hi) = (0, len);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match get_key_at_index(mid).compare_as_key(query)? {
+            Ordering::Less => lo = mid + 1,
+            Ordering::Equal | Ordering::Greater => hi = mid,
         }
     }
-
-    // safe because values cannot be empty
-    let last_ix = len - 1;
-    let upper_bound = get_key_at_index(last_ix);
-
-    match query.compare_as_key(upper_bound)? {
-        Ordering::Greater => return Ok(None),
-        Ordering::Equal => return Ok(Some(last_ix)),
-        Ordering::Less => {
-            // skip entire loop when there are no middle values
-            if len <= 2 {
-                return Ok(None);
-            }
-        }
+    if lo < len && get_key_at_index(lo).eq_key(query)? {
+        Ok(Some(lo))
+    } else {
+        Ok(None)
     }
-
-    // binary search, after already checking edge-cases bounds
-
-    let mut lower_bound_ix = 0;
-    let mut upper_bound_ix = last_ix;
-
-    while lower_bound_ix <= upper_bound_ix {
-        // if lower_bound_ix == upper_bound_ix, this will converge to that
-        // value, and any branch below besides return, will break the loop
-        // condition
-        let mid = (lower_bound_ix + upper_bound_ix) / 2;
-
-        let mid_key = get_key_at_index(mid);
-        match query.compare_as_key(mid_key)? {
-            Ordering::Less => upper_bound_ix = mid - 1,
-            Ordering::Equal => return Ok(Some(mid)),
-            Ordering::Greater => lower_bound_ix = mid + 1,
-        }
-    }
-    Ok(None)
 }
 
-pub(crate) fn find_index_by_key_unsorted<'a, V, V0, Eval>(
+/// Linear search for `query` in `values`, returning the index of the first match, or of the last if
+/// `from_end` is set (`KeySearch::First` and `KeySearch::Last`). Stops at the match it returns.
+pub(crate) fn find_index_by_key_linear<'a, V, V0, Eval>(
     f_get_key: &'a Expr,
     query: &V,
     values: &SeqKind<V0>,
     evaluate: Eval,
+    from_end: bool,
 ) -> Result<Option<usize>, EvalError>
 where
     Eval: 'a + Fn(&Expr, &V0) -> V,
     V: AsKey,
     V0: Clone,
 {
-    for (ix, v) in values.iter().enumerate() {
-        let key = evaluate(f_get_key, v);
+    let len = values.len();
+    for i in 0..len {
+        let ix = if from_end { len - 1 - i } else { i };
+        let key = evaluate(f_get_key, &values[ix]);
         if query.eq_key(&key)? {
             return Ok(Some(ix));
         }

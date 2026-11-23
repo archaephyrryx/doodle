@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use num_traits::{ToPrimitive, Unsigned, Zero};
 
+pub use crate::KeySearch;
 use crate::bounds::Bounds;
 use crate::byte_set::ByteSet;
 pub use crate::marker::BaseKind;
@@ -1921,13 +1922,13 @@ pub fn enum_from_to(start: Expr, end: Expr) -> Expr {
 
 /// Helper for [`Expr::FindByKey`].
 pub fn find_by_key(
-    is_sorted: bool,
+    search: KeySearch,
     key_fn: impl FnOnce(Expr) -> Expr,
     query: Expr,
     array: Expr,
 ) -> Expr {
     Expr::FindByKey(
-        is_sorted,
+        search,
         Box::new(lambda("elem", key_fn(var("elem")))),
         Box::new(query),
         Box::new(array),

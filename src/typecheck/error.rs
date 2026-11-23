@@ -254,7 +254,7 @@ impl std::fmt::Display for TCErrorKind {
                         f,
                         "`{v} = {t:?}` is an infinite type ({v} or alias occurs within the rhs utype)"
                     ),
-                    Constraint::NumTree(_) | Constraint::Elem(_) => {
+                    Constraint::NumTree(_) | Constraint::Elem(_) | Constraint::OrdKey => {
                         unreachable!("`{v} {inv}` is not infinite, but we thought it was")
                     }
                     Constraint::Proj(ps) => {

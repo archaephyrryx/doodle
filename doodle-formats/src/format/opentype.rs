@@ -469,10 +469,10 @@ mod util {
     ) -> Format {
         // Not all fonts are actually sorted: https://github.com/harfbuzz/harfbuzz/issues/3065
         // NOTE - while technically, we could refactor to make the sortedness a runtime-dependant parameter and check (once) whether the directory is sorted, this may yield only marginal benefits
-        const TABLE_RECORDS_ARE_SORTED: bool = false;
+        const TABLE_RECORDS_SEARCH: KeySearch = KeySearch::First;
         let f_get_table_id = |table_record: Expr| record_proj(table_record, "table_id");
         let opt_match = find_by_key(
-            TABLE_RECORDS_ARE_SORTED,
+            TABLE_RECORDS_SEARCH,
             f_get_table_id,
             Expr::U32(query_table_id),
             table_records,

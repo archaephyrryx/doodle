@@ -270,7 +270,12 @@ mod survey {
             }),
             ("Dup({a}, U8(0))", |e| compute(dup(e, Expr::U8(0)))),
             ("FindByKey(id, {a}, [U8(5)])", |e| {
-                compute(find_by_key(false, |x| x, e, Expr::Seq(vec![Expr::U8(5)])))
+                compute(find_by_key(
+                    KeySearch::First,
+                    |x| x,
+                    e,
+                    Expr::Seq(vec![Expr::U8(5)]),
+                ))
             }),
             ("RepeatCount({a}, u8)", |e| repeat_count(e, u8())),
             ("CaptureBytes({a})", capture_bytes_from_here),

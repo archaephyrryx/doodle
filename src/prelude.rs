@@ -212,17 +212,14 @@ where
     Ok(res)
 }
 
-/// Performs a binary search through a slice, returning the element at the index found by the
-/// slice method [`binary_search_by_key`](slice::binary_search_by_key). If this search fails, returns `None`
-/// instead.
-pub fn find_by_key_sorted<T, K>(f: impl FnMut(&T) -> K, query: K, slice: &[T]) -> Option<&T>
+/// Performs a binary search through a slice sorted (ascending) by `f`, returning the first
+/// (leftmost) element such that `f(elem) == query`, or `None` if there is none.
+pub fn find_by_key_sorted<T, K>(mut f: impl FnMut(&T) -> K, query: K, slice: &[T]) -> Option<&T>
 where
     K: Ord + Copy,
 {
-    match slice.binary_search_by_key(&query, f) {
-        Ok(ix) => Some(&slice[ix]),
-        Err(_) => None,
-    }
+    let ix = slice.partition_point(|x| f(x) < query);
+    slice.get(ix).filter(|x| f(x) == query)
 }
 
 /// Performs a linear search through a slice, returning the first element such that
@@ -236,6 +233,44 @@ where
     K: Eq + Copy,
 {
     slice.iter().find(|x| f(x) == query)
+}
+
+/// Performs a linear search from the end of a slice, returning the last element such that
+/// `f(elem) == query`.
+pub fn find_by_key_last<T, K>(mut f: impl FnMut(&T) -> K, query: K, slice: &[T]) -> Option<&T>
+where
+    K: Eq + Copy,
+{
+    slice.iter().rev().find(|x| f(x) == query)
+}
+
+/// As [`find_by_key_sorted`], for a byte-string key that `f` borrows from each element, ordered
+/// lexicographically.
+pub fn find_by_bytes_key_sorted<'a, T>(
+    f: impl Fn(&T) -> &[u8],
+    query: &[u8],
+    slice: &'a [T],
+) -> Option<&'a T> {
+    let ix = slice.partition_point(|x| f(x) < query);
+    slice.get(ix).filter(|x| f(x) == query)
+}
+
+/// As [`find_by_key_unsorted`], for a byte-string key that `f` borrows from each element.
+pub fn find_by_bytes_key_first<'a, T>(
+    f: impl Fn(&T) -> &[u8],
+    query: &[u8],
+    slice: &'a [T],
+) -> Option<&'a T> {
+    slice.iter().find(|x| f(x) == query)
+}
+
+/// As [`find_by_key_last`], for a byte-string key that `f` borrows from each element.
+pub fn find_by_bytes_key_last<'a, T>(
+    f: impl Fn(&T) -> &[u8],
+    query: &[u8],
+    slice: &'a [T],
+) -> Option<&'a T> {
+    slice.iter().rev().find(|x| f(x) == query)
 }
 
 pub fn u16le(input: (u8, u8)) -> u16 {
