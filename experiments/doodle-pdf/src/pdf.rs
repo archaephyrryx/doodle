@@ -522,6 +522,109 @@ fn nat_value(value: Expr) -> Format {
     )
 }
 
+/// DaeDaLus `Default dflt (LookupNat key dict)`: the natural-number value of `key` in `dict`,
+/// or `dflt` if `key` is absent or its value is not a natural number.
+///
+/// DaeDaLus `LookupNat` also resolves an indirect reference (`LookupResolve`). That isn't
+/// supported yet (#355), so a reference here gives `dflt`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn lookup_nat_or(key: &[u8], dict: Expr, dflt: u64, value_type: ValueType) -> Expr {
+    expr_match(
+        dict_lookup(key, dict, value_type),
+        [
+            (
+                pat_some(Pattern::Variant("number".into(), Box::new(bind("n")))),
+                expr_option_map_or(Expr::U64(dflt), |x| x, number_as_nat(var("n"))),
+            ),
+            (Pattern::Wildcard, Expr::U64(dflt)),
+        ],
+    )
+}
+
+/// DaeDaLus `FlateDecodeParams`: the `predictor`, `colors`, `bpc` and `columns` (all `u64`)
+/// of a `/FlateDecode` filter, where `param` is the filter's `/DecodeParms` entry as an
+/// `Option` of a `pdf.value.dict` result (DaeDaLus `FilterParam`, which maps `null` to
+/// `nothing`). Absent entries, and an absent `param`, take the defaults `1`, `1`, `8` and `1`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn flate_decode_params(param: Expr, value_type: ValueType) -> Expr {
+    const DEFAULTS: [(&str, &[u8], u64); 4] = [
+        ("predictor", b"Predictor", 1),
+        ("colors", b"Colors", 1),
+        ("bpc", b"BitsPerComponent", 8),
+        ("columns", b"Columns", 1),
+    ];
+    let params = |f: &dyn Fn(&[u8], u64) -> Expr| {
+        Expr::Record(
+            DEFAULTS
+                .iter()
+                .map(|(label, key, dflt)| (Label::Borrowed(label), f(key, *dflt)))
+                .collect(),
+        )
+    };
+    expr_match(
+        param,
+        [
+            (
+                pat_some(bind("ps")),
+                params(&|key, dflt| lookup_nat_or(key, var("ps"), dflt, value_type.clone())),
+            ),
+            (pat_none(), params(&|_, dflt| Expr::U64(dflt))),
+        ],
+    )
+}
+
+/// DaeDaLus `supportedPredictor`, over a [`flate_decode_params`] record: no prediction
+/// (`1`), or a PNG predictor (`10..=15`) with sensible `colors`, `bpc` and `columns`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn supported_predictor(params: Expr) -> Expr {
+    let field = |label: &'static str| record_proj(params.clone(), label);
+    let bpc_ok = [1, 2, 4, 8, 16]
+        .into_iter()
+        .map(|n| expr_eq(field("bpc"), Expr::U64(n)))
+        .reduce(or)
+        .unwrap();
+    or(
+        expr_eq(field("predictor"), Expr::U64(1)),
+        and(
+            and(
+                expr_gte(field("predictor"), Expr::U64(10)),
+                expr_lte(field("predictor"), Expr::U64(15)),
+            ),
+            and(
+                and(expr_gte(field("colors"), Expr::U64(1)), bpc_ok),
+                expr_gte(field("columns"), Expr::U64(1)),
+            ),
+        ),
+    )
+}
+
+/// DaeDaLus `FlateDecode` (a host primitive there): zlib-decodes the bytes `body` with the
+/// `zlib` format from `doodle-formats`, given a [`flate_decode_params`] record `params`.
+///
+/// Fails when `supported_predictor` rejects `params`, the case in which DaeDaLus
+/// `TryApplyFilter` reports the filter as unsupported instead of applying it. Also fails for
+/// the PNG predictors (`10..=15`), whose un-filtering isn't implemented yet (#352); only
+/// predictor `1` (no prediction) decodes.
+#[cfg_attr(not(test), allow(dead_code))]
+fn flate_decode(zlib: FormatRef, params: Expr, body: Expr) -> Format {
+    let inflate = decode_bytes(
+        body,
+        map(
+            zlib.call(),
+            lambda("zlib", record_lens(var("zlib"), &["data", "inflate"])),
+        ),
+    );
+    if_then_else(
+        supported_predictor(params.clone()),
+        if_then_else(
+            expr_eq(record_proj(params, "predictor"), Expr::U64(1)),
+            inflate,
+            Format::Fail, // "PNG predictors are not yet supported" (#352)
+        ),
+        Format::Fail, // "unsupported predictor"
+    )
+}
+
 fn v_string(module: &mut FormatModule, any_ws: FormatRef, eol: FormatRef) -> Format {
     let known_esc = interpret([
         (is_byte(b'n'), Expr::Seq(vec![Expr::U8(b'\n')])),
@@ -1246,6 +1349,192 @@ mod tests {
                 *ok,
                 "decoding {:?}",
                 String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// zlib of `hello hello hello hello` (compressed, with back-references)
+    const HELLO_Z: &[u8] = &[
+        0x78, 0xda, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0xc8, 0x40, 0x27, 0x01, 0x68, 0x03, 0x08,
+        0xb1,
+    ];
+    /// zlib of `abc` (one stored block)
+    const ABC_Z: &[u8] = &[
+        0x78, 0x01, 0x01, 0x03, 0x00, 0xfc, 0xff, 0x61, 0x62, 0x63, 0x02, 0x4d, 0x01, 0x27,
+    ];
+
+    /// Parses a `pdf.value` that is a dict or `null` (as a `/DecodeParms` entry), then `rest`
+    /// with the [`flate_decode_params`] record bound to `params`.
+    fn with_flate_params(module: &mut FormatModule, rest: Format) -> Format {
+        let simple_eol = simple_eol(module);
+        let eol = eol(module, simple_eol);
+        let comment = comment(module, eol);
+        let any_ws = any_ws(module, eol, comment);
+        let v_name = v_name(module, any_ws);
+        let natural = natural(module);
+        let number = number(module, natural);
+        let [value, _dict] = pdf_value(module, any_ws, eol, natural, number, v_name);
+        let value_type = module.get_format_type(value.get_level()).clone();
+        chain(
+            value.call_args(vec![Expr::U64(32)]),
+            "v",
+            chain(
+                fmt_match(
+                    var("v"),
+                    [
+                        (
+                            Pattern::Variant("dict".into(), Box::new(bind("d"))),
+                            compute(expr_some(var("d"))),
+                        ),
+                        (
+                            Pattern::Variant("null".into(), Box::new(Pattern::Wildcard)),
+                            compute(expr_none()),
+                        ),
+                    ],
+                ),
+                "param",
+                chain(
+                    compute(flate_decode_params(var("param"), value_type)),
+                    "params",
+                    rest,
+                ),
+            ),
+        )
+    }
+
+    /// `flate_decode_params` takes each entry that is a natural number, and the default for an
+    /// absent entry, an absent `/DecodeParms`, or an entry that isn't a natural number
+    /// (including an indirect reference, until #355).
+    #[test]
+    fn flate_decode_params_defaults() {
+        let cases: &[(&[u8], [u64; 4])] = &[
+            (b"null", [1, 1, 8, 1]),
+            (b"<<>>", [1, 1, 8, 1]),
+            (b"<< /Predictor 12 /Columns 5 >>", [12, 1, 8, 5]),
+            (b"<< /Colors 3 /BitsPerComponent 16 >>", [1, 3, 16, 1]),
+            (b"<< /Predictor -2 /Columns 4. >>", [1, 1, 8, 4]),
+            (b"<< /Predictor /Twelve /Colors 2.5 >>", [1, 1, 8, 1]),
+            (b"<< /Columns 7 0 R >>", [1, 1, 8, 1]),
+        ];
+        for (input, expected) in cases {
+            let mut module = FormatModule::new();
+            let fields = ["predictor", "colors", "bpc", "columns"]
+                .map(|label| record_proj(var("params"), label));
+            let check = fmt_match(
+                Expr::Tuple(fields.to_vec()),
+                [
+                    (
+                        Pattern::Tuple(expected.iter().map(|n| Pattern::U64(*n)).collect()),
+                        Format::EMPTY,
+                    ),
+                    (Pattern::Wildcard, Format::Fail),
+                ],
+            );
+            let top = with_flate_params(&mut module, check);
+            let top = module.define_format("test.flate_params", only(top));
+            let prog = Compiler::compile_program(&module, &top.call()).expect("must compile");
+            assert!(
+                prog.run(ReadCtxt::new(input)).is_ok(),
+                "params of {:?}, expecting {expected:?}",
+                String::from_utf8_lossy(input),
+            );
+        }
+    }
+
+    /// `supported_predictor` accepts no prediction, or a PNG predictor with at least one colour
+    /// and column and a valid bit depth. Until #352, `flate_decode` fails on every predictor
+    /// other than 1 whatever this says, so it is tested on its own.
+    #[test]
+    fn supported_predictor_cases() {
+        let cases: &[([u64; 4], bool)] = &[
+            ([1, 0, 3, 0], true),
+            ([10, 1, 8, 1], true),
+            ([15, 4, 16, 100], true),
+            ([12, 3, 1, 5], true),
+            ([2, 1, 8, 1], false),
+            ([9, 1, 8, 1], false),
+            ([16, 1, 8, 1], false),
+            ([12, 0, 8, 1], false),
+            ([12, 1, 3, 1], false),
+            ([12, 1, 32, 1], false),
+            ([12, 1, 8, 0], false),
+        ];
+        for ([predictor, colors, bpc, columns], expected) in cases {
+            let params = Expr::Record(vec![
+                (Label::Borrowed("predictor"), Expr::U64(*predictor)),
+                (Label::Borrowed("colors"), Expr::U64(*colors)),
+                (Label::Borrowed("bpc"), Expr::U64(*bpc)),
+                (Label::Borrowed("columns"), Expr::U64(*columns)),
+            ]);
+            let mut module = FormatModule::new();
+            let top = module.define_format(
+                "test.supported_predictor",
+                fmt_match(
+                    supported_predictor(params),
+                    [
+                        (Pattern::Bool(*expected), Format::EMPTY),
+                        (Pattern::Wildcard, Format::Fail),
+                    ],
+                ),
+            );
+            let prog = Compiler::compile_program(&module, &top.call()).expect("must compile");
+            assert!(
+                prog.run(ReadCtxt::new(&[])).is_ok(),
+                "supported_predictor({predictor}, {colors}, {bpc}, {columns}) should be {expected}"
+            );
+        }
+    }
+
+    /// `flate_decode` inflates zlib data when there is no predictor, and fails on corrupt
+    /// data, on a PNG predictor (not yet supported, #352) and on an unsupported predictor.
+    #[test]
+    fn flate_decode_inflates() {
+        let hello: &[u8] = b"hello hello hello hello";
+        let corrupt = [&HELLO_Z[..2], &[0xff, 0xff, 0xff][..]].concat();
+        let cases: &[(&[u8], &[u8], Option<&[u8]>)] = &[
+            (b"null", HELLO_Z, Some(hello)),
+            (b"<<>>", ABC_Z, Some(b"abc")),
+            (b"<< /Predictor 1 >>", ABC_Z, Some(b"abc")),
+            (b"null", &corrupt, None),
+            (b"<< /Predictor 12 /Columns 5 >>", HELLO_Z, None),
+            (b"<< /Predictor 2 >>", HELLO_Z, None),
+            (b"<< /Predictor 12 /Columns 0 >>", HELLO_Z, None),
+        ];
+        for (param, body, expected) in cases {
+            let mut module = FormatModule::new();
+            let deflate = doodle_formats::format::deflate::main(&mut module);
+            let zlib = doodle_formats::format::zlib::main(&mut module, deflate);
+            // `stream` separates the body from the param's trailing whitespace
+            let check = chain(
+                monad_seq(is_bytes(b"stream\n"), repeat(Format::ANY_BYTE)),
+                "body",
+                chain(
+                    flate_decode(zlib, var("params"), var("body")),
+                    "out",
+                    // Where decoding should fail, any output is a test failure, so there is
+                    // nothing to compare
+                    match expected {
+                        Some(bytes) => fmt_match(
+                            var("out"),
+                            [
+                                (pattern_bytestring(bytes), Format::EMPTY),
+                                (Pattern::Wildcard, Format::Fail),
+                            ],
+                        ),
+                        None => Format::EMPTY,
+                    },
+                ),
+            );
+            let top = with_flate_params(&mut module, check);
+            let top = module.define_format("test.flate_decode", only(top));
+            let prog = Compiler::compile_program(&module, &top.call()).expect("must compile");
+            let input = [*param, b" stream\n", *body].concat();
+            assert_eq!(
+                prog.run(ReadCtxt::new(&input)).is_ok(),
+                expected.is_some(),
+                "flate_decode with {:?}, expecting {:?}",
+                String::from_utf8_lossy(param),
+                expected.map(String::from_utf8_lossy),
             );
         }
     }
