@@ -465,8 +465,12 @@ impl UintSet {
 
 // SECTION - UintSet queries and mutators
 impl UintSet {
+    /// Whether `b` is in the set, which holds only unsigned integer types (so not, e.g., `Bool`).
     pub fn contains(self, b: BaseType) -> bool {
-        self.ranks[b.int_width() as usize] != Rank::Excluded
+        matches!(
+            b,
+            BaseType::U8 | BaseType::U16 | BaseType::U32 | BaseType::U64
+        ) && self.ranks[b.int_width() as usize] != Rank::Excluded
     }
 
     /// Returns `true` if the set is
@@ -1191,6 +1195,17 @@ mod tests {
             .unify(BaseSet::U(UintSet::at_least(Bits16)))
             .unwrap();
         assert!(unified.get_unique_solution(UVar(0)).is_err());
+    }
+
+    /// A non-integer base type is outside every unsigned set, so unifying one with it is an error
+    /// (rather than a panic measuring its width).
+    #[test]
+    fn non_integer_outside_unsigned_sets() {
+        for b in [BaseType::Bool, BaseType::Char] {
+            assert!(!UintSet::ANY.contains(b));
+            assert!(BaseSet::UAny.unify(BaseSet::Single(b)).is_err());
+            assert!(BaseSet::Single(b).unify(BaseSet::UAny).is_err());
+        }
     }
 
     /// The `+ 1` offset of `HintStamp` round-trips, including for `UVar(0)`.
