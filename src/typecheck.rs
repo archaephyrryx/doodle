@@ -1609,6 +1609,13 @@ impl TypeChecker {
     /// of the metavariable equation, with `ix_var` occurring at index `ix` of the tuple being projected.
     fn unify_var_proj_index(&mut self, tuple_var: UVar, ix: usize, ix_var: UVar) -> TCResult<()> {
         let can_v = self.get_canonical_uvar(tuple_var);
+        // A vacuous constraint (`Equiv` of `Hole` or `Empty`, the type of `Format::Fail`) is
+        // equivalent to `Indefinite` (as in `transfer_constraints`), and is solved as one
+        if let Constraints::Invariant(c) = &self.constraints[can_v.0]
+            && c.is_vacuous()
+        {
+            self.constraints[can_v.0] = Constraints::Indefinite;
+        }
         match &mut self.constraints[can_v.0] {
             Constraints::Indefinite => {
                 let mut proj = ProjShape::new_tuple();
@@ -1649,6 +1656,13 @@ impl TypeChecker {
     /// of the metavariable equation, with `fld_var` being the field with label `fname`.
     fn unify_var_proj_field(&mut self, rec_var: UVar, fname: Label, fld_var: UVar) -> TCResult<()> {
         let can_v = self.get_canonical_uvar(rec_var);
+        // A vacuous constraint (`Equiv` of `Hole` or `Empty`, the type of `Format::Fail`) is
+        // equivalent to `Indefinite` (as in `transfer_constraints`), and is solved as one
+        if let Constraints::Invariant(c) = &self.constraints[can_v.0]
+            && c.is_vacuous()
+        {
+            self.constraints[can_v.0] = Constraints::Indefinite;
+        }
         match &mut self.constraints[can_v.0] {
             Constraints::Indefinite => {
                 let mut proj = ProjShape::new_record();
@@ -1704,6 +1718,13 @@ impl TypeChecker {
     /// and `param_v` is the rhs metavariable.
     fn unify_var_proj_param(&mut self, opt_v: UVar, param_v: UVar) -> TCResult<()> {
         let can_v = self.get_canonical_uvar(opt_v);
+        // A vacuous constraint (`Equiv` of `Hole` or `Empty`, the type of `Format::Fail`) is
+        // equivalent to `Indefinite` (as in `transfer_constraints`), and is solved as one
+        if let Constraints::Invariant(c) = &self.constraints[can_v.0]
+            && c.is_vacuous()
+        {
+            self.constraints[can_v.0] = Constraints::Indefinite;
+        }
         match &mut self.constraints[can_v.0] {
             Constraints::Indefinite => {
                 let proj = ProjShape::opt_of(param_v);
@@ -1749,6 +1770,13 @@ impl TypeChecker {
     /// and `elem_v` is the rhs metavariable.
     fn unify_var_proj_elem(&mut self, seq_v: UVar, elem_v: UVar) -> TCResult<()> {
         let can_v = self.get_canonical_uvar(seq_v);
+        // A vacuous constraint (`Equiv` of `Hole` or `Empty`, the type of `Format::Fail`) is
+        // equivalent to `Indefinite` (as in `transfer_constraints`), and is solved as one
+        if let Constraints::Invariant(c) = &self.constraints[can_v.0]
+            && c.is_vacuous()
+        {
+            self.constraints[can_v.0] = Constraints::Indefinite;
+        }
         match &mut self.constraints[can_v.0] {
             Constraints::Indefinite => {
                 let proj = ProjShape::seq_of(elem_v);

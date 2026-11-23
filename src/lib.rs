@@ -235,6 +235,50 @@ pub enum ProjKind {
     Tuple,
 }
 
+// SECTION - `Any` in registration's own type inference
+//
+// `ValueType::Any` is the placeholder type of a recursive-batch member that registration's first
+// pass has not reached yet (see `FormatModule::infer_batch_types`), and so of anything computed
+// from a call to it. It stands for a type not known yet, not for a type error: `ValueType::unify`
+// accepts it as-is, `solve_batch_types` then checks the whole batch, and `Pattern::build_scope`
+// matches it. These helpers give the other checks the same reading, so that each passes an
+// `Any` operand, and a part taken out of an `Any` (a field, an element) is itself `Any`.
+//
+// They pass `Empty` too, and a part of an `Empty` is `Empty`: a value of type `Empty` is never
+// produced (it only comes from a format or branch that always fails), so a check on it holds
+// vacuously. `ValueType::unify` gives `Empty` for `Any` against `Empty` (in either order), so an
+// `Any` that meets a `Fail` branch arrives here as `Empty`.
+
+/// Whether `t` is unsigned or Auto, or not known yet (`Any`), or has no values (`Empty`).
+fn unsigned_or_any(t: &ValueType) -> bool {
+    t.is_unsigned_or_auto() || matches!(t, ValueType::Any | ValueType::Empty)
+}
+
+/// Whether `t` is numeric, or not known yet (`Any`), or has no values (`Empty`).
+fn numeric_or_any(t: &ValueType) -> bool {
+    t.is_numeric() || matches!(t, ValueType::Any | ValueType::Empty)
+}
+
+/// Whether `t` is `Bool`, or not known yet (`Any`), or has no values (`Empty`).
+fn bool_or_any(t: &ValueType) -> bool {
+    matches!(
+        t,
+        ValueType::Base(BaseType::Bool) | ValueType::Any | ValueType::Empty
+    )
+}
+
+/// The element type of a sequence type `t`: `Any` or `Empty` if `t` is itself, or `None` if `t`
+/// is not a sequence.
+fn seq_elem_or_any(t: ValueType) -> Option<ValueType> {
+    match t {
+        ValueType::Seq(elem) => Some(*elem),
+        ValueType::Any => Some(ValueType::Any),
+        ValueType::Empty => Some(ValueType::Empty),
+        _ => None,
+    }
+}
+// !SECTION
+
 impl Expr {
     // FIXME: is this still an inherent method, or should we have a UD -> TC phase and use get_type_info instead?
     fn infer_type(&self, scope: &TypeScope<'_, ValueType>) -> AResult<ValueType> {
@@ -263,6 +307,7 @@ impl Expr {
             }
             Expr::TupleProj(head, index) => match head.infer_type(scope)? {
                 ValueType::Tuple(vs) => Ok(scope.unfold(vs[*index].clone())),
+                t @ (ValueType::Any | ValueType::Empty) => Ok(t),
                 other => Err(anyhow!("tuple projection on non-tuple type {other:?}")),
             },
             Expr::Record(fields) => {
@@ -272,9 +317,10 @@ impl Expr {
                 }
                 Ok(ValueType::Record(fs))
             }
-            Expr::RecordProj(head, label) => {
-                Ok(scope.unfold(head.infer_type(scope)?.record_proj(label)))
-            }
+            Expr::RecordProj(head, label) => match head.infer_type(scope)? {
+                t @ (ValueType::Any | ValueType::Empty) => Ok(t),
+                t => Ok(scope.unfold(t.record_proj(label))),
+            },
             Expr::Variant(label, expr) => Ok(ValueType::Union(BTreeMap::from([(
                 label.clone(),
                 expr.infer_type(scope)?,
@@ -317,7 +363,7 @@ impl Expr {
                 if scope
                     .unify(&t0, &t1)
                     .as_ref()
-                    .is_ok_and(ValueType::is_numeric)
+                    .is_ok_and(|t| numeric_or_any(&t))
                 {
                     Ok(ValueType::Base(BaseType::Bool))
                 } else {
@@ -328,7 +374,7 @@ impl Expr {
             }
             Expr::Arith(_arith @ (Arith::BoolAnd | Arith::BoolOr), x, y) => {
                 match (x.infer_type(scope)?, y.infer_type(scope)?) {
-                    (ValueType::Base(BaseType::Bool), ValueType::Base(BaseType::Bool)) => {
+                    (x, y) if bool_or_any(&x) && bool_or_any(&y) => {
                         Ok(ValueType::Base(BaseType::Bool))
                     }
                     (x, y) => Err(anyhow!(
@@ -344,7 +390,7 @@ impl Expr {
                     .map_err(|e| anyhow!("{e}"))
                     .and_then(|t0| {
                         // NOTE - signed arithmetic is only supported within `Expr::Numeric`
-                        if t0.is_unsigned_or_auto() {
+                        if unsigned_or_any(&t0) {
                             Ok(t0)
                         } else {
                             Err(anyhow!(
@@ -354,40 +400,43 @@ impl Expr {
                     })
             }
             Expr::Unary(_op @ UnaryOp::BoolNot, x) => match x.infer_type(scope)? {
-                ValueType::Base(BaseType::Bool) => Ok(ValueType::Base(BaseType::Bool)),
+                x if bool_or_any(&x) => Ok(ValueType::Base(BaseType::Bool)),
                 x => Err(anyhow!("unexpected operand type for {_op:?}: {x:?}")),
             },
             Expr::Unary(_op @ (UnaryOp::IntSucc | UnaryOp::IntPred), x) => {
                 let t = x.infer_type(scope)?;
-                if t.is_unsigned_or_auto() {
+                if unsigned_or_any(&t) {
                     Ok(t)
                 } else {
                     Err(anyhow!("unexpected operand type for {_op:?}: {t:?}"))
                 }
             }
             Expr::AsU8(x) => match x.infer_type(scope)? {
-                t if t.is_numeric() => Ok(ValueType::U8),
+                t if numeric_or_any(&t) => Ok(ValueType::U8),
                 x => Err(anyhow!("unsound type cast AsU8(_ : {x:?})")),
             },
             Expr::AsU16(x) => match x.infer_type(scope)? {
-                t if t.is_numeric() => Ok(ValueType::U16),
+                t if numeric_or_any(&t) => Ok(ValueType::U16),
                 x => Err(anyhow!("unsound type cast AsU16(_ : {x:?})")),
             },
             Expr::AsU32(x) => match x.infer_type(scope)? {
-                t if t.is_numeric() => Ok(ValueType::U32),
+                t if numeric_or_any(&t) => Ok(ValueType::U32),
                 x => Err(anyhow!("unsound type cast AsU32(_ : {x:?})")),
             },
             Expr::AsU64(x) => match x.infer_type(scope)? {
-                t if t.is_numeric() => Ok(ValueType::U64),
+                t if numeric_or_any(&t) => Ok(ValueType::U64),
                 x => Err(anyhow!("cannot convert {x:?} to U64")),
             },
             // NOTE - unlike AsU8..AsU64, signed operands are rejected; use `AsChar(AsU32(x))` instead
             Expr::AsChar(x) => match x.infer_type(scope)? {
-                t if t.is_unsigned_or_auto() => Ok(ValueType::Base(BaseType::Char)),
+                t if unsigned_or_any(&t) => Ok(ValueType::Base(BaseType::Char)),
                 x => Err(anyhow!("unsound type cast AsChar(_ : {x:?})")),
             },
             Expr::U16Be(bytes) => {
                 let _t = bytes.infer_type(scope)?;
+                if matches!(_t, ValueType::Any | ValueType::Empty) {
+                    return Ok(ValueType::U16);
+                }
                 match _t.try_as_tuple_type() {
                     Ok([ValueType::U8, ValueType::U8]) => Ok(ValueType::U16),
                     _ => Err(anyhow!("unsound byte-level type cast U16Be(_ : {_t:?})")),
@@ -395,6 +444,9 @@ impl Expr {
             }
             Expr::U16Le(bytes) => {
                 let _t = bytes.infer_type(scope)?;
+                if matches!(_t, ValueType::Any | ValueType::Empty) {
+                    return Ok(ValueType::U16);
+                }
                 match _t.try_as_tuple_type() {
                     Ok([ValueType::U8, ValueType::U8]) => Ok(ValueType::U16),
                     _ => Err(anyhow!("unsound byte-level type cast U16Le(_ : {_t:?})")),
@@ -402,6 +454,9 @@ impl Expr {
             }
             Expr::U32Be(bytes) => {
                 let _t = bytes.infer_type(scope)?;
+                if matches!(_t, ValueType::Any | ValueType::Empty) {
+                    return Ok(ValueType::U32);
+                }
                 match _t.try_as_tuple_type() {
                     Ok([ValueType::U8, ValueType::U8, ValueType::U8, ValueType::U8]) => {
                         Ok(ValueType::U32)
@@ -411,6 +466,9 @@ impl Expr {
             }
             Expr::U32Le(bytes) => {
                 let _t = bytes.infer_type(scope)?;
+                if matches!(_t, ValueType::Any | ValueType::Empty) {
+                    return Ok(ValueType::U32);
+                }
                 match _t.try_as_tuple_type() {
                     Ok([ValueType::U8, ValueType::U8, ValueType::U8, ValueType::U8]) => {
                         Ok(ValueType::U32)
@@ -420,6 +478,9 @@ impl Expr {
             }
             Expr::U64Be(bytes) => {
                 let _t = bytes.infer_type(scope)?;
+                if matches!(_t, ValueType::Any | ValueType::Empty) {
+                    return Ok(ValueType::U64);
+                }
                 match _t.try_as_tuple_type() {
                     Ok(
                         [
@@ -438,6 +499,9 @@ impl Expr {
             }
             Expr::U64Le(bytes) => {
                 let _t = bytes.infer_type(scope)?;
+                if matches!(_t, ValueType::Any | ValueType::Empty) {
+                    return Ok(ValueType::U64);
+                }
                 match _t.try_as_tuple_type() {
                     Ok(
                         [
@@ -457,20 +521,23 @@ impl Expr {
             // NOTE - typed like `Format::Pos`: the interpreter yields an Auto Numeric, which takes the type of
             // whatever native operand it meets
             Expr::SeqLength(seq) => match seq.infer_type(scope)? {
-                ValueType::Seq(_t) => Ok(ValueType::NumericHole),
+                ValueType::Seq(_) | ValueType::Any | ValueType::Empty => Ok(ValueType::NumericHole),
                 other => Err(anyhow!("seq-length called on non-sequence type: {other:?}")),
             },
-            Expr::SeqIx(seq, index) => match seq.infer_type(scope)? {
-                ValueType::Seq(t) => {
+            Expr::SeqIx(seq, index) => match seq_elem_or_any(seq.infer_type(scope)?) {
+                Some(t) => {
                     let index_type = index.infer_type(scope)?;
-                    if !index_type.is_unsigned_or_auto() {
+                    if !unsigned_or_any(&index_type) {
                         return Err(anyhow!(
                             "SeqIx `index` param: expected unsigned or auto, found {index_type:?}"
                         ));
                     }
-                    Ok(scope.unfold(ValueType::clone(&t)))
+                    Ok(scope.unfold(t))
                 }
-                other => Err(anyhow!("SeqIx: expected Seq, found {other:?}")),
+                None => Err(anyhow!(
+                    "SeqIx: expected Seq, found {:?}",
+                    seq.infer_type(scope)?
+                )),
             },
             Expr::SubSeq(seq, start, length) | Expr::SubSeqInflate(seq, start, length) => {
                 let op = if matches!(self, Expr::SubSeq(..)) {
@@ -479,10 +546,12 @@ impl Expr {
                     "SubSeqInflate"
                 };
                 match seq.infer_type(scope)? {
-                    ValueType::Seq(t) => {
+                    t @ (ValueType::Seq(_) | ValueType::Any | ValueType::Empty) => {
+                        // a sub-sequence of a sequence not known yet is a sequence
+                        let t = seq_elem_or_any(t).map(Box::new).unwrap();
                         for (what, expr) in [("start", start), ("length", length)] {
                             let t = expr.infer_type(scope)?;
-                            if !t.is_unsigned_or_auto() {
+                            if !unsigned_or_any(&t) {
                                 return Err(anyhow!(
                                     "{op} `{what}` param: expected unsigned or auto, found {t:?}"
                                 ));
@@ -494,91 +563,114 @@ impl Expr {
                 }
             }
             Expr::FlatMap(expr, seq) => match expr.as_ref() {
-                Expr::Lambda(name, expr) => match seq.infer_type(scope)? {
-                    ValueType::Seq(t) => {
+                Expr::Lambda(name, expr) => match seq_elem_or_any(seq.infer_type(scope)?) {
+                    Some(t) => {
                         let mut child_scope = TypeScope::child(scope);
-                        child_scope.push(name.clone(), *t);
-                        match expr.infer_type(&child_scope)? {
-                            ValueType::Seq(t2) => Ok(ValueType::Seq(t2)),
-                            other => Err(anyhow!("FlatMap: expected Seq, found {other:?}")),
+                        child_scope.push(name.clone(), t);
+                        match seq_elem_or_any(expr.infer_type(&child_scope)?) {
+                            Some(t2) => Ok(ValueType::Seq(Box::new(t2))),
+                            None => Err(anyhow!("FlatMap: lambda does not return a Seq")),
                         }
                     }
-                    other => Err(anyhow!("FlatMap: expected Seq, found {other:?}")),
+                    None => Err(anyhow!(
+                        "FlatMap: expected Seq, found {:?}",
+                        seq.infer_type(scope)?
+                    )),
                 },
                 other => Err(anyhow!("FlatMap: expected Lambda, found {other:?}")),
             },
             Expr::FlatMapAccum(expr, accum, accum_type, seq) => match expr.as_ref() {
-                Expr::Lambda(name, expr) => match seq.infer_type(scope)? {
-                    ValueType::Seq(t) => {
+                Expr::Lambda(name, expr) => match seq_elem_or_any(seq.infer_type(scope)?) {
+                    Some(t) => {
                         let accum_type =
                             scope.unify(&accum.infer_type(scope)?, accum_type.as_ref())?;
                         let mut child_scope = TypeScope::child(scope);
                         child_scope
-                            .push(name.clone(), ValueType::Tuple(vec![accum_type.clone(), *t]));
-                        match expr
-                            .infer_type(&child_scope)?
-                            .try_into_tuple_type()?
-                            .as_mut_slice()
-                        {
-                            [accum_result, ValueType::Seq(t2)] => {
-                                scope.unify(accum_result, &accum_type)?;
-                                Ok(ValueType::Seq(t2.clone()))
+                            .push(name.clone(), ValueType::Tuple(vec![accum_type.clone(), t]));
+                        let body_type = match expr.infer_type(&child_scope)? {
+                            ValueType::Any => {
+                                ValueType::Tuple(vec![ValueType::Any, ValueType::Any])
                             }
+                            t => t,
+                        };
+                        match body_type.try_into_tuple_type()?.as_mut_slice() {
+                            [accum_result, t2] => match seq_elem_or_any(t2.clone()) {
+                                Some(t2) => {
+                                    scope.unify(accum_result, &accum_type)?;
+                                    Ok(ValueType::Seq(Box::new(t2)))
+                                }
+                                None => Err(anyhow!("FlatMapAccum: expected a Seq, found {t2:?}")),
+                            },
                             _ => Err(anyhow!("FlatMapAccum: expected two values")),
                         }
                     }
-                    other => Err(anyhow!("FlatMapAccum: expected Seq, found {other:?}")),
+                    None => Err(anyhow!(
+                        "FlatMapAccum: expected Seq, found {:?}",
+                        seq.infer_type(scope)?
+                    )),
                 },
                 other => Err(anyhow!("FlatMapAccum: expected Lambda, found {other:?}")),
             },
             Expr::LeftFold(expr, accum, accum_type, seq) => match expr.as_ref() {
-                Expr::Lambda(name, expr) => match seq.infer_type(scope)? {
-                    ValueType::Seq(t) => {
+                Expr::Lambda(name, expr) => match seq_elem_or_any(seq.infer_type(scope)?) {
+                    Some(t) => {
                         let accum_type =
                             scope.unify(&accum.infer_type(scope)?, accum_type.as_ref())?;
                         let mut child_scope = TypeScope::child(scope);
                         child_scope
-                            .push(name.clone(), ValueType::Tuple(vec![accum_type.clone(), *t]));
+                            .push(name.clone(), ValueType::Tuple(vec![accum_type.clone(), t]));
                         Ok(scope.unify(&expr.infer_type(&child_scope)?, &accum_type)?)
                     }
-                    other => Err(anyhow!("LeftFold: expected Seq, found {other:?}")),
+                    None => Err(anyhow!(
+                        "LeftFold: expected Seq, found {:?}",
+                        seq.infer_type(scope)?
+                    )),
                 },
                 other => Err(anyhow!("LeftFold: expected Lambda, found {other:?}")),
             },
             Expr::FindByKey(_is_sorted, get_key, query_key, seq) => match get_key.as_ref() {
-                Expr::Lambda(name, expr) => match seq.infer_type(scope)? {
-                    ValueType::Seq(t) => {
+                Expr::Lambda(name, expr) => match seq_elem_or_any(seq.infer_type(scope)?) {
+                    Some(t) => {
                         let key_type = query_key.infer_type(scope)?;
                         let mut child_scope = TypeScope::child(scope);
-                        child_scope.push(name.clone(), t.as_ref().clone());
+                        child_scope.push(name.clone(), t.clone());
                         match scope.unify(&expr.infer_type(&child_scope)?, &key_type)? {
-                            ValueType::Base(b) if b.is_numeric() => Ok(ValueType::Option(t)),
+                            ValueType::Base(b) if b.is_numeric() => {
+                                Ok(ValueType::Option(Box::new(t)))
+                            }
+                            ValueType::Any => Ok(ValueType::Option(Box::new(t))),
                             other => Err(anyhow!(
                                 "FindByKey: expected numeric key type, found {other:?}"
                             )),
                         }
                     }
-                    other => Err(anyhow!("FindByKey: expected Seq, found {other:?}")),
+                    None => Err(anyhow!(
+                        "FindByKey: expected Seq, found {:?}",
+                        seq.infer_type(scope)?
+                    )),
                 },
                 other => Err(anyhow!("FindByKey: Expected Lambda, found {other:?}")),
             },
             Expr::FlatMapList(expr, ret_type, seq) => match expr.as_ref() {
-                Expr::Lambda(name, expr) => match seq.infer_type(scope)? {
-                    ValueType::Seq(t) => {
+                Expr::Lambda(name, expr) => match seq_elem_or_any(seq.infer_type(scope)?) {
+                    Some(t) => {
                         let mut child_scope = TypeScope::child(scope);
                         child_scope.push(
                             name.clone(),
                             ValueType::Tuple(vec![
                                 ValueType::Seq(Box::new(ret_type.as_ref().clone())),
-                                *t,
+                                t,
                             ]),
                         );
-                        match expr.infer_type(&child_scope)? {
-                            ValueType::Seq(t2) => Ok(ValueType::Seq(t2)),
-                            other => Err(anyhow!("FlatMapList: expected Seq, found {other:?}")),
+                        match seq_elem_or_any(expr.infer_type(&child_scope)?) {
+                            Some(t2) => Ok(ValueType::Seq(Box::new(t2))),
+                            None => Err(anyhow!("FlatMapList: lambda does not return a Seq")),
                         }
                     }
-                    other => Err(anyhow!("FlatMapList: expected Seq, found {other:?}")),
+                    None => Err(anyhow!(
+                        "FlatMapList: expected Seq, found {:?}",
+                        seq.infer_type(scope)?
+                    )),
                 },
                 other => Err(anyhow!("FlatMapList: expected Lambda, found {other:?}")),
             },
@@ -593,7 +685,7 @@ impl Expr {
                 };
 
                 // NOTE - checked after unification so that a signed bound cannot hide behind an Auto one
-                if !t.is_unsigned_or_auto() {
+                if !unsigned_or_any(&t) {
                     return Err(anyhow!(
                         "EnumFromTo: bounds must be unsigned or auto, found {t:?}"
                     ));
@@ -603,7 +695,7 @@ impl Expr {
             }
             Expr::Dup(count, expr) => {
                 let count_type = count.infer_type(scope)?;
-                if !count_type.is_unsigned_or_auto() {
+                if !unsigned_or_any(&count_type) {
                     return Err(anyhow!(
                         "Dup: count should be unsigned or auto, found {count_type:?}"
                     ));
@@ -616,8 +708,13 @@ impl Expr {
                 None => Ok(ValueType::Option(Box::new(ValueType::Any))),
             },
             Expr::Append(lhs, rhs) => {
-                let lhs_type = lhs.infer_type(scope)?;
-                let rhs_type = rhs.infer_type(scope)?;
+                // a sequence not known yet (`Any`) is a sequence of `Any`
+                let as_seq = |t: ValueType| match t {
+                    t @ (ValueType::Any | ValueType::Empty) => ValueType::Seq(Box::new(t)),
+                    t => t,
+                };
+                let lhs_type = as_seq(lhs.infer_type(scope)?);
+                let rhs_type = as_seq(rhs.infer_type(scope)?);
                 match (&lhs_type, &rhs_type) {
                     (ValueType::Seq(t1), ValueType::Seq(t2)) => {
                         let elem_t = scope.unify(t1, t2)?;
@@ -1454,9 +1551,12 @@ impl FormatModule {
             Format::DecodeBytes(bytes, f) => {
                 let bytes_type = bytes.infer_type(scope)?;
                 match bytes_type {
-                    ValueType::Seq(bt) if matches!(*bt, ValueType::U8) => {
+                    ValueType::Seq(bt)
+                        if matches!(*bt, ValueType::U8 | ValueType::Any | ValueType::Empty) =>
+                    {
                         self.infer_format_type(scope, f)
                     }
+                    ValueType::Any | ValueType::Empty => self.infer_format_type(scope, f),
                     other => Err(anyhow!(
                         "DecodeBytes first argument type should be Seq(U8), found {other:?} instead"
                     )),
@@ -1493,7 +1593,7 @@ impl FormatModule {
                 Ok(ValueType::Seq(Box::new(t)))
             }
             Format::RepeatCount(count, a) => match count.infer_type(scope)? {
-                t if t.is_unsigned_or_auto() => {
+                t if unsigned_or_any(&t) => {
                     let t = self.infer_format_type(scope, a)?;
                     Ok(ValueType::Seq(Box::new(t)))
                 }
@@ -1519,7 +1619,7 @@ impl FormatModule {
                     child_scope.push(head.clone(), t.clone());
                     let ret_type = expr.infer_type(&child_scope)?;
                     match ret_type {
-                        ValueType::Base(BaseType::Bool) => Ok(ValueType::Seq(Box::new(t))),
+                        ret if bool_or_any(&ret) => Ok(ValueType::Seq(Box::new(t))),
                         other => Err(anyhow!(
                             "RepeatUntilLast first argument (lambda) return type should be Bool, found {other:?} instead"
                         )),
@@ -1536,7 +1636,7 @@ impl FormatModule {
                     child_scope.push(head.clone(), ValueType::Seq(Box::new(t.clone())));
                     let ret_type = expr.infer_type(&child_scope)?;
                     match ret_type {
-                        ValueType::Base(BaseType::Bool) => Ok(ValueType::Seq(Box::new(t))),
+                        ret if bool_or_any(&ret) => Ok(ValueType::Seq(Box::new(t))),
                         other => Err(anyhow!(
                             "RepeatUntilSeq first argument (lambda) return type should be Bool, found {other:?} instead"
                         )),
@@ -1558,7 +1658,7 @@ impl FormatModule {
                         child_scope.push(head.clone(), vt_acc_seq.clone());
                         let ret_type = expr.infer_type(&child_scope)?;
                         match ret_type {
-                            ValueType::Base(BaseType::Bool) => {
+                            ret if bool_or_any(&ret) => {
                                 match lambda_acc_val.as_ref() {
                                     Expr::Lambda(head, expr) => {
                                         let mut child_scope = TypeScope::child(&child_scope);
@@ -1586,7 +1686,7 @@ impl FormatModule {
                 }
             }
             Format::Maybe(x, a) => match x.infer_type(scope)? {
-                ValueType::Base(BaseType::Bool) => {
+                t if bool_or_any(&t) => {
                     let t = self.infer_format_type(scope, a)?;
                     Ok(ValueType::Option(Box::new(t)))
                 }
@@ -1602,7 +1702,7 @@ impl FormatModule {
                 self.infer_format_type(scope, a)?,
             ])),
             Format::Slice(len, a) => match len.infer_type(scope)? {
-                t if t.is_unsigned_or_auto() => self.infer_format_type(scope, a),
+                t if unsigned_or_any(&t) => self.infer_format_type(scope, a),
                 other => Err(anyhow!(
                     "Slice length should be unsigned or auto, found {other:?} instead"
                 )),
@@ -1611,7 +1711,7 @@ impl FormatModule {
             Format::WithRelativeOffset(base_addr, offset, a) => {
                 for (what, expr) in [("base address", base_addr), ("offset", offset)] {
                     let t = expr.infer_type(scope)?;
-                    if !t.is_unsigned_or_auto() {
+                    if !unsigned_or_any(&t) {
                         return Err(anyhow!(
                             "WithRelativeOffset {what} should be unsigned or auto, found {t:?} instead"
                         ));
@@ -1637,7 +1737,7 @@ impl FormatModule {
                         let mut child_scope = TypeScope::child(scope);
                         child_scope.push(name.clone(), arg_type.clone());
                         let t = body.infer_type(&child_scope)?;
-                        if t != ValueType::Base(BaseType::Bool) {
+                        if !bool_or_any(&t) {
                             return Err(anyhow!("Where: expected bool lambda, found {t:?}"));
                         }
                         Ok(arg_type)
@@ -1699,8 +1799,9 @@ impl FormatModule {
                 match dynformat {
                     DynFormat::Huffman(lengths_expr, opt_values_expr) => {
                         match lengths_expr.infer_type(scope)? {
+                            ValueType::Any => {}
                             ValueType::Seq(t) => match &*t {
-                                &ValueType::U8 | &ValueType::U16 => {}
+                                &ValueType::U8 | &ValueType::U16 | &ValueType::Any => {}
                                 other => {
                                     return Err(anyhow!(
                                         "Huffman: expected U8 or U16, found {other:?}"
@@ -1713,8 +1814,9 @@ impl FormatModule {
                         }
                         if let Some(values_expr) = opt_values_expr {
                             match values_expr.infer_type(scope)? {
+                                ValueType::Any => {}
                                 ValueType::Seq(t) => match &*t {
-                                    &ValueType::U8 | &ValueType::U16 => {}
+                                    &ValueType::U8 | &ValueType::U16 | &ValueType::Any => {}
                                     other => {
                                         return Err(anyhow!(
                                             "Huffman: expected U8 or U16, found {other:?}"
@@ -1740,9 +1842,8 @@ impl FormatModule {
             Format::Pos => Ok(ValueType::NumericHole),
             Format::ForEach(expr, lbl, format) => {
                 let expr_t = expr.infer_type(scope)?;
-                let elem_t = match expr_t {
-                    ValueType::Seq(elem_t) => (*elem_t).clone(),
-                    _ => return Err(anyhow!("ForEach: expected Seq, found {expr_t:?}")),
+                let Some(elem_t) = seq_elem_or_any(expr_t.clone()) else {
+                    return Err(anyhow!("ForEach: expected Seq, found {expr_t:?}"));
                 };
                 let mut child_scope = TypeScope::child(scope);
                 child_scope.push(lbl.clone(), elem_t);
@@ -1760,7 +1861,7 @@ impl FormatModule {
                 ViewFormat::CaptureBytes(len) => {
                     view.check_type(scope)?;
                     match len.infer_type(scope)? {
-                        t if t.is_unsigned_or_auto() => {}
+                        t if unsigned_or_any(&t) => {}
                         other => {
                             return Err(anyhow!(
                                 "CaptureBytes@0: expected unsigned or auto, found {other:?}"
@@ -1773,7 +1874,7 @@ impl FormatModule {
                 ViewFormat::ReadArray(len, kind) => {
                     view.check_type(scope)?;
                     match len.infer_type(scope)? {
-                        t if t.is_unsigned_or_auto() => {}
+                        t if unsigned_or_any(&t) => {}
                         other => {
                             return Err(anyhow!(
                                 "ReadArray@0: expected unsigned or auto, found {other:?}"
@@ -5294,6 +5395,95 @@ mod test {
         let prog = super::decoder::Compiler::compile_program(&module, &reached.call()).unwrap();
         // `test.down(0)`: no `a`, then `S` and `test.down(1)`, which is one `a`, then `Z`
         assert!(prog.run(ReadCtxt::new(b"SaZ")).is_ok());
+    }
+
+    /// In a recursive batch, the result of a member's call to itself (typed `Any` in
+    /// registration's first pass) can be used like any other value: unwrapped by a match whose
+    /// fallback is `Fail` (`Any` against `Empty`), projected, decoded from, measured and folded
+    /// over. The batch's real type comes from the `TypeChecker` afterwards.
+    #[test]
+    fn batch_member_uses_own_call_result() {
+        use crate::helper::{
+            add, alts, as_u64, bind, chain, compute, decode_bytes, fmt_match, is_byte,
+            lambda_tuple, left_fold, monad_seq, record_auto, record_proj, repeat_count,
+            seq_length, var,
+        };
+        let mut module = FormatModule::new();
+        // `L` then two bytes is a `leaf`; `N` then a `leaf` is a `node` describing its bytes
+        let [f] = module.define_batch_with_args(
+            [("test.use_self", vec![])],
+            [Box::new(|&[f]: &[FormatRef; 1]| {
+                let bytes = || record_proj(var("l"), "bytes");
+                let unwrap_leaf = fmt_match(
+                    var("r"),
+                    [
+                        (
+                            Pattern::Variant("leaf".into(), Box::new(bind("l"))),
+                            compute(var("l")),
+                        ),
+                        (Pattern::Wildcard, Format::Fail),
+                    ],
+                );
+                let sum = left_fold(
+                    lambda_tuple(["acc", "b"], add(var("acc"), as_u64(var("b")))),
+                    Expr::U64(0),
+                    ValueType::Base(BaseType::U64),
+                    bytes(),
+                );
+                alts([
+                    (
+                        "leaf",
+                        monad_seq(
+                            is_byte(b'L'),
+                            record_auto([("bytes", repeat_count(Expr::U8(2), Format::ANY_BYTE))]),
+                        ),
+                    ),
+                    (
+                        "node",
+                        monad_seq(
+                            is_byte(b'N'),
+                            chain(
+                                f.call(),
+                                "r",
+                                chain(
+                                    unwrap_leaf,
+                                    "l",
+                                    record_auto([
+                                        ("first", decode_bytes(bytes(), Format::ANY_BYTE)),
+                                        ("len", compute(as_u64(seq_length(bytes())))),
+                                        ("sum", compute(sum)),
+                                    ]),
+                                ),
+                            ),
+                        ),
+                    ),
+                ])
+            })],
+        );
+        let u64t = || ValueType::Base(BaseType::U64);
+        assert_eq!(
+            module.get_format_type(f.get_level()),
+            &ValueType::Union(std::collections::BTreeMap::from([
+                (
+                    Label::Borrowed("leaf"),
+                    ValueType::Record(vec![(
+                        Label::Borrowed("bytes"),
+                        ValueType::Seq(Box::new(ValueType::Base(BaseType::U8)))
+                    )])
+                ),
+                (
+                    Label::Borrowed("node"),
+                    ValueType::Record(vec![
+                        (Label::Borrowed("first"), ValueType::Base(BaseType::U8)),
+                        (Label::Borrowed("len"), u64t()),
+                        (Label::Borrowed("sum"), u64t()),
+                    ])
+                ),
+            ]))
+        );
+        let prog = super::decoder::Compiler::compile_program(&module, &f.call()).unwrap();
+        assert!(prog.run(ReadCtxt::new(b"NLab")).is_ok());
+        assert!(prog.run(ReadCtxt::new(b"NNLab")).is_err());
     }
 
     /// A recursive-batch member can pattern-match the result of its own call, whose type is
