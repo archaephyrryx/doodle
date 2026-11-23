@@ -598,13 +598,153 @@ fn supported_predictor(params: Expr) -> Expr {
     )
 }
 
+/// Reverses the PNG row filters selected by PDF predictors `10..=15`, parsing the bytes of a
+/// decompressed stream, given a [`flate_decode_params`] record `params`.
+///
+/// Each row is a filter tag (`0` None, `1` Sub, `2` Up, `3` Average, `4` Paeth) followed by
+/// `ceil(colors * bpc * columns / 8)` bytes. The value is the reconstructed bytes, with the tags
+/// removed. As in the DaeDaLus host implementation of `FlateDecode`, a tag over `4` or a
+/// partial final row fails, an empty input gives an empty output, and the row above the first
+/// is taken to be zeros. The bytes per pixel (for Sub, Average and Paeth) is
+/// `ceil(colors * bpc / 8)`, or `1` for less than a byte.
+///
+/// Like the PNG predictors themselves, the PDF predictor value (`10` to `15`) is only a hint:
+/// each row's own tag selects its filter.
+#[cfg_attr(not(test), allow(dead_code))]
+fn png_unpredict(params: Expr) -> Format {
+    let field = |label: &'static str| compute(record_proj(params.clone(), label));
+    // Computed in the Numeric model, so that the only overflow check is the conversion to u64
+    let bpp = as_u64(numeric(numexpr!(("colors" * "bpc" + 7) / 8)));
+    let row_bytes = as_u64(numeric(numexpr!(("colors" * "bpc" * "columns" + 7) / 8)));
+
+    let row = record([
+        ("tag", byte_in(0..=4)),
+        ("data", repeat_count(var("row_bytes"), Format::ANY_BYTE)),
+    ]);
+
+    // Reconstructs one byte `x` of a row, given the bytes of the row so far (`done`) and the
+    // previous row (`prev`, empty for the first row, where it counts as zeros).
+    let step = {
+        let ix = || seq_length(var("done"));
+        let has_left = || expr_gte(ix(), var("bpp"));
+        let prev_at =
+            |i: Expr| expr_option_map_or(Expr::U8(0), |b| b, index_checked(var("prev"), i));
+        let left = expr_if_else(
+            has_left(),
+            index_unchecked(var("done"), sub(ix(), var("bpp"))),
+            Expr::U8(0),
+        );
+        let above = prev_at(ix());
+        let upper_left = expr_if_else(has_left(), prev_at(sub(ix(), var("bpp"))), Expr::U8(0));
+        // Paeth: of left, above and upper-left, the one closest to `left + above - upper_left`
+        // (ties going in that order). The distances simplify to these.
+        let paeth = {
+            let dist_left = || numeric(numexpr!(abs ("a" into i16 - "c" into i16)));
+            let dist_above = || numeric(numexpr!(abs ("l" into i16 - "c" into i16)));
+            let dist_ul =
+                || numeric(numexpr!(abs ("l" into i16 + "a" into i16 - 2 * "c" into i16)));
+            expr_if_else(
+                and(
+                    expr_lte(dist_left(), dist_above()),
+                    expr_lte(dist_left(), dist_ul()),
+                ),
+                var("l"),
+                expr_if_else(expr_lte(dist_above(), dist_ul()), var("a"), var("c")),
+            )
+        };
+        let prediction = expr_match(
+            var("tag"),
+            [
+                (Pattern::U8(0), Expr::U8(0)),
+                (Pattern::U8(1), var("l")),
+                (Pattern::U8(2), var("a")),
+                (
+                    Pattern::U8(3),
+                    as_u8(numeric(numexpr!(("l" into u16 + "a" into u16) / 2))),
+                ),
+                // 4, the only other tag the row format accepts
+                (Pattern::Wildcard, paeth),
+            ],
+        );
+        // `(x + prediction) mod 256`
+        let byte = expr_match(
+            prediction,
+            [(
+                bind("p"),
+                as_u8(numeric(numexpr!(("x" into u16 + "p" into u16) % 256))),
+            )],
+        );
+        lambda_tuple(
+            ["done", "x"],
+            expr_match(
+                Expr::Tuple(vec![left, above, upper_left]),
+                [(
+                    Pattern::Tuple(vec![bind("l"), bind("a"), bind("c")]),
+                    append(var("done"), Expr::Seq(vec![byte])),
+                )],
+            ),
+        )
+    };
+    let bytes_type = || ValueType::Seq(Box::new(ValueType::Base(BaseType::U8)));
+    // Each row is reconstructed from the previous reconstructed row, which is carried along
+    let unfilter_row = lambda_tuple(
+        ["prev", "row"],
+        expr_match(
+            Expr::Tuple(vec![
+                record_proj(var("row"), "tag"),
+                record_proj(var("row"), "data"),
+            ]),
+            [(
+                Pattern::Tuple(vec![bind("tag"), bind("data")]),
+                expr_match(
+                    left_fold(step, Expr::Seq(vec![]), bytes_type(), var("data")),
+                    [(bind("cur"), Expr::Tuple(vec![var("cur"), var("cur")]))],
+                ),
+            )],
+        ),
+    );
+
+    chain(
+        field("colors"),
+        "colors",
+        chain(
+            field("bpc"),
+            "bpc",
+            chain(
+                field("columns"),
+                "columns",
+                chain(
+                    compute(bpp),
+                    "bpp",
+                    chain(
+                        compute(row_bytes),
+                        "row_bytes",
+                        chain(
+                            repeat(row),
+                            "rows",
+                            monad_seq(
+                                Format::EndOfInput,
+                                compute(flat_map_accum(
+                                    unfilter_row,
+                                    Expr::Seq(vec![]),
+                                    bytes_type(),
+                                    var("rows"),
+                                )),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+}
+
 /// DaeDaLus `FlateDecode` (a host primitive there): zlib-decodes the bytes `body` with the
-/// `zlib` format from `doodle-formats`, given a [`flate_decode_params`] record `params`.
+/// `zlib` format from `doodle-formats`, given a [`flate_decode_params`] record `params`, then
+/// reverses the PNG predictor if `params` names one (see [`png_unpredict`]).
 ///
 /// Fails when `supported_predictor` rejects `params`, the case in which DaeDaLus
-/// `TryApplyFilter` reports the filter as unsupported instead of applying it. Also fails for
-/// the PNG predictors (`10..=15`), whose un-filtering isn't implemented yet (#352); only
-/// predictor `1` (no prediction) decodes.
+/// `TryApplyFilter` reports the filter as unsupported instead of applying it.
 #[cfg_attr(not(test), allow(dead_code))]
 fn flate_decode(zlib: FormatRef, params: Expr, body: Expr) -> Format {
     let inflate = decode_bytes(
@@ -617,9 +757,13 @@ fn flate_decode(zlib: FormatRef, params: Expr, body: Expr) -> Format {
     if_then_else(
         supported_predictor(params.clone()),
         if_then_else(
-            expr_eq(record_proj(params, "predictor"), Expr::U64(1)),
-            inflate,
-            Format::Fail, // "PNG predictors are not yet supported" (#352)
+            expr_eq(record_proj(params.clone(), "predictor"), Expr::U64(1)),
+            inflate.clone(),
+            chain(
+                inflate,
+                "inflated",
+                decode_bytes(var("inflated"), png_unpredict(params)),
+            ),
         ),
         Format::Fail, // "unsupported predictor"
     )
@@ -1363,6 +1507,14 @@ mod tests {
         0x78, 0x01, 0x01, 0x03, 0x00, 0xfc, 0xff, 0x61, 0x62, 0x63, 0x02, 0x4d, 0x01, 0x27,
     ];
 
+    /// zlib of three 5-byte rows, each filtered with tag 2 (Up), as xref streams usually are
+    const UP_Z: &[u8] = &[
+        0x78, 0x9c, 0x63, 0x62, 0x64, 0x60, 0x10, 0x64, 0x60, 0x62, 0x60, 0x60, 0x48, 0x67, 0x60,
+        0x62, 0x64, 0xe0, 0xec, 0x60, 0x06, 0x00, 0x05, 0xc4, 0x01, 0x15,
+    ];
+    /// The rows of [`UP_Z`] before filtering
+    const UP_RAW: &[u8] = &[1, 0, 0, 17, 0, 1, 0, 0, 120, 0, 2, 0, 9, 0, 3];
+
     /// Parses a `pdf.value` that is a dict or `null` (as a `/DecodeParms` entry), then `rest`
     /// with the [`flate_decode_params`] record bound to `params`.
     fn with_flate_params(module: &mut FormatModule, rest: Format) -> Format {
@@ -1441,6 +1593,112 @@ mod tests {
         }
     }
 
+    /// `png_unpredict` reconstructs PNG-filtered rows, checked against vectors made by a
+    /// forward PNG filter (in Python) and decoded identically by the DaeDaLus host
+    /// implementation (`formats/pdf/new/rust/src/filters/predictor.rs`). It fails on a tag
+    /// over 4 and on a partial row, and gives nothing for no input.
+    #[test]
+    fn png_unpredict_cases() {
+        let cases: &[([u64; 3], &[u8], Option<&[u8]>)] = &[
+            // xref-like: 1 colour, 8 bits, 5 columns, every tag
+            (
+                [1, 8, 5],
+                &[
+                    0, 145, 73, 32, 138, 71, 1, 100, 140, 52, 72, 41, 2, 214, 50, 22, 233, 200, 3,
+                    122, 121, 150, 251, 86, 4, 173, 133, 196, 255, 115, 2, 69, 2, 251, 180, 209, 4,
+                    11, 146, 110, 97, 71,
+                ],
+                Some(&[
+                    145, 73, 32, 138, 71, 100, 240, 36, 108, 149, 58, 34, 58, 85, 93, 151, 213, 29,
+                    52, 158, 68, 28, 224, 223, 82, 137, 30, 219, 147, 35, 148, 176, 73, 170, 106,
+                ]),
+            ),
+            // 3 colours (bpp 3), Sub/Average/Paeth need left and upper-left
+            (
+                [3, 8, 3],
+                &[
+                    1, 188, 55, 129, 232, 235, 53, 35, 39, 245, 4, 77, 196, 24, 24, 185, 86, 44,
+                    178, 201, 3, 7, 145, 21, 6, 225, 160, 147, 127, 136, 4, 104, 242, 88, 192, 9,
+                    13, 154, 120, 230, 2, 112, 227, 88, 128, 75, 195, 147, 93, 218,
+                ],
+                Some(&[
+                    188, 55, 129, 164, 34, 182, 199, 73, 171, 9, 251, 153, 33, 180, 12, 77, 102,
+                    213, 11, 14, 97, 28, 66, 214, 199, 211, 93, 115, 0, 185, 51, 75, 227, 97, 75,
+                    67, 227, 227, 17, 179, 150, 166, 244, 168, 29,
+                ]),
+            ),
+            // 16 bits (bpp 2)
+            (
+                [1, 16, 4],
+                &[
+                    4, 117, 34, 130, 24, 168, 179, 134, 184, 1, 232, 245, 88, 31, 216, 84, 122,
+                    241, 3, 64, 152, 188, 82, 143, 130, 183, 208, 2, 41, 103, 205, 72, 49, 104,
+                    203, 116,
+                ],
+                Some(&[
+                    117, 34, 247, 58, 159, 237, 37, 165, 232, 245, 64, 20, 24, 104, 146, 89, 180,
+                    18, 54, 101, 182, 232, 91, 112, 221, 121, 3, 173, 231, 80, 38, 228,
+                ]),
+            ),
+            // 1 bit, 10 columns (row of 2 bytes, bpp 1)
+            (
+                [1, 1, 10],
+                &[2, 201, 77, 4, 129, 90, 1, 152, 231, 3, 81, 110],
+                Some(&[201, 77, 74, 164, 152, 127, 157, 252]),
+            ),
+            // 4 colours of 2 bits (bpp 1), 3 columns
+            (
+                [4, 2, 3],
+                &[3, 222, 82, 135, 4, 140, 72, 176, 4, 17, 239, 84],
+                Some(&[222, 193, 231, 106, 178, 151, 123, 161, 235]),
+            ),
+            // Paeth tie between above and upper-left: left 25, above 10, upper-left 20, so the
+            // estimate is 15, at distances 10, 5 and 5, and the tie goes to above (10)
+            ([1, 8, 2], &[0, 20, 10, 4, 5, 67], Some(&[20, 10, 25, 77])),
+            // Paeth tie between left and upper-left: left 10, above 25, upper-left 20, so the
+            // estimate is 15, at distances 5, 10 and 5, and the tie goes to left (10). (A tie
+            // between left and above alone needs left == above, so its order isn't observable.)
+            ([1, 8, 2], &[0, 20, 25, 4, 246, 89], Some(&[20, 25, 10, 99])),
+            // tag 5
+            ([1, 8, 2], &[0, 1, 2, 5, 3, 4], None),
+            // a partial final row
+            ([1, 8, 2], &[0, 1, 2, 0, 3], None),
+            ([1, 8, 2], &[], Some(&[])),
+        ];
+        for ([colors, bpc, columns], input, expected) in cases {
+            let params = Expr::Record(vec![
+                (Label::Borrowed("predictor"), Expr::U64(12)),
+                (Label::Borrowed("colors"), Expr::U64(*colors)),
+                (Label::Borrowed("bpc"), Expr::U64(*bpc)),
+                (Label::Borrowed("columns"), Expr::U64(*columns)),
+            ]);
+            let mut module = FormatModule::new();
+            let top = module.define_format(
+                "test.png_unpredict",
+                chain(
+                    png_unpredict(params),
+                    "out",
+                    match expected {
+                        Some(bytes) => fmt_match(
+                            var("out"),
+                            [
+                                (pattern_bytestring(bytes), Format::EMPTY),
+                                (Pattern::Wildcard, Format::Fail),
+                            ],
+                        ),
+                        None => Format::EMPTY,
+                    },
+                ),
+            );
+            let prog = Compiler::compile_program(&module, &top.call()).expect("must compile");
+            assert_eq!(
+                prog.run(ReadCtxt::new(input)).is_ok(),
+                expected.is_some(),
+                "png_unpredict with colors {colors}, bpc {bpc}, columns {columns} on {input:?}",
+            );
+        }
+    }
+
     /// `supported_predictor` accepts no prediction, or a PNG predictor with at least one colour
     /// and column and a valid bit depth. Until #352, `flate_decode` fails on every predictor
     /// other than 1 whatever this says, so it is tested on its own.
@@ -1485,8 +1743,8 @@ mod tests {
         }
     }
 
-    /// `flate_decode` inflates zlib data when there is no predictor, and fails on corrupt
-    /// data, on a PNG predictor (not yet supported, #352) and on an unsupported predictor.
+    /// `flate_decode` inflates zlib data, reverses a PNG predictor, and fails on corrupt data,
+    /// on inflated data that isn't predictor rows, and on an unsupported predictor.
     #[test]
     fn flate_decode_inflates() {
         let hello: &[u8] = b"hello hello hello hello";
@@ -1496,7 +1754,11 @@ mod tests {
             (b"<<>>", ABC_Z, Some(b"abc")),
             (b"<< /Predictor 1 >>", ABC_Z, Some(b"abc")),
             (b"null", &corrupt, None),
+            // the inflated text isn't predictor rows (23 bytes, and `h` is not a tag)
             (b"<< /Predictor 12 /Columns 5 >>", HELLO_Z, None),
+            (b"<< /Predictor 12 /Columns 5 >>", UP_Z, Some(UP_RAW)),
+            // Columns 3 makes rows of 4 bytes, which 18 is not a multiple of
+            (b"<< /Predictor 12 /Columns 3 >>", UP_Z, None),
             (b"<< /Predictor 2 >>", HELLO_Z, None),
             (b"<< /Predictor 12 /Columns 0 >>", HELLO_Z, None),
         ];
