@@ -5296,6 +5296,56 @@ mod test {
         assert!(prog.run(ReadCtxt::new(b"SaZ")).is_ok());
     }
 
+    /// A recursive-batch member can pattern-match the result of its own call, whose type is
+    /// still registration's `Any` placeholder in the first pass (`Pattern::build_scope`), and
+    /// gets the batch's real type from the `TypeChecker` afterwards.
+    #[test]
+    fn batch_member_matches_own_call_result() {
+        use crate::helper::{
+            alts, bind, chain, compute, fmt_match, is_byte, monad_seq, var,
+        };
+        let mut module = FormatModule::new();
+        // `L` is `leaf('L')`; `N` then a `leaf(x)` is `node(x)`, and `N` then a `node` fails
+        let [f] = module.define_batch_with_args(
+            [("test.unwrap_self", vec![])],
+            [Box::new(|&[f]: &[FormatRef; 1]| {
+                alts([
+                    ("leaf", is_byte(b'L')),
+                    (
+                        "node",
+                        monad_seq(
+                            is_byte(b'N'),
+                            chain(
+                                f.call(),
+                                "r",
+                                fmt_match(
+                                    var("r"),
+                                    [
+                                        (
+                                            Pattern::Variant("leaf".into(), Box::new(bind("x"))),
+                                            compute(var("x")),
+                                        ),
+                                        (Pattern::Wildcard, Format::Fail),
+                                    ],
+                                ),
+                            ),
+                        ),
+                    ),
+                ])
+            })],
+        );
+        assert_eq!(
+            module.get_format_type(f.get_level()),
+            &ValueType::Union(std::collections::BTreeMap::from([
+                (Label::Borrowed("leaf"), ValueType::Base(BaseType::U8)),
+                (Label::Borrowed("node"), ValueType::Base(BaseType::U8)),
+            ]))
+        );
+        let prog = super::decoder::Compiler::compile_program(&module, &f.call()).unwrap();
+        assert!(prog.run(ReadCtxt::new(b"NL")).is_ok());
+        assert!(prog.run(ReadCtxt::new(b"NNL")).is_err());
+    }
+
     /// A `Fail` unified with a union-typed format keeps the union: `Fail`'s type, `Empty`, is
     /// bottom also where it meets a union's variable (`TypeChecker::transfer_constraints`),
     /// rather than leaving the combined variable `Empty`. Here the `Fail` branch comes first, so

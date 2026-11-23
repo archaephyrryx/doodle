@@ -69,6 +69,29 @@ impl Pattern {
         Pattern::Binding(name.into())
     }
 
+    /// The variables bound by `self`, in order.
+    fn binding_names(&self) -> Vec<&Label> {
+        match self {
+            Pattern::Binding(name) => vec![name],
+            Pattern::Tuple(ps) | Pattern::Seq(ps) => {
+                ps.iter().flat_map(Pattern::binding_names).collect()
+            }
+            Pattern::Variant(_, p) => p.binding_names(),
+            Pattern::Option(Some(p)) => p.binding_names(),
+            Pattern::Wildcard
+            | Pattern::Bool(_)
+            | Pattern::U8(_)
+            | Pattern::U16(_)
+            | Pattern::U32(_)
+            | Pattern::U64(_)
+            | Pattern::Int(_)
+            | Pattern::ZConst(_)
+            | Pattern::ZRange(_)
+            | Pattern::Char(_)
+            | Pattern::Option(None) => Vec::new(),
+        }
+    }
+
     pub(crate) fn build_scope(&self, scope: &mut TypeScope<'_>, t: Rc<ValueType>) -> AResult<()> {
         let t = match t.as_ref() {
             ValueType::Rec(_) => Rc::new(scope.unfold(ValueType::clone(&t))),
@@ -120,6 +143,15 @@ impl Pattern {
                 // FIXME - this is pretty bad, but it is hard to do better without more destructive changes
                 let tmp = Rc::new(t.clone());
                 p.build_scope(scope, tmp)?;
+            }
+            // `Any` is the placeholder type of a recursive-batch member that registration's
+            // first pass has not reached yet (see `FormatModule::infer_batch_types`), which
+            // `ValueType::unify` already accepts as-is; the batch is then type-checked
+            // properly. So a pattern matches it, with each variable it binds also `Any`.
+            (p, ValueType::Any) => {
+                for name in p.binding_names() {
+                    scope.push(name.clone(), ValueType::Any);
+                }
             }
             (l, r) => return Err(anyhow!("pattern {l:?} does not match type {r:?}")),
         }
@@ -175,6 +207,12 @@ impl Pattern {
                 // FIXME - this is pretty bad, but it is hard to do better without more destructive changes
                 let tmp = Rc::new(t.clone());
                 p.build_scope_ext(scope, tmp)?;
+            }
+            // As in `build_scope`
+            (p, ValueTypeExt::Any) => {
+                for name in p.binding_names() {
+                    scope.push(name.clone(), ValueTypeExt::Any);
+                }
             }
             (l, r) => return Err(anyhow!("pattern {l:?} does not match type {r:?}")),
         }
