@@ -1136,7 +1136,285 @@ fn cross_ref_section(
     )
 }
 
+/// DaeDaLus `WhiteTillEOL`: simple whitespace, then an end-of-line
+fn white_till_eol(eol: FormatRef) -> Format {
+    monad_seq(repeat(byte_in(SIMPLE_WS)), eol.call())
+}
+
+/// A run of decimal digits (as from `pdf.util.natural`) read as a `u64`, failing if it is too
+/// large (DaeDaLus `Natural as? uint 64`).
+fn natural_u64(natural: FormatRef) -> Format {
+    chain(
+        natural.call(),
+        "digits",
+        fmt_match(
+            number_as_nat(var("digits")),
+            [
+                (pat_some(bind("n")), compute(var("n"))),
+                (pat_none(), Format::Fail), // "number too large"
+            ],
+        ),
+    )
+}
+
+/// DaeDaLus `PdfEnd`: `startxref`, the offset of the last cross-reference section, and `%%EOF`,
+/// each on its own line. Yields the offset.
+fn pdf_end(module: &mut FormatModule, eol: FormatRef, natural: FormatRef) -> FormatRef {
+    let ws = || repeat(byte_in(SIMPLE_WS));
+    module.define_format(
+        "pdf.end",
+        record_daedalus([
+            ("__ws0", ws()),
+            ("__startxref", match_str(b"startxref")),
+            ("__eol0", white_till_eol(eol)),
+            ("__ws1", ws()),
+            ("$$", natural_u64(natural)),
+            ("__eol1", white_till_eol(eol)),
+            ("__ws2", ws()),
+            ("__eof", match_str(b"%%EOF")),
+        ]),
+    )
+}
+
+/// The `pdf.end` for the *last* `startxref` in the input, as the DaeDaLus host finds it (it
+/// searches backwards from the end of the file for `startxref`, then parses `PdfEnd` there).
+///
+/// The first offset where `pdf.end` parses and no `startxref` follows is that last occurrence,
+/// and this fails exactly when the host's search or parse does. The search runs forward over
+/// the whole input; a backward `SkipTo` (#358) would avoid that.
+fn last_pdf_end(pdf_end: FormatRef) -> Format {
+    // Whether another `startxref` follows. `PeekNot` can't take a `SkipTo` (whose lookahead
+    // is unbounded), so this is a `UnionNondet`, which commits to its first branch that
+    // succeeds.
+    let another_follows = Format::UnionNondet(vec![
+        monad_seq(
+            Format::Peek(Box::new(Format::SkipTo(Box::new(is_bytes(b"startxref"))))),
+            compute(Expr::Bool(true)),
+        ),
+        compute(Expr::Bool(false)),
+    ]);
+    skip_to(chain(
+        pdf_end.call(),
+        "offset",
+        chain(
+            another_follows,
+            "another",
+            if_then_else(var("another"), Format::Fail, compute(var("offset"))),
+        ),
+    ))
+}
+
+/// DaeDaLus `TrailerDict`, given a `pdf.value.dict` result `dict`: the `size`, `root`, `prev`
+/// and `xrefstm` entries, and the whole dict as `all`. The `/Encrypt` and `/ID` entries
+/// (`TrailerDictEncrypt`) aren't extracted.
+///
+/// `size` is required and must be a natural number. `root` must be a reference if present.
+/// `prev` and `xrefstm` are `None` if absent or not a natural number, as DaeDaLus `Optional`
+/// gives. DaeDaLus resolves an indirect `/XRefStm`; until #355 that gives `None` here.
+fn trailer_dict(dict: Expr, value_type: ValueType) -> Format {
+    let optional_nat = |key: &[u8]| {
+        expr_match(
+            dict_lookup(key, dict.clone(), value_type.clone()),
+            [
+                (
+                    pat_some(Pattern::Variant("number".into(), Box::new(bind("n")))),
+                    number_as_nat(var("n")),
+                ),
+                (Pattern::Wildcard, expr_none()),
+            ],
+        )
+    };
+    record_auto([
+        (
+            "size",
+            chain(
+                dict_get(b"Size", dict.clone(), value_type.clone()),
+                "size",
+                nat_value(var("size")),
+            ),
+        ),
+        (
+            "root",
+            fmt_match(
+                dict_lookup(b"Root", dict.clone(), value_type.clone()),
+                [
+                    (
+                        pat_some(Pattern::Variant("ref".into(), Box::new(bind("r")))),
+                        compute(expr_some(var("r"))),
+                    ),
+                    (pat_none(), compute(expr_none())),
+                    (Pattern::Wildcard, Format::Fail), // "/Root is not a reference"
+                ],
+            ),
+        ),
+        ("prev", compute(optional_nat(b"Prev"))),
+        ("xrefstm", compute(optional_nat(b"XRefStm"))),
+        ("all", compute(dict)),
+    ])
+}
+
+/// DaeDaLus `CrossRef`: the cross-reference section found at an offset.
+///
+/// Only the classic form (`CrossRefAndTrailer`: an `xref` table, then `trailer` and its dict)
+/// is supported so far. DaeDaLus also accepts a cross-reference stream (`XRefObj`) here, and
+/// until that is added, a link to one fails the parse.
+fn cross_ref(
+    module: &mut FormatModule,
+    any_ws: FormatRef,
+    eol: FormatRef,
+    xref_table: FormatRef,
+    pdf_dict: FormatRef,
+    value_type: ValueType,
+) -> FormatRef {
+    let just_white = union([void(byte_in(SIMPLE_WS)), eol.call()]);
+    let old_xref = record_auto([
+        // DaeDaLus `CrossRefSection` allows whitespace and comments before `xref`
+        ("xref", monad_seq(repeat(any_ws.call()), xref_table.call())),
+        // ... but only whitespace (no comments) before `trailer`
+        ("__ws", repeat(just_white)),
+        ("__kw_trailer", kw(b"trailer", any_ws)),
+        ("_dict", pdf_dict.call_args(vec![Expr::U64(32)])),
+        ("trailer", trailer_dict(var("_dict"), value_type)),
+    ]);
+    module.define_format("pdf.cross_ref", fmt_variant("old_xref", old_xref))
+}
+
+/// The cross-reference sections reachable from the one at `offset` (relative to `base`, the
+/// position of the `%PDF-` header), through `/Prev` and `/XRefStm` links.
+///
+/// Follows the DaeDaLus host (`process_xref`): an offset that has already been visited is an
+/// error (a cycle, or two links to one section), and for each section the `/Prev` link is
+/// followed before `/XRefStm`. Each section's own entries take precedence over those of its
+/// `/XRefStm` sections, which take precedence over its `/Prev` sections, so `sections` lists
+/// them in that order (highest precedence first). `visited` is threaded from the `/Prev` call
+/// into the `/XRefStm` call, as the host's visited-set is.
+///
+/// `lim` bounds the depth of the links followed; the visited check alone already guarantees
+/// termination, so `lim` only guards against a very long chain overflowing the stack.
+fn xref_chain(module: &mut FormatModule, cross_ref: FormatRef) -> FormatRef {
+    let u64_type = || ValueType::Base(BaseType::U64);
+    let args = vec![
+        (Label::Borrowed("base"), u64_type()),
+        (Label::Borrowed("offset"), u64_type()),
+        (
+            Label::Borrowed("visited"),
+            ValueType::Seq(Box::new(u64_type())),
+        ),
+        (Label::Borrowed("lim"), u64_type()),
+    ];
+    let [chain_ref] = module.define_batch_with_args(
+        [("pdf.xref_chain", args)],
+        [Box::new(move |&[xref_chain]: &[FormatRef; 1]| {
+            // Follows `link` (an `Option` of an offset) with the visited offsets `visited`, or
+            // yields no sections if there is no link.
+            let follow = |link: Expr, visited: Expr| {
+                fmt_match(
+                    link,
+                    [
+                        (
+                            pat_some(bind("next")),
+                            xref_chain.call_args(vec![
+                                var("base"),
+                                var("next"),
+                                visited.clone(),
+                                sub(var("lim"), Expr::U64(1)),
+                            ]),
+                        ),
+                        (
+                            pat_none(),
+                            compute(Expr::Record(vec![
+                                (Label::Borrowed("sections"), Expr::Seq(vec![])),
+                                (Label::Borrowed("visited"), visited),
+                            ])),
+                        ),
+                    ],
+                )
+            };
+            let trailer = || {
+                expr_match(
+                    var("section"),
+                    [(
+                        Pattern::Variant("old_xref".into(), Box::new(bind("x"))),
+                        record_proj(var("x"), "trailer"),
+                    )],
+                )
+            };
+            let visited_here = || append(var("visited"), Expr::Seq(vec![var("offset")]));
+            if_then_else(
+                or(
+                    expr_eq(var("lim"), Expr::U64(0)), // "cross-reference chain too long"
+                    seq_any(|v| expr_eq(v, var("offset")), var("visited")), // "cycle"
+                ),
+                Format::Fail,
+                chain(
+                    with_relative_offset(Some(var("base")), var("offset"), cross_ref.call()),
+                    "section",
+                    chain(
+                        follow(record_proj(trailer(), "prev"), visited_here()),
+                        "prev",
+                        chain(
+                            follow(
+                                record_proj(trailer(), "xrefstm"),
+                                record_proj(var("prev"), "visited"),
+                            ),
+                            "xrefstm",
+                            compute(Expr::Record(vec![
+                                (
+                                    Label::Borrowed("sections"),
+                                    concat(Expr::Seq(vec![
+                                        Expr::Seq(vec![var("section")]),
+                                        record_proj(var("xrefstm"), "sections"),
+                                        record_proj(var("prev"), "sections"),
+                                    ])),
+                                ),
+                                (
+                                    Label::Borrowed("visited"),
+                                    record_proj(var("xrefstm"), "visited"),
+                                ),
+                            ])),
+                        ),
+                    ),
+                ),
+            )
+        })],
+    );
+    chain_ref
+}
+
+/// The cross-reference sections of a PDF, found from its end as the DaeDaLus host does: the
+/// `%PDF-` header gives the base for all offsets, the last `startxref` gives the offset of the
+/// newest section, and `/Prev` and `/XRefStm` links lead to the rest (see [`xref_chain`]).
+///
+/// Sits alongside `pdf.main` (a front-to-back parse), and leaves any bytes after the final
+/// `%%EOF` unread.
+fn pdf_cos(module: &mut FormatModule, pdf_end: FormatRef, xref_chain: FormatRef) -> FormatRef {
+    module.define_format(
+        "pdf.cos",
+        record_auto([
+            ("header_offset", count_to(is_bytes(b"%PDF-"))),
+            ("startxref", last_pdf_end(pdf_end)),
+            (
+                "_chain",
+                xref_chain.call_args(vec![
+                    var("header_offset"),
+                    var("startxref"),
+                    Expr::Seq(vec![]),
+                    Expr::U64(64),
+                ]),
+            ),
+            ("sections", compute(record_proj(var("_chain"), "sections"))),
+        ]),
+    )
+}
+
 pub fn main(module: &mut FormatModule) -> FormatRef {
+    let [pdf_main, _pdf_cos] = top_formats(module);
+    pdf_main
+}
+
+/// Defines the module's formats, returning the two top-level ones: `pdf.main` (front to back)
+/// and `pdf.cos` (from the end, following the cross-reference chain).
+fn top_formats(module: &mut FormatModule) -> [FormatRef; 2] {
     let simple_eol = simple_eol(module);
     let eol = eol(module, simple_eol);
     let comment = comment(module, eol);
@@ -1153,7 +1431,7 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
     let stream = stream(module, simple_eol, any_ws, pdf_value_type.clone());
     let top_decl_def = module.define_format_args(
         "pdf.top_decl",
-        vec![(Label::Borrowed("val"), pdf_value_type)],
+        vec![(Label::Borrowed("val"), pdf_value_type.clone())],
         alts([
             ("stream", stream.invoke_args([var("val")])),
             ("value", compute(var("val"))),
@@ -1179,6 +1457,19 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
         ),
     );
 
+    // `pdf.cos`, the end-driven parse, alongside the front-to-back `pdf.main`
+    let pdf_end = pdf_end(module, eol, natural);
+    let cross_ref = cross_ref(
+        module,
+        any_ws,
+        eol,
+        cross_ref_section,
+        pdf_dict,
+        pdf_value_type.clone(),
+    );
+    let xref_chain = xref_chain(module, cross_ref);
+    let pdf_cos = pdf_cos(module, pdf_end, xref_chain);
+
     let pdf_chunk = module.define_format(
         "pdf.chunk",
         record_auto([
@@ -1191,7 +1482,7 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
         ]),
     );
 
-    module.define_format(
+    let pdf_main = module.define_format(
         "pdf.main",
         only(record_auto([
             (
@@ -1202,7 +1493,8 @@ pub fn main(module: &mut FormatModule) -> FormatRef {
             ("chunks", repeat(pdf_chunk.call())),
             // adding `Many AnyWS` here breaks matchtree because pdf_chunk can end in whitespace
         ])),
-    )
+    );
+    [pdf_main, pdf_cos]
 }
 
 #[cfg(test)]
@@ -1797,6 +2089,229 @@ mod tests {
                 "flate_decode with {:?}, expecting {:?}",
                 String::from_utf8_lossy(param),
                 expected.map(String::from_utf8_lossy),
+            );
+        }
+    }
+
+    /// A classic cross-reference section for [`build_pdf`], identified by its trailer's
+    /// `/Size`, with optional `/Prev` and `/XRefStm` links to other sections by index. An index
+    /// past the last section stands for an offset past the end of the file.
+    struct Sec {
+        size: u64,
+        prev: Option<usize>,
+        xrefstm: Option<usize>,
+    }
+
+    const fn sec(size: u64, prev: Option<usize>, xrefstm: Option<usize>) -> Sec {
+        Sec {
+            size,
+            prev,
+            xrefstm,
+        }
+    }
+
+    /// `prefix`, a `%PDF-1.4` header, the sections `secs`, then a `startxref` block for each
+    /// index in `startxrefs`, then `suffix`. Offsets are relative to the header, and links are
+    /// written with ten digits, so a section's length doesn't depend on where its links point.
+    fn build_pdf(prefix: &[u8], secs: &[Sec], startxrefs: &[usize], suffix: &[u8]) -> Vec<u8> {
+        const HEADER: &[u8] = b"%PDF-1.4\n";
+        let render = |sec: &Sec, offsets: &[usize]| {
+            let link = |key: &str, ix: Option<usize>| match ix {
+                Some(ix) => format!(
+                    " /{key} {:010}",
+                    offsets.get(ix).copied().unwrap_or(9_999_999)
+                ),
+                None => String::new(),
+            };
+            format!(
+                "xref\n0 1\n0000000000 65535 f\r\ntrailer\n<< /Size {}{}{} >>\n",
+                sec.size,
+                link("Prev", sec.prev),
+                link("XRefStm", sec.xrefstm)
+            )
+            .into_bytes()
+        };
+        let mut offsets = Vec::new();
+        let mut at = HEADER.len();
+        for sec in secs {
+            offsets.push(at);
+            at += render(sec, &[]).len();
+        }
+        let mut out = [prefix, HEADER].concat();
+        for sec in secs {
+            out.extend(render(sec, &offsets));
+        }
+        for &ix in startxrefs {
+            out.extend(format!("startxref\n{}\n%%EOF\n", offsets[ix]).into_bytes());
+        }
+        out.extend_from_slice(suffix);
+        out
+    }
+
+    /// `pdf.cos` finds the last `startxref` (relative to the `%PDF-` header), and lists the
+    /// sections reachable from it in precedence order: each section, then its `/XRefStm`
+    /// sections, then its `/Prev` sections, as the DaeDaLus host merges them. It fails on a
+    /// revisited section, an out-of-range offset, an unparsable final `startxref`, and a chain
+    /// longer than its limit. Each case gives the expected `/Size`s, in order, or `None`.
+    #[test]
+    fn pdf_cos_follows_xref_chain() {
+        let long_chain = |n: usize| -> Vec<Sec> {
+            (0..n)
+                .map(|i| sec(i as u64, i.checked_sub(1), None))
+                .collect()
+        };
+        let cases: Vec<(&str, Vec<u8>, Option<Vec<u64>>)> = vec![
+            (
+                "one section",
+                build_pdf(b"", &[sec(1, None, None)], &[0], b""),
+                Some(vec![1]),
+            ),
+            (
+                "a /Prev chain",
+                build_pdf(b"", &[sec(1, None, None), sec(2, Some(0), None)], &[1], b""),
+                Some(vec![2, 1]),
+            ),
+            (
+                "/XRefStm takes precedence over /Prev",
+                build_pdf(
+                    b"",
+                    &[
+                        sec(1, None, None),
+                        sec(2, None, None),
+                        sec(3, Some(0), Some(1)),
+                    ],
+                    &[2],
+                    b"",
+                ),
+                Some(vec![3, 2, 1]),
+            ),
+            (
+                "the /Prev subtree comes after the /XRefStm subtree",
+                build_pdf(
+                    b"",
+                    &[
+                        sec(1, None, None),
+                        sec(2, None, None),
+                        sec(3, Some(0), None),
+                        sec(4, Some(2), Some(1)),
+                    ],
+                    &[3],
+                    b"",
+                ),
+                Some(vec![4, 2, 3, 1]),
+            ),
+            (
+                "the last startxref is used",
+                build_pdf(
+                    b"",
+                    &[sec(1, None, None), sec(2, Some(0), None)],
+                    &[0, 1],
+                    b"",
+                ),
+                Some(vec![2, 1]),
+            ),
+            (
+                "the last startxref is used, even if older",
+                build_pdf(
+                    b"",
+                    &[sec(1, None, None), sec(2, Some(0), None)],
+                    &[1, 0],
+                    b"",
+                ),
+                Some(vec![1]),
+            ),
+            (
+                "bytes after the last %%EOF are ignored",
+                build_pdf(b"", &[sec(1, None, None)], &[0], b"\ntrailing junk"),
+                Some(vec![1]),
+            ),
+            (
+                "offsets are relative to the %PDF- header",
+                build_pdf(b"leading junk\n", &[sec(1, None, None)], &[0], b""),
+                Some(vec![1]),
+            ),
+            (
+                "a chain within the limit",
+                build_pdf(b"", &long_chain(64), &[63], b""),
+                { Some((0..64).rev().collect()) },
+            ),
+            (
+                "a chain over the limit",
+                build_pdf(b"", &long_chain(65), &[64], b""),
+                None,
+            ),
+            (
+                "a /Prev cycle",
+                build_pdf(b"", &[sec(1, Some(0), None)], &[0], b""),
+                None,
+            ),
+            (
+                "two links to one section",
+                build_pdf(
+                    b"",
+                    &[sec(1, None, None), sec(2, Some(0), Some(0))],
+                    &[1],
+                    b"",
+                ),
+                None,
+            ),
+            (
+                "a /Prev past the end of the file",
+                build_pdf(b"", &[sec(1, Some(5), None)], &[0], b""),
+                None,
+            ),
+            (
+                "an unparsable final startxref",
+                build_pdf(
+                    b"",
+                    &[sec(1, None, None)],
+                    &[0],
+                    b"startxref\nnot a number\n%%EOF\n",
+                ),
+                None,
+            ),
+            (
+                "no startxref",
+                build_pdf(b"", &[sec(1, None, None)], &[], b""),
+                None,
+            ),
+        ];
+        let mut module = FormatModule::new();
+        let [_pdf_main, pdf_cos] = top_formats(&mut module);
+        for (name, input, expected) in cases {
+            let sizes = flat_map(
+                lambda(
+                    "s",
+                    expr_match(
+                        var("s"),
+                        [(
+                            Pattern::Variant("old_xref".into(), Box::new(bind("x"))),
+                            Expr::Seq(vec![record_lens(var("x"), &["trailer", "size"])]),
+                        )],
+                    ),
+                ),
+                record_proj(var("cos"), "sections"),
+            );
+            let check = match &expected {
+                Some(sizes_expected) => fmt_match(
+                    sizes,
+                    [
+                        (
+                            Pattern::Seq(sizes_expected.iter().map(|n| Pattern::U64(*n)).collect()),
+                            Format::EMPTY,
+                        ),
+                        (Pattern::Wildcard, Format::Fail),
+                    ],
+                ),
+                None => Format::EMPTY,
+            };
+            let top = chain(pdf_cos.call(), "cos", check);
+            let prog = Compiler::compile_program(&module, &top).expect("must compile");
+            assert_eq!(
+                prog.run(ReadCtxt::new(&input)).is_ok(),
+                expected.is_some(),
+                "{name}: expecting {expected:?} from {:?}",
+                String::from_utf8_lossy(&input)
             );
         }
     }
