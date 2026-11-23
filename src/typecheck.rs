@@ -734,6 +734,12 @@ pub struct TypeChecker {
     /// interpreter represents an anonymous recursive value without difficulty, so only codegen
     /// needs the stricter rule.
     nominal_cycles_only: bool,
+    /// Type annotations of the form [`ValueType::Rec(level)`](ValueType::Rec) whose `level` had
+    /// no variable yet (in `level_vars`) when the annotation was unified, as `(var, level)`.
+    ///
+    /// The `Expr`-level inference that meets most annotations has no access to the module, so
+    /// these are resolved by [`Self::resolve_pending_recs`], from the entry points that do.
+    pending_recs: Vec<(UVar, usize)>,
     // /// Scaffolding for compartmentalized external type inference in the arithmetic extension grammar
     // sub_extension: EmbeddedResolver,
 }
@@ -759,6 +765,7 @@ impl TypeChecker {
             level_vars: HashMap::new(),
             void_table: OnceCell::new(),
             nominal_cycles_only: true,
+            pending_recs: Vec::new(),
             // sub_extension: EmbeddedResolver::new(),
         }
     }
@@ -2082,6 +2089,15 @@ impl TypeChecker {
                     self.unify_var_proj_param(uv, param_v)?;
                     self.unify_var_valuetype(param_v, inner)?;
                 }
+                // The type of the format at `level`, which is that level's variable. This allocates
+                // no `UVar`, so the `Elaborator`'s lockstep count is unaffected (see
+                // `infer_var_format_level`).
+                ValueType::Rec(level) => match self.level_vars.get(level) {
+                    Some(&level_var) => {
+                        self.unify_var_pair(uv, level_var)?;
+                    }
+                    None => self.pending_recs.push((uv, *level)),
+                },
                 other => unreachable!("unify_var_utype failed on non-nested ValueType {other:?}"),
             },
         }
@@ -3986,6 +4002,38 @@ impl TypeChecker {
         Ok(uv.into())
     }
 
+    /// Infers the type of `level`, which no call has reached, with its parameters bound to
+    /// their declared types (as the `Format::ItemVar` arm would bind them to a call's
+    /// arguments).
+    fn infer_unreached_level(&mut self, level: usize, module: &FormatModule) -> TCResult<UVar> {
+        let scope = UScope::Empty;
+        let ctxt = Ctxt::new(module, &scope);
+        let mut arg_scope = UMultiScope::new(&scope);
+        for (lbl, vt) in module.get_args(level) {
+            let v_arg = self.get_new_uvar();
+            self.unify_var_valuetype(v_arg, vt)?;
+            arg_scope.push(lbl.clone(), v_arg);
+        }
+        let level_scope = UScope::Multi(&arg_scope);
+        self.infer_var_format_level(level, ctxt.with_scope(&level_scope), None)
+    }
+
+    /// Unifies each [`Self::pending_recs`] entry with its level's variable, inferring any level
+    /// that hasn't been reached (which may add further entries).
+    ///
+    /// In [`Self::infer_module`], every level has been inferred by the time this runs, so it
+    /// allocates no `UVar`s there and leaves the `Elaborator`'s lockstep count intact.
+    fn resolve_pending_recs(&mut self, module: &FormatModule) -> TCResult<()> {
+        while let Some((uv, level)) = self.pending_recs.pop() {
+            let level_var = match self.level_vars.get(&level) {
+                Some(&v) => v,
+                None => self.infer_unreached_level(level, module)?,
+            };
+            self.unify_var_pair(uv, level_var)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn infer_module(module: &FormatModule, top_format: &Format) -> TCResult<Self> {
         let mut this = Self::new();
         let scope = UScope::Empty;
@@ -4018,6 +4066,7 @@ impl TypeChecker {
             }
             seen_levels = all_seen_levels;
         }
+        this.resolve_pending_recs(module)?;
         this.check_unique_solutions()?;
         Ok(this)
     }
@@ -4038,25 +4087,16 @@ impl TypeChecker {
     ) -> TCResult<Vec<ValueType>> {
         let mut this = Self::new();
         this.nominal_cycles_only = false;
-        let scope = UScope::Empty;
-        let ctxt = Ctxt::new(module, &scope);
         for level in levels.clone() {
             if this.level_vars.contains_key(&level) {
                 // Already inferred, as the callee of an earlier member, with that call's
                 // arguments bound to its parameters.
                 continue;
             }
-            // Not reached through any call yet, so its parameters are bound here, to their
-            // declared types, as the `Format::ItemVar` arm would bind them to a call's arguments.
-            let mut arg_scope = UMultiScope::new(&scope);
-            for (lbl, vt) in module.get_args(level) {
-                let v_arg = this.get_new_uvar();
-                this.unify_var_valuetype(v_arg, vt)?;
-                arg_scope.push(lbl.clone(), v_arg);
-            }
-            let level_scope = UScope::Multi(&arg_scope);
-            this.infer_var_format_level(level, ctxt.with_scope(&level_scope), None)?;
+            // Not reached through any call yet, so its parameters are bound to their declared types
+            this.infer_unreached_level(level, module)?;
         }
+        this.resolve_pending_recs(module)?;
 
         let mut level_of: HashMap<UVar, Vec<usize>> = HashMap::new();
         for (&level, &uv) in this.level_vars.iter() {
@@ -4659,6 +4699,7 @@ pub fn typecheck(module: &FormatModule, f: &Format) -> TCResult<Option<ValueType
     let scope = UScope::new();
     let ctxt = Ctxt::new(module, &scope);
     let _ut = tc.infer_utype_format(f, ctxt)?;
+    tc.resolve_pending_recs(module)?;
     // FIXME - there should be a lot more that goes on under the covers here, especially since we want to detect errors
     let ret = Ok(tc.reify(_ut).map(|aug_t| aug_t.into()));
     tc.check_uvar_sanity();

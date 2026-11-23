@@ -5245,6 +5245,57 @@ mod test {
         down
     }
 
+    /// A type annotation that names a recursive batch member's type (which contains
+    /// `ValueType::Rec`) is accepted by the `TypeChecker`, in a later batch and in whole-module
+    /// inference, whether or not the annotated level has been reached when the annotation is
+    /// met (the deferred path, `TypeChecker::resolve_pending_recs`).
+    #[test]
+    fn rec_type_annotation_in_later_batch() {
+        use crate::helper::{chain, compute, expr_none, expr_some, lambda_tuple, left_fold, var};
+
+        let mut module = FormatModule::new();
+        let down = define_down(&mut module);
+        let down_type = module.get_format_type(down.get_level()).clone();
+        assert!(
+            format!("{down_type:?}").contains("Rec("),
+            "test.down's type should refer back to itself: {down_type:?}"
+        );
+        // Keeps the last element of `seq`, with an accumulator typed `Option(test.down)`
+        let keep_last = move |seq: Expr| {
+            left_fold(
+                lambda_tuple(["acc", "x"], expr_some(var("x"))),
+                expr_none(),
+                ValueType::Option(Box::new(down_type.clone())),
+                seq,
+            )
+        };
+        let keep_last_ = keep_last.clone();
+        // `test.down` is reached (through the call) before the annotation is
+        let [reached] = module.define_batch_with_args(
+            [("test.reached", vec![])],
+            [Box::new(move |_: &[FormatRef; 1]| {
+                chain(
+                    down.call_args(vec![Expr::U8(0)]),
+                    "d",
+                    compute(keep_last_(Expr::Seq(vec![var("d")]))),
+                )
+            })],
+        );
+        // `test.down` is never reached, only named by the annotation
+        let [_unreached] = module.define_batch_with_args(
+            [("test.unreached", vec![])],
+            [Box::new(move |_: &[FormatRef; 1]| {
+                compute(keep_last(Expr::Seq(vec![])))
+            })],
+        );
+
+        typecheck::TypeChecker::infer_module(&module, &reached.call())
+            .expect("whole-module inference accepts the annotation");
+        let prog = super::decoder::Compiler::compile_program(&module, &reached.call()).unwrap();
+        // `test.down(0)`: no `a`, then `S` and `test.down(1)`, which is one `a`, then `Z`
+        assert!(prog.run(ReadCtxt::new(b"SaZ")).is_ok());
+    }
+
     /// A tuple or record type annotation that contains a union is unified as the whole type,
     /// so it is solved even when nothing else constrains the value: here the fold's element
     /// type is known only through the accumulator's annotation, since the sequence is empty.
