@@ -1485,72 +1485,144 @@ fn xref_widths(header: Expr, value_type: ValueType) -> Format {
     ])
 }
 
-/// DaeDaLus `ApplyFilters` for a cross-reference stream, given its dictionary `header` and
-/// its raw bytes `raw`: the decoded bytes.
+/// DaeDaLus `ApplyFilters`, given a stream's dictionary `header` and its raw bytes `raw`:
+/// `ok` with the decoded bytes, or `unsupported` with the name of the filter that can't be
+/// applied (followed by ` (with params)` if it has a `/DecodeParms` entry), as DaeDaLus
+/// `ApplyFilter` gives.
 ///
-/// DaeDaLus exempts a stream of `/Type /XRef` from decryption, and that is the only kind used
-/// here. Of the filters, only a single `/FlateDecode` (as a name, or alone in an array) is
-/// supported, as in [`flate_decode`]; no filter (or an empty array) leaves `raw` as it is, and
-/// any other filter, or more than one, fails. A `/DecodeParms` that is `null` (or absent) gives
-/// the defaults, and one that isn't a dict, `null`, or an array whose first element is one
-/// of those, fails, as DaeDaLus `FilterParam` does.
-fn xref_stream_filters(zlib: FormatRef, header: Expr, raw: Expr, value_type: ValueType) -> Format {
+/// Of the filters, only `/FlateDecode` with a supported predictor is applied (see
+/// [`flate_decode`]), and only on its own; no filter gives `ok` with `raw`. Unlike DaeDaLus:
+/// - every other filter is `unsupported`, including `/ASCIIHexDecode`, `/ASCII85Decode` and
+///   `/DCTDecode`, which DaeDaLus decodes or passes through;
+/// - a chain of more than one filter is `unsupported`, naming the first, and nothing is
+///   decoded;
+/// - nothing is decrypted (DaeDaLus decrypts every stream except a `/Type /XRef` one), so an
+///   encrypted file's streams are taken as they are;
+/// - an indirect `/Filter` or `/DecodeParms` isn't resolved, and fails.
+///
+/// A filter that isn't a name, or a `/DecodeParms` that isn't a dict or `null`, fails (DaeDaLus
+/// `Filter`, `FilterParam`), as does a `/FlateDecode` whose data doesn't decode.
+fn apply_filters(zlib: FormatRef, header: Expr, raw: Expr, value_type: ValueType) -> Format {
+    // DaeDaLus `LookupOptArray`: absent is `[]`, and a single value is `[value]`
+    let opt_array = |key: &[u8]| {
+        expr_match(
+            dict_lookup(key, header.clone(), value_type.clone()),
+            [
+                (pat_none(), Expr::Seq(vec![])),
+                (
+                    pat_some(Pattern::Variant("array".into(), Box::new(bind("vs")))),
+                    var("vs"),
+                ),
+                (pat_some(bind("v")), Expr::Seq(vec![var("v")])),
+            ],
+        )
+    };
     let null = || Pattern::Variant("null".into(), Box::new(Pattern::Wildcard));
-    let dict = || Pattern::Variant("dict".into(), Box::new(bind("d")));
-    // DaeDaLus `FilterParam` of the first element of `OneOrArray`, defaulting to `null`
+    // DaeDaLus `FilterParam` of the first filter's parameters, which default to `null`
     let param = fmt_match(
-        dict_lookup(b"DecodeParms", header.clone(), value_type.clone()),
+        index_checked(var("_params"), Expr::U32(0)),
         [
             (pat_none(), compute(expr_none())),
             (pat_some(null()), compute(expr_none())),
-            (pat_some(dict()), compute(expr_some(var("d")))),
             (
-                pat_some(Pattern::Variant("array".into(), Box::new(bind("ps")))),
-                fmt_match(
-                    index_checked(var("ps"), Expr::U32(0)),
-                    [
-                        (pat_none(), compute(expr_none())),
-                        (pat_some(null()), compute(expr_none())),
-                        (pat_some(dict()), compute(expr_some(var("d")))),
-                        (Pattern::Wildcard, Format::Fail), // "bad /DecodeParms"
-                    ],
-                ),
+                pat_some(Pattern::Variant("dict".into(), Box::new(bind("d")))),
+                compute(expr_some(var("d"))),
             ),
             (Pattern::Wildcard, Format::Fail), // "bad /DecodeParms"
         ],
     );
-    let flate = chain(
-        param,
-        "param",
-        flate_decode(
-            zlib,
-            flate_decode_params(var("param"), value_type.clone()),
-            raw.clone(),
+    let name = fmt_match(
+        index_unchecked(var("_filters"), Expr::U32(0)),
+        [
+            (
+                Pattern::Variant("name".into(), Box::new(bind("n"))),
+                compute(var("n")),
+            ),
+            (Pattern::Wildcard, Format::Fail), // "filter is not a name"
+        ],
+    );
+    let unsupported = || {
+        let with_params = b" (with params)".iter().map(|b| Expr::U8(*b)).collect();
+        compute(variant(
+            "unsupported",
+            expr_match(
+                var("_param"),
+                [
+                    (pat_none(), var("_name")),
+                    (
+                        Pattern::Wildcard,
+                        append(var("_name"), Expr::Seq(with_params)),
+                    ),
+                ],
+            ),
+        ))
+    };
+    let lone_flate = and(
+        expr_eq(seq_length(var("_filters")), Expr::U32(1)),
+        expr_match(
+            var("_name"),
+            [
+                (pattern_bytestring(b"/FlateDecode"), Expr::Bool(true)),
+                (Pattern::Wildcard, Expr::Bool(false)),
+            ],
         ),
     );
-    let flate_name =
-        || Pattern::Variant("name".into(), Box::new(pattern_bytestring(b"/FlateDecode")));
-    fmt_match(
-        dict_lookup(b"Filter", header, value_type),
-        [
-            (pat_none(), compute(raw.clone())),
-            (
-                pat_some(Pattern::Variant(
-                    "array".into(),
-                    Box::new(Pattern::Seq(vec![])),
-                )),
-                compute(raw),
+    let flate = chain(
+        compute(flate_decode_params(var("_param"), value_type.clone())),
+        "_fp",
+        if_then_else(
+            supported_predictor(var("_fp")),
+            map(
+                flate_decode(zlib, var("_fp"), raw.clone()),
+                lambda("decoded", variant("ok", var("decoded"))),
             ),
-            (pat_some(flate_name()), flate.clone()),
-            (
-                pat_some(Pattern::Variant(
-                    "array".into(),
-                    Box::new(Pattern::Seq(vec![flate_name()])),
-                )),
-                flate,
+            unsupported(),
+        ),
+    );
+    chain(
+        compute(opt_array(b"Filter")),
+        "_filters",
+        chain(
+            compute(opt_array(b"DecodeParms")),
+            "_params",
+            fmt_match(
+                var("_filters"),
+                [
+                    (Pattern::Seq(vec![]), compute(variant("ok", raw))),
+                    (
+                        Pattern::Wildcard,
+                        chain(
+                            name,
+                            "_name",
+                            chain(
+                                param,
+                                "_param",
+                                if_then_else(lone_flate, flate, unsupported()),
+                            ),
+                        ),
+                    ),
+                ],
             ),
-            (Pattern::Wildcard, Format::Fail), // "unsupported filter"
-        ],
+        ),
+    )
+}
+
+/// [`apply_filters`] for a cross-reference stream, whose filters must all be applied (DaeDaLus
+/// `str.body is ok`): the decoded bytes, failing if they're `unsupported`.
+fn xref_stream_filters(zlib: FormatRef, header: Expr, raw: Expr, value_type: ValueType) -> Format {
+    chain(
+        apply_filters(zlib, header, raw, value_type),
+        "_filtered",
+        fmt_match(
+            var("_filtered"),
+            [
+                (
+                    Pattern::Variant("ok".into(), Box::new(bind("bytes"))),
+                    compute(var("bytes")),
+                ),
+                (Pattern::Wildcard, Format::Fail), // "unsupported filter"
+            ],
+        ),
     )
 }
 
@@ -1735,17 +1807,7 @@ fn xref_chain(module: &mut FormatModule, cross_ref: FormatRef) -> FormatRef {
                     ],
                 )
             };
-            let trailer = || {
-                expr_match(
-                    var("section"),
-                    ["old_xref", "new_xref"].map(|form| {
-                        (
-                            Pattern::Variant(form.into(), Box::new(bind("x"))),
-                            record_proj(var("x"), "trailer"),
-                        )
-                    }),
-                )
-            };
+            let trailer = || section_trailer(var("section"));
             let visited_here = || append(var("visited"), Expr::Seq(vec![var("offset")]));
             if_then_else(
                 or(
@@ -1788,13 +1850,401 @@ fn xref_chain(module: &mut FormatModule, cross_ref: FormatRef) -> FormatRef {
     chain_ref
 }
 
+/// The trailer of a `pdf.cross_ref` result, of either form.
+fn section_trailer(section: Expr) -> Expr {
+    expr_match(
+        section,
+        ["old_xref", "new_xref"].map(|form| {
+            (
+                Pattern::Variant(form.into(), Box::new(bind("x"))),
+                record_proj(var("x"), "trailer"),
+            )
+        }),
+    )
+}
+
+/// What the cross-reference sections say of object number `obj` (a `u64`), as the DaeDaLus
+/// host's merged table does: `Some` of `at` (an `offset` relative to the `%PDF-` header, and
+/// a `gen`), `packed` (in an object stream, at generation `0`), `free` or `null` (an unknown
+/// entry type), or `None` if no section has an entry for it.
+///
+/// `sections` is in precedence order (see [`xref_chain`]), so the first section with an
+/// entry decides; the host gets the same by letting each section's entries replace those of
+/// the sections it links to, with a free entry removing the object. Within a section, a later
+/// subsection's entry replaces an earlier one's.
+fn xref_entry_for(sections: Expr, obj: Expr) -> Expr {
+    let u64_type = || ValueType::Base(BaseType::U64);
+    let kind_type = ValueType::Option(Box::new(ValueType::Union(
+        std::collections::BTreeMap::from([
+            (
+                Label::Borrowed("at"),
+                ValueType::Record(vec![
+                    (Label::Borrowed("offset"), u64_type()),
+                    (Label::Borrowed("gen"), u64_type()),
+                ]),
+            ),
+            (Label::Borrowed("packed"), ValueType::UNIT),
+            (Label::Borrowed("free"), ValueType::UNIT),
+            (Label::Borrowed("null"), ValueType::UNIT),
+        ]),
+    )));
+    let at = |offset: Expr, gen_: Expr| {
+        variant(
+            "at",
+            Expr::Record(vec![
+                (Label::Borrowed("offset"), offset),
+                (Label::Borrowed("gen"), gen_),
+            ]),
+        )
+    };
+    let unit = |name: &'static str| variant(name, Expr::UNIT);
+    // The last subsection of `subs` (with `first`, `count` and `kind` of its entry) that covers `obj`
+    let in_section = |subs: Expr,
+                      first: &dyn Fn() -> Expr,
+                      count: &dyn Fn() -> Expr,
+                      kind: &dyn Fn(Expr) -> Expr| {
+        left_fold(
+            lambda_tuple(
+                ["found", "sub"],
+                expr_if_else(
+                    and(
+                        expr_gte(obj.clone(), first()),
+                        expr_lt(obj.clone(), add(first(), count())),
+                    ),
+                    expr_some(kind(index_unchecked(
+                        record_proj(var("sub"), "entries"),
+                        sub(obj.clone(), first()),
+                    ))),
+                    var("found"),
+                ),
+            ),
+            expr_none(),
+            kind_type.clone(),
+            subs,
+        )
+    };
+    let first = || record_proj(var("sub"), "first_id");
+    let old = in_section(
+        record_lens(var("x"), &["xref", "entries"]),
+        &first,
+        &|| record_proj(var("sub"), "count"),
+        &|e| {
+            expr_if_else(
+                record_proj(e.clone(), "in_use"),
+                at(record_proj(e.clone(), "offset"), record_proj(e, "gen")),
+                unit("free"),
+            )
+        },
+    );
+    let new = in_section(
+        record_proj(var("x"), "xref"),
+        &first,
+        &|| as_u64(seq_length(record_proj(var("sub"), "entries"))),
+        &|e| {
+            expr_match(
+                e,
+                [
+                    (
+                        Pattern::Variant("in_use".into(), Box::new(bind("e"))),
+                        at(
+                            record_proj(var("e"), "offset"),
+                            record_proj(var("e"), "gen"),
+                        ),
+                    ),
+                    (
+                        Pattern::Variant("compressed".into(), Box::new(Pattern::Wildcard)),
+                        unit("packed"),
+                    ),
+                    (
+                        Pattern::Variant("free".into(), Box::new(Pattern::Wildcard)),
+                        unit("free"),
+                    ),
+                    (Pattern::Wildcard, unit("null")),
+                ],
+            )
+        },
+    );
+    left_fold(
+        lambda_tuple(
+            ["acc", "s"],
+            expr_match(
+                var("acc"),
+                [
+                    (pat_none(), {
+                        expr_match(
+                            var("s"),
+                            [
+                                (
+                                    Pattern::Variant("old_xref".into(), Box::new(bind("x"))),
+                                    old,
+                                ),
+                                (
+                                    Pattern::Variant("new_xref".into(), Box::new(bind("x"))),
+                                    new,
+                                ),
+                            ],
+                        )
+                    }),
+                    (Pattern::Wildcard, var("acc")),
+                ],
+            ),
+        ),
+        expr_none(),
+        kind_type,
+        sections,
+    )
+}
+
+/// DaeDaLus `ResolveVal v`, inside or calling the [`resolve`] batch: the value that `v` refers
+/// to if it is a reference, and `v` otherwise. A reference to a stream fails (DaeDaLus
+/// `ResolveValRef` is `ResolveDeclRef r is value`), as does an object or generation number
+/// over `u64` (as in the DaeDaLus host).
+///
+/// `args` are `resolve_ref`'s other arguments: `base`, `sections`, `resolving` and `lim`.
+fn resolve_val(resolve_ref: FormatRef, args: [Expr; 4], v: Expr) -> Format {
+    let [base, sections, resolving, lim] = args;
+    fmt_match(
+        v.clone(),
+        [
+            (
+                Pattern::Variant("ref".into(), Box::new(bind("r"))),
+                fmt_match(
+                    Expr::Tuple(vec![
+                        number_as_nat(record_proj(var("r"), "obj")),
+                        number_as_nat(record_proj(var("r"), "gen")),
+                    ]),
+                    [
+                        (
+                            Pattern::Tuple(vec![pat_some(bind("r_obj")), pat_some(bind("r_gen"))]),
+                            chain(
+                                resolve_ref.call_args(vec![
+                                    base,
+                                    sections,
+                                    var("r_obj"),
+                                    var("r_gen"),
+                                    resolving,
+                                    lim,
+                                ]),
+                                "r_decl",
+                                fmt_match(
+                                    var("r_decl"),
+                                    [
+                                        (
+                                            Pattern::Variant("value".into(), Box::new(bind("rv"))),
+                                            compute(var("rv")),
+                                        ),
+                                        (Pattern::Wildcard, Format::Fail), // "is a stream"
+                                    ],
+                                ),
+                            ),
+                        ),
+                        (Pattern::Wildcard, Format::Fail), // "invalid object number"
+                    ],
+                ),
+            ),
+            (Pattern::Wildcard, compute(v)),
+        ],
+    )
+}
+
+/// DaeDaLus `ResolveDeclRef`, restricted to objects at a byte offset (#355): the batch
+/// `[pdf.resolve_ref, pdf.resolved_decl]`, both taking `base` (the position of the `%PDF-`
+/// header), `sections` (from `pdf.cos`), the object number `obj` and generation `gen` (as
+/// `u64`s), `resolving` and `lim`.
+///
+/// `pdf.resolve_ref` gives the object's DaeDaLus `TopDeclDef`: a `stream` (its `header` and
+/// its `body`, see [`apply_filters`]) or a `value`. As in the DaeDaLus host:
+/// - an object with no entry, a free entry, a `null` entry, or an entry of another
+///   generation is the value `null`;
+/// - otherwise the object is parsed at its offset (`pdf.resolved_decl`), and must be numbered
+///   `obj gen` there (DaeDaLus `CheckExpected`);
+/// - an object that is already being resolved fails (a cycle, such as a stream whose
+///   indirect `/Length` is itself); `resolving` holds those objects. `lim` bounds the depth.
+///
+/// An object in an object stream (a type 2 entry) fails, as decoding object streams (DaeDaLus
+/// `ObjStream`) isn't supported yet.
+///
+/// A stream's body is the `/Length` bytes after the `stream` line (DaeDaLus `StreamBody`),
+/// where an indirect `/Length` is resolved within the batch; that is the only nested
+/// resolution.
+#[allow(clippy::too_many_arguments)]
+fn resolve(
+    module: &mut FormatModule,
+    any_ws: FormatRef,
+    simple_eol: FormatRef,
+    natural: FormatRef,
+    pdf_value: FormatRef,
+    zlib: FormatRef,
+    sections_type: ValueType,
+    value_type: ValueType,
+) -> [FormatRef; 2] {
+    let u64_type = || ValueType::Base(BaseType::U64);
+    let args = || {
+        vec![
+            (Label::Borrowed("base"), u64_type()),
+            (Label::Borrowed("sections"), sections_type.clone()),
+            (Label::Borrowed("obj"), u64_type()),
+            (Label::Borrowed("gen"), u64_type()),
+            (
+                Label::Borrowed("resolving"),
+                ValueType::Seq(Box::new(u64_type())),
+            ),
+            (Label::Borrowed("lim"), u64_type()),
+        ]
+    };
+    let pass_on = || {
+        vec![
+            var("base"),
+            var("sections"),
+            var("obj"),
+            var("gen"),
+            var("resolving"),
+            var("lim"),
+        ]
+    };
+    let null_decl = || compute(variant("value", variant("null", Expr::UNIT)));
+    let vt = value_type.clone();
+    module.define_batch_with_args(
+        [("pdf.resolve_ref", args()), ("pdf.resolved_decl", args())],
+        [
+            Box::new(move |&[_, decl]: &[FormatRef; 2]| {
+                let entry = || Pattern::Variant("at".into(), Box::new(bind("at")));
+                let packed = || Pattern::Variant("packed".into(), Box::new(Pattern::Wildcard));
+                if_then_else(
+                    or(
+                        expr_eq(var("lim"), Expr::U64(0)), // "resolution too deep"
+                        // "cycle": the host's check, which fails at once; without it, `lim`
+                        // would still end the cycle, with the same result
+                        seq_any(|o| expr_eq(o, var("obj")), var("resolving")),
+                    ),
+                    Format::Fail,
+                    fmt_match(
+                        xref_entry_for(var("sections"), var("obj")),
+                        [
+                            (
+                                pat_some(entry()),
+                                if_then_else(
+                                    expr_eq(record_proj(var("at"), "gen"), var("gen")),
+                                    with_relative_offset(
+                                        Some(var("base")),
+                                        record_proj(var("at"), "offset"),
+                                        decl.call_args(pass_on()),
+                                    ),
+                                    null_decl(),
+                                ),
+                            ),
+                            (
+                                pat_some(packed()),
+                                if_then_else(
+                                    expr_eq(var("gen"), Expr::U64(0)),
+                                    Format::Fail, // "object streams are not supported yet"
+                                    null_decl(),
+                                ),
+                            ),
+                            (Pattern::Wildcard, null_decl()),
+                        ],
+                    ),
+                )
+            }),
+            Box::new(move |&[resolve_ref, _]: &[FormatRef; 2]| {
+                let vt = vt.clone();
+                // Nested resolution, with this object added to those being resolved
+                let nested = || {
+                    [
+                        var("base"),
+                        var("sections"),
+                        append(var("resolving"), Expr::Seq(vec![var("obj")])),
+                        sub(var("lim"), Expr::U64(1)),
+                    ]
+                };
+                // DaeDaLus `StreamLen`: `LookupResolve "Length"`, a natural number
+                let stream_len = chain(
+                    dict_get(b"Length", var("header"), vt.clone()),
+                    "_len_v",
+                    chain(
+                        resolve_val(resolve_ref, nested(), var("_len_v")),
+                        "_len_r",
+                        nat_value(var("_len_r")),
+                    ),
+                );
+                // DaeDaLus `Stream`
+                let stream = record_auto([
+                    (
+                        "header",
+                        fmt_match(
+                            var("_val"),
+                            [
+                                (
+                                    Pattern::Variant("dict".into(), Box::new(bind("d"))),
+                                    compute(var("d")),
+                                ),
+                                (Pattern::Wildcard, Format::Fail),
+                            ],
+                        ),
+                    ),
+                    ("__kw_stream", match_str(b"stream")),
+                    ("__eol", simple_eol.call()),
+                    ("_len", stream_len),
+                    (
+                        "body",
+                        token(
+                            slice(
+                                var("_len"),
+                                chain(
+                                    repeat(Format::ANY_BYTE),
+                                    "raw",
+                                    apply_filters(zlib, var("header"), var("raw"), vt.clone()),
+                                ),
+                            ),
+                            any_ws,
+                        ),
+                    ),
+                    ("__kw_endstream", kw(b"endstream", any_ws)),
+                ]);
+                // DaeDaLus `TopDecl`, then `CheckExpected`
+                map(
+                    record_auto([
+                        ("__ws", repeat(any_ws.call())),
+                        ("_id", token(natural_u64(natural), any_ws)),
+                        ("_gen", token(natural_u64(natural), any_ws)),
+                        (
+                            "__check",
+                            if_then_else(
+                                and(
+                                    expr_eq(var("_id"), var("obj")),
+                                    expr_eq(var("_gen"), var("gen")),
+                                ),
+                                Format::EMPTY,
+                                Format::Fail, // "object and generation don't match the xref"
+                            ),
+                        ),
+                        ("__kw_obj", kw(b"obj", any_ws)),
+                        ("_val", pdf_value.call_args(vec![Expr::U64(32)])),
+                        (
+                            "decl",
+                            alts_nondet([("stream", stream), ("value", compute(var("_val")))]),
+                        ),
+                        ("__kw_endobj", match_str(b"endobj")),
+                    ]),
+                    lambda("d", record_proj(var("d"), "decl")),
+                )
+            }),
+        ],
+    )
+}
+
 /// The cross-reference sections of a PDF, found from its end as the DaeDaLus host does: the
 /// `%PDF-` header gives the base for all offsets, the last `startxref` gives the offset of the
 /// newest section, and `/Prev` and `/XRefStm` links lead to the rest (see [`xref_chain`]).
 ///
 /// Sits alongside `pdf.main` (a front-to-back parse), and leaves any bytes after the final
 /// `%%EOF` unread.
-fn pdf_cos(module: &mut FormatModule, pdf_end: FormatRef, xref_chain: FormatRef) -> FormatRef {
+fn pdf_cos(
+    module: &mut FormatModule,
+    pdf_end: FormatRef,
+    xref_chain: FormatRef,
+    resolve_ref: FormatRef,
+) -> FormatRef {
     module.define_format(
         "pdf.cos",
         record_auto([
@@ -1810,18 +2260,48 @@ fn pdf_cos(module: &mut FormatModule, pdf_end: FormatRef, xref_chain: FormatRef)
                 ]),
             ),
             ("sections", compute(record_proj(var("_chain"), "sections"))),
+            // the newest trailer's `/Root`, resolved
+            (
+                "root",
+                fmt_match(
+                    record_proj(
+                        section_trailer(index_unchecked(var("sections"), Expr::U32(0))),
+                        "root",
+                    ),
+                    [
+                        (
+                            pat_some(bind("root_ref")),
+                            fmt_some(chain(
+                                resolve_val(
+                                    resolve_ref,
+                                    [
+                                        var("header_offset"),
+                                        var("sections"),
+                                        Expr::Seq(vec![]),
+                                        Expr::U64(256),
+                                    ],
+                                    variant("ref", var("root_ref")),
+                                ),
+                                "root_v",
+                                compute(var("root_v")),
+                            )),
+                        ),
+                        (pat_none(), compute(expr_none())),
+                    ],
+                ),
+            ),
         ]),
     )
 }
 
 pub fn main(module: &mut FormatModule) -> FormatRef {
-    let [pdf_main, _pdf_cos] = top_formats(module);
+    let [pdf_main, _pdf_cos, _resolve_ref] = top_formats(module);
     pdf_main
 }
 
-/// Defines the module's formats, returning the two top-level ones: `pdf.main` (front to back)
-/// and `pdf.cos` (from the end, following the cross-reference chain).
-fn top_formats(module: &mut FormatModule) -> [FormatRef; 2] {
+/// Defines the module's formats, returning the two top-level ones, `pdf.main` (front to back)
+/// and `pdf.cos` (from the end, following the cross-reference chain), and `pdf.resolve_ref`.
+fn top_formats(module: &mut FormatModule) -> [FormatRef; 3] {
     let simple_eol = simple_eol(module);
     let eol = eol(module, simple_eol);
     let comment = comment(module, eol);
@@ -1887,7 +2367,20 @@ fn top_formats(module: &mut FormatModule) -> [FormatRef; 2] {
         pdf_value_type.clone(),
     );
     let xref_chain = xref_chain(module, cross_ref);
-    let pdf_cos = pdf_cos(module, pdf_end, xref_chain);
+    let sections_type = ValueType::Seq(Box::new(
+        module.get_format_type(cross_ref.get_level()).clone(),
+    ));
+    let [resolve_ref, _resolved_decl] = resolve(
+        module,
+        any_ws,
+        simple_eol,
+        natural,
+        pdf_value,
+        zlib,
+        sections_type,
+        pdf_value_type.clone(),
+    );
+    let pdf_cos = pdf_cos(module, pdf_end, xref_chain, resolve_ref);
 
     let pdf_chunk = module.define_format(
         "pdf.chunk",
@@ -1913,7 +2406,7 @@ fn top_formats(module: &mut FormatModule) -> [FormatRef; 2] {
             // adding `Many AnyWS` here breaks matchtree because pdf_chunk can end in whitespace
         ])),
     );
-    [pdf_main, pdf_cos]
+    [pdf_main, pdf_cos, resolve_ref]
 }
 
 #[cfg(test)]
@@ -2750,7 +3243,7 @@ mod tests {
             ),
         ];
         let mut module = FormatModule::new();
-        let [_pdf_main, pdf_cos] = top_formats(&mut module);
+        let [_pdf_main, pdf_cos, _resolve_ref] = top_formats(&mut module);
         for (name, input, expected) in cases {
             let sizes = flat_map(
                 lambda(
@@ -2967,7 +3460,7 @@ mod tests {
             ),
         ];
         let mut module = FormatModule::new();
-        let [_pdf_main, pdf_cos] = top_formats(&mut module);
+        let [_pdf_main, pdf_cos, _resolve_ref] = top_formats(&mut module);
         let seq1 = |e: Expr| Expr::Seq(vec![e]);
         let entry = |name: &'static str, f2: &'static str, f3: &'static str| {
             (
@@ -3041,6 +3534,389 @@ mod tests {
                             Pattern::Seq(out.iter().map(|n| Pattern::U64(*n)).collect()),
                             Format::EMPTY,
                         ),
+                        (Pattern::Wildcard, Format::Fail),
+                    ],
+                ),
+                None => Format::EMPTY,
+            };
+            let top = chain(pdf_cos.call(), "cos", check);
+            let prog = Compiler::compile_program(&module, &top).expect("must compile");
+            assert_eq!(
+                prog.run(ReadCtxt::new(&input)).is_ok(),
+                expected.is_some(),
+                "{name}: expecting {expected:?} from {:?}",
+                String::from_utf8_lossy(&input)
+            );
+        }
+    }
+
+    /// An xref entry for [`build_objects`]: an object with this text between `obj` and
+    /// `endobj`, a free entry, or an entry pointing at the offset of another object.
+    enum Obj {
+        Def(&'static [u8]),
+        Free,
+        At(u64),
+    }
+
+    /// A `%PDF-1.4` file of incremental sections, oldest first: each writes its `Def` objects,
+    /// then a classic xref listing all its entries (as `(number, generation, entry)`), and a
+    /// trailer with `/Root 1 0 R` and a `/Prev` to the section before; then a `startxref` to
+    /// the last. Each object is written as `N G obj\n…\nendobj\n`.
+    fn build_objects(sections: &[&[(u64, u64, Obj)]]) -> Vec<u8> {
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = std::collections::BTreeMap::new();
+        let mut prev = None;
+        for entries in sections {
+            for (n, g, obj) in entries.iter() {
+                if let Obj::Def(body) = obj {
+                    offsets.insert(*n, out.len());
+                    out.extend(format!("{n} {g} obj\n").into_bytes());
+                    out.extend_from_slice(body);
+                    out.extend_from_slice(b"\nendobj\n");
+                }
+            }
+            let xref_at = out.len();
+            out.extend_from_slice(b"xref\n");
+            for (n, g, obj) in entries.iter() {
+                let line = match obj {
+                    Obj::Def(_) => format!("{:010} {g:05} n\r\n", offsets[n]),
+                    Obj::At(m) => format!("{:010} {g:05} n\r\n", offsets[m]),
+                    Obj::Free => format!("0000000000 {g:05} f\r\n"),
+                };
+                out.extend(format!("{n} 1\n{line}").into_bytes());
+            }
+            let prev_link = prev.map_or(String::new(), |p| format!(" /Prev {p}"));
+            out.extend(format!("trailer\n<< /Size 100 /Root 1 0 R{prev_link} >>\n").into_bytes());
+            prev = Some(xref_at);
+        }
+        out.extend(format!("startxref\n{}\n%%EOF\n", prev.unwrap()).into_bytes());
+        out
+    }
+
+    /// What resolving a reference should give, for [`resolve_ref_cases`]
+    enum Resolved {
+        Null,
+        Number(&'static [u8]),
+        /// a value of this kind (`pdf.value` variant)
+        Kind(&'static str),
+        StreamOk(&'static [u8]),
+        Unsupported(&'static [u8]),
+        Fails,
+    }
+
+    /// `pdf.resolve_ref` follows the DaeDaLus host: the newest entry decides; a missing, free
+    /// or other-generation object is `null`; an object numbered differently from its xref
+    /// entry fails; a stream's body is read by its (possibly indirect) `/Length` and decoded,
+    /// or reported `unsupported`; and a cycle, a too-deep resolution, or an object in an
+    /// object stream fails. Each case resolves `(number, generation)` with a depth limit.
+    #[test]
+    fn resolve_ref_cases() {
+        use Obj::*;
+        use Resolved::*;
+        const CATALOG: (u64, u64, Obj) = (1, 0, Def(b"<< /Type /Catalog >>"));
+        let flate_dict = format!(
+            "<< /Length {} /Filter /FlateDecode >>\nstream\n",
+            HELLO_Z.len()
+        );
+        let flate = [flate_dict.as_bytes(), HELLO_Z, b"\nendstream"]
+            .concat()
+            .leak();
+        let base: Vec<u8> = build_objects(&[&[
+            CATALOG,
+            (2, 0, Def(b"42")),
+            (3, 0, Free),
+            (4, 0, At(2)),
+            (5, 0, Def(b"<< /Length 5 >>\nstream\nhello\nendstream")),
+            (6, 0, Def(b"<< /Length 7 0 R >>\nstream\nhello\nendstream")),
+            (7, 0, Def(b"5")),
+            (8, 0, Def(flate)),
+            (9, 0, Def(b"<< /Length 5 /Filter /DCTDecode >>\nstream\nhello\nendstream")),
+            (
+                10,
+                0,
+                Def(b"<< /Length 5 /Filter /FlateDecode /DecodeParms << /Predictor 2 >> >>\nstream\nhello\nendstream"),
+            ),
+            (
+                11,
+                0,
+                Def(b"<< /Length 5 /Filter [/LZWDecode /FlateDecode] >>\nstream\nhello\nendstream"),
+            ),
+            (12, 0, Def(b"<< /Length 12 0 R >>\nstream\nhello\nendstream")),
+            (13, 0, Def(b"<< /Length 5 0 R >>\nstream\nhello\nendstream")),
+            (14, 0, Def(b"<< /Length 99 0 R >>\nstream\nhello\nendstream")),
+            (15, 0, Def(b"<< /Length 16 0 R >>\nstream\nhello\nendstream")),
+            (16, 0, Def(b"7 0 R")),
+            (17, 1, Def(b"(gen 1)")),
+            (18, 0, Def(b"<< /Length 5 /Filter /FlateDecode >>\nstream\nhello\nendstream")),
+            (
+                19,
+                0,
+                Def(b"<< /Length 5 /Filter [/FlateDecode /DCTDecode] >>\nstream\nhello\nendstream"),
+            ),
+        ]]);
+        let updated: Vec<u8> = build_objects(&[
+            &[CATALOG, (2, 0, Def(b"42")), (3, 0, Def(b"3"))],
+            &[(2, 0, Def(b"43")), (3, 0, Free)],
+        ]);
+        let cases: Vec<(&str, &[u8], (u64, u64), u64, Resolved)> = vec![
+            ("a direct value", &base, (2, 0), 8, Number(b"42")),
+            ("no entry", &base, (50, 0), 8, Null),
+            ("a free entry", &base, (3, 0), 8, Null),
+            ("another generation", &base, (2, 1), 8, Null),
+            ("a generation over 0", &base, (17, 1), 8, Kind("string")),
+            ("an entry at another object", &base, (4, 0), 8, Fails),
+            ("a stream", &base, (5, 0), 8, StreamOk(b"hello")),
+            ("an indirect /Length", &base, (6, 0), 8, StreamOk(b"hello")),
+            ("an indirect /Length, too deep", &base, (6, 0), 1, Fails),
+            (
+                "/FlateDecode",
+                &base,
+                (8, 0),
+                8,
+                StreamOk(b"hello hello hello hello"),
+            ),
+            (
+                "an unsupported filter",
+                &base,
+                (9, 0),
+                8,
+                Unsupported(b"/DCTDecode"),
+            ),
+            (
+                "an unsupported predictor",
+                &base,
+                (10, 0),
+                8,
+                Unsupported(b"/FlateDecode (with params)"),
+            ),
+            ("two filters", &base, (11, 0), 8, Unsupported(b"/LZWDecode")),
+            (
+                "two filters, the first /FlateDecode",
+                &base,
+                (19, 0),
+                8,
+                Unsupported(b"/FlateDecode"),
+            ),
+            ("a /Length that is itself", &base, (12, 0), 8, Fails),
+            ("a /Length that is a stream", &base, (13, 0), 8, Fails),
+            ("a /Length that is null", &base, (14, 0), 8, Fails),
+            ("a /Length that is a reference", &base, (15, 0), 8, Fails),
+            (
+                "/FlateDecode of data that isn't zlib",
+                &base,
+                (18, 0),
+                8,
+                Fails,
+            ),
+            (
+                "a newer section's object",
+                &updated,
+                (2, 0),
+                8,
+                Number(b"43"),
+            ),
+            ("a newer section's free entry", &updated, (3, 0), 8, Null),
+            (
+                "an older section's object",
+                &updated,
+                (1, 0),
+                8,
+                Kind("dict"),
+            ),
+        ];
+        let mut module = FormatModule::new();
+        let [_pdf_main, pdf_cos, resolve_ref] = top_formats(&mut module);
+        for (name, input, (obj, gen_), lim, expected) in cases {
+            let value = |p: Pattern| Pattern::Variant("value".into(), Box::new(p));
+            let body = |p: Pattern| {
+                fmt_match(
+                    var("d"),
+                    [
+                        (
+                            Pattern::Variant("stream".into(), Box::new(bind("s"))),
+                            fmt_match(
+                                record_proj(var("s"), "body"),
+                                [(p, Format::EMPTY), (Pattern::Wildcard, Format::Fail)],
+                            ),
+                        ),
+                        (Pattern::Wildcard, Format::Fail),
+                    ],
+                )
+            };
+            let is = |p: Pattern| {
+                fmt_match(
+                    var("d"),
+                    [(p, Format::EMPTY), (Pattern::Wildcard, Format::Fail)],
+                )
+            };
+            let (check, ok) = match &expected {
+                Null => (
+                    is(value(Pattern::Variant(
+                        "null".into(),
+                        Box::new(Pattern::Wildcard),
+                    ))),
+                    true,
+                ),
+                Kind(kind) => (
+                    is(value(Pattern::Variant(
+                        (*kind).into(),
+                        Box::new(Pattern::Wildcard),
+                    ))),
+                    true,
+                ),
+                Number(n) => (
+                    is(value(Pattern::Variant(
+                        "number".into(),
+                        Box::new(pattern_bytestring(n)),
+                    ))),
+                    true,
+                ),
+                StreamOk(b) => (
+                    body(Pattern::Variant(
+                        "ok".into(),
+                        Box::new(pattern_bytestring(b)),
+                    )),
+                    true,
+                ),
+                Unsupported(b) => (
+                    body(Pattern::Variant(
+                        "unsupported".into(),
+                        Box::new(pattern_bytestring(b)),
+                    )),
+                    true,
+                ),
+                Fails => (Format::EMPTY, false),
+            };
+            let top = chain(
+                pdf_cos.call(),
+                "cos",
+                chain(
+                    resolve_ref.call_args(vec![
+                        record_proj(var("cos"), "header_offset"),
+                        record_proj(var("cos"), "sections"),
+                        Expr::U64(obj),
+                        Expr::U64(gen_),
+                        Expr::Seq(vec![]),
+                        Expr::U64(lim),
+                    ]),
+                    "d",
+                    check,
+                ),
+            );
+            let prog = Compiler::compile_program(&module, &top).expect("must compile");
+            assert_eq!(
+                prog.run(ReadCtxt::new(input)).is_ok(),
+                ok,
+                "{name}: resolving {obj} {gen_} in {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// A `%PDF-1.5` file whose only section is a cross-reference stream: object 1 (the text
+    /// `obj1`) at its offset, and object 2 packed in object stream 5 (which isn't there, as
+    /// resolving a packed object fails before reaching it), with the trailer's `/Root` as
+    /// given.
+    fn packed_pdf(root: &str, obj1: &str) -> Vec<u8> {
+        let header = b"%PDF-1.5\n".to_vec();
+        let obj1_at = header.len();
+        let obj1 = format!("1 0 obj\n{obj1}\nendobj\n").into_bytes();
+        let stream_at = obj1_at + obj1.len();
+        let rows = be_rows(
+            &[1, 2, 1],
+            &[&[0, 0, 0], &[1, obj1_at as u64, 0], &[2, 5, 0]],
+        );
+        let stream = [
+            format!(
+                "9 0 obj\n<< /Type /XRef /Size 3 /W [1 2 1] /Root {root} /Length {} >>\nstream\n",
+                rows.len()
+            )
+            .into_bytes(),
+            rows,
+            b"\nendstream\nendobj\n".to_vec(),
+        ]
+        .concat();
+        [
+            header,
+            obj1,
+            stream,
+            format!("startxref\n{stream_at}\n%%EOF\n").into_bytes(),
+        ]
+        .concat()
+    }
+
+    /// `pdf.cos` resolves the newest trailer's `/Root` (here a dict, or `null` for a missing
+    /// object), through classic and stream sections alike; and an object packed in an object
+    /// stream fails to resolve (until `ObjStream` is supported), unless its generation isn't
+    /// `0`, which makes it `null`. Each case gives the expected `root` value's kind (`None`
+    /// for no `/Root`), or fails.
+    #[test]
+    fn pdf_cos_resolves_root() {
+        let classic = |root: &str| {
+            let mut out = build_objects(&[&[(1, 0, Obj::Def(b"<< /Type /Catalog >>"))]]);
+            if root != "1 0 R" {
+                let at = out.windows(9).position(|w| w == b"/Root 1 0").unwrap();
+                out.splice(at..at + 11, format!("/Root {root}").into_bytes());
+            }
+            out
+        };
+        let no_root = build_pdf(b"", &[sec(1, None, None)], &[0], b"");
+        let cases: Vec<(&str, Vec<u8>, Option<Option<&str>>)> = vec![
+            (
+                "a classic file's catalog",
+                classic("1 0 R"),
+                Some(Some("dict")),
+            ),
+            (
+                "offsets are relative to the %PDF- header",
+                [&b"leading junk\n"[..], &classic("1 0 R")].concat(),
+                Some(Some("dict")),
+            ),
+            (
+                "a missing /Root object",
+                classic("7 0 R"),
+                Some(Some("null")),
+            ),
+            ("no /Root", no_root, Some(None)),
+            (
+                "an xref stream's /Root at an offset",
+                packed_pdf("1 0 R", "<< /Type /Catalog >>"),
+                Some(Some("dict")),
+            ),
+            (
+                "a /Root packed in an object stream",
+                packed_pdf("2 0 R", "<< /Type /Catalog >>"),
+                None,
+            ),
+            (
+                "a packed object of another generation",
+                packed_pdf("2 1 R", "<< /Type /Catalog >>"),
+                Some(Some("null")),
+            ),
+            (
+                "a /Root that is a stream",
+                packed_pdf("1 0 R", "<< /Length 2 >>\nstream\nab\nendstream"),
+                None,
+            ),
+        ];
+        let mut module = FormatModule::new();
+        let [_pdf_main, pdf_cos, _resolve_ref] = top_formats(&mut module);
+        for (name, input, expected) in cases {
+            let check = match expected {
+                Some(Some(kind)) => fmt_match(
+                    record_proj(var("cos"), "root"),
+                    [
+                        (
+                            pat_some(Pattern::Variant(kind.into(), Box::new(Pattern::Wildcard))),
+                            Format::EMPTY,
+                        ),
+                        (Pattern::Wildcard, Format::Fail),
+                    ],
+                ),
+                Some(None) => fmt_match(
+                    record_proj(var("cos"), "root"),
+                    [
+                        (pat_none(), Format::EMPTY),
                         (Pattern::Wildcard, Format::Fail),
                     ],
                 ),
