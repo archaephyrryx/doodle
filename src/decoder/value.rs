@@ -469,22 +469,26 @@ impl Value {
         scope: &mut MultiScope<'a>,
         pattern: &Pattern,
     ) -> bool {
+        // Coerce through wrappers at every level, not just at the top (as `matches` does):
+        // the elements of a sequence, tuple, variant or option may be wrapped too, e.g. each byte
+        // of a sequence parsed by a `repeat` of a union is a `Branch`.
+        let this = self.coerce_nominal_value();
         match pattern {
             Pattern::Binding(name) => {
                 scope.push(name.clone(), self);
                 true
             }
             Pattern::Wildcard => true,
-            Pattern::Bool(b0) => matches!(self, Value::Bool(b1) if b0 == b1),
+            Pattern::Bool(b0) => matches!(this, Value::Bool(b1) if b0 == b1),
             Pattern::U8(..)
             | Pattern::U16(..)
             | Pattern::U32(..)
             | Pattern::U64(..)
             | Pattern::Int(..)
             | Pattern::ZConst(..)
-            | Pattern::ZRange(..) => self.matches_numeric_literal(pattern),
-            Pattern::Char(c0) => matches!(self, Value::Char(c1) if c0 == c1),
-            Pattern::Tuple(ps) => match self {
+            | Pattern::ZRange(..) => this.matches_numeric_literal(pattern),
+            Pattern::Char(c0) => matches!(this, Value::Char(c1) if c0 == c1),
+            Pattern::Tuple(ps) => match this {
                 Value::Tuple(vs) if ps.len() == vs.len() => {
                     for (p, v) in Iterator::zip(ps.iter(), vs.iter()) {
                         if !v.matches_inner(scope, p) {
@@ -495,7 +499,7 @@ impl Value {
                 }
                 _ => false,
             },
-            Pattern::Seq(ps) => match self {
+            Pattern::Seq(ps) => match this {
                 Value::Seq(vs) if ps.len() == vs.len() => {
                     for (p, v) in Iterator::zip(ps.iter(), vs.iter()) {
                         if !v.matches_inner(scope, p) {
@@ -506,12 +510,12 @@ impl Value {
                 }
                 _ => false,
             },
-            Pattern::Variant(label0, p) => match self {
+            Pattern::Variant(label0, p) => match this {
                 Value::Variant(label1, v) if label0 == label1 => v.matches_inner(scope, p),
                 _ => false,
             },
-            Pattern::Option(None) => matches!(self, Value::Option(None)),
-            Pattern::Option(Some(p)) => match self {
+            Pattern::Option(None) => matches!(this, Value::Option(None)),
+            Pattern::Option(Some(p)) => match this {
                 Value::Option(Some(v)) => v.matches_inner(scope, p),
                 _ => false,
             },

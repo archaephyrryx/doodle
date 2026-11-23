@@ -3344,6 +3344,38 @@ mod tests {
         accepts(&dg, DATA, DATA, expect)
     }
 
+    /// A pattern matches through wrappers on nested values, not only on the top-level value:
+    /// each byte of a `repeat` of a union is a `Branch`, and `pattern_bytestring` must still
+    /// match the sequence, in both interpreters.
+    #[test]
+    fn matches_inner_through_nested_branch() {
+        let mut module = FormatModule::new();
+        let bytes = repeat(union([is_byte(b'a'), is_byte(b'b')]));
+        let top = module.define_format(
+            "test.nested_branch",
+            chain(
+                bytes,
+                "xs",
+                fmt_match(
+                    var("xs"),
+                    [
+                        (pattern_bytestring(b"ab"), Format::EMPTY),
+                        (Pattern::Wildcard, Format::Fail),
+                    ],
+                ),
+            ),
+        );
+        let program = Compiler::compile_program(&module, &top.call()).unwrap();
+        for (input, ok) in [(&b"ab"[..], true), (b"ba", false), (b"abb", false)] {
+            assert_eq!(program.run(ReadCtxt::new(input)).is_ok(), ok, "{input:?}");
+            assert_eq!(
+                program.run_with_loc(ReadCtxt::new(input)).is_ok(),
+                ok,
+                "{input:?} (with loc)"
+            );
+        }
+    }
+
     #[test]
     fn matches_inner_on_permit_err() {
         let f = permit(

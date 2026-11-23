@@ -363,13 +363,16 @@ impl ParsedValue {
     }
 
     pub fn matches_inner(&self, scope: &mut LocMultiScope<'_>, pattern: &Pattern) -> bool {
+        // Coerce through wrappers at every level, not just at the top (as `matches` does);
+        // mirrors `Value::matches_inner`.
+        let this = self.coerce_nominal_value();
         match pattern {
             Pattern::Binding(name) => {
                 scope.push_owned(name.clone(), self.clone());
                 true
             }
             Pattern::Wildcard => true,
-            Pattern::Bool(b0) => matches!(self, ParsedValue::Flat(Parsed {
+            Pattern::Bool(b0) => matches!(this, ParsedValue::Flat(Parsed {
                     inner: Value::Bool(b1),
                     ..
                 }) if b0 == b1),
@@ -379,15 +382,15 @@ impl ParsedValue {
             | Pattern::U64(..)
             | Pattern::Int(..)
             | Pattern::ZConst(..)
-            | Pattern::ZRange(..) => match self {
+            | Pattern::ZRange(..) => match this {
                 ParsedValue::Flat(Parsed { inner: v, .. }) => v.matches_numeric_literal(pattern),
                 _ => false,
             },
-            Pattern::Char(c0) => matches!(self, ParsedValue::Flat(Parsed {
+            Pattern::Char(c0) => matches!(this, ParsedValue::Flat(Parsed {
                     inner: Value::Char(c1),
                     ..
                 }) if c0 == c1),
-            Pattern::Tuple(ps) => match self {
+            Pattern::Tuple(ps) => match this {
                 ParsedValue::Tuple(vs) if ps.len() == vs.inner.len() => {
                     for (p, v) in Iterator::zip(ps.iter(), vs.inner.iter()) {
                         if !v.matches_inner(scope, p) {
@@ -398,7 +401,7 @@ impl ParsedValue {
                 }
                 _ => false,
             },
-            Pattern::Seq(ps) => match self {
+            Pattern::Seq(ps) => match this {
                 ParsedValue::Seq(vs) if ps.len() == vs.inner.len() => {
                     for (p, v) in Iterator::zip(ps.iter(), vs.inner.iter()) {
                         if !v.matches_inner(scope, p) {
@@ -409,12 +412,12 @@ impl ParsedValue {
                 }
                 _ => false,
             },
-            Pattern::Variant(label0, p) => match self {
+            Pattern::Variant(label0, p) => match this {
                 ParsedValue::Variant(label1, v) if label0 == label1 => v.matches_inner(scope, p),
                 _ => false,
             },
-            Pattern::Option(None) => matches!(self, ParsedValue::Option(None)),
-            Pattern::Option(Some(p)) => match self {
+            Pattern::Option(None) => matches!(this, ParsedValue::Option(None)),
+            Pattern::Option(Some(p)) => match this {
                 ParsedValue::Option(Some(v)) => v.matches_inner(scope, p),
                 _ => false,
             },
