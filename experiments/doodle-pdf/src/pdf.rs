@@ -545,8 +545,8 @@ fn nat_value(value: Expr) -> Format {
 /// DaeDaLus `Default dflt (LookupNat key dict)`: the natural-number value of `key` in `dict`,
 /// or `dflt` if `key` is absent or its value is not a natural number.
 ///
-/// DaeDaLus `LookupNat` also resolves an indirect reference (`LookupResolve`). That isn't
-/// supported yet (#355), so a reference here gives `dflt`.
+/// DaeDaLus `LookupNat` also resolves an indirect reference (`LookupResolve`). This doesn't
+/// (as for the other filter parameters, see [`apply_filters`]), so a reference gives `dflt`.
 fn lookup_nat_or(key: &[u8], dict: Expr, dflt: u64, value_type: ValueType) -> Expr {
     expr_match(
         dict_lookup(key, dict, value_type),
@@ -1865,7 +1865,8 @@ fn section_trailer(section: Expr) -> Expr {
 
 /// What the cross-reference sections say of object number `obj` (a `u64`), as the DaeDaLus
 /// host's merged table does: `Some` of `at` (an `offset` relative to the `%PDF-` header, and
-/// a `gen`), `packed` (in an object stream, at generation `0`), `free` or `null` (an unknown
+/// a `gen`), `packed` (at index `index` of object stream `container`, at generation `0`),
+/// `free` or `null` (an unknown
 /// entry type), or `None` if no section has an entry for it.
 ///
 /// `sections` is in precedence order (see [`xref_chain`]), so the first section with an
@@ -1883,7 +1884,13 @@ fn xref_entry_for(sections: Expr, obj: Expr) -> Expr {
                     (Label::Borrowed("gen"), u64_type()),
                 ]),
             ),
-            (Label::Borrowed("packed"), ValueType::UNIT),
+            (
+                Label::Borrowed("packed"),
+                ValueType::Record(vec![
+                    (Label::Borrowed("container"), u64_type()),
+                    (Label::Borrowed("index"), u64_type()),
+                ]),
+            ),
             (Label::Borrowed("free"), ValueType::UNIT),
             (Label::Borrowed("null"), ValueType::UNIT),
         ]),
@@ -1952,8 +1959,17 @@ fn xref_entry_for(sections: Expr, obj: Expr) -> Expr {
                         ),
                     ),
                     (
-                        Pattern::Variant("compressed".into(), Box::new(Pattern::Wildcard)),
-                        unit("packed"),
+                        Pattern::Variant("compressed".into(), Box::new(bind("e"))),
+                        variant(
+                            "packed",
+                            Expr::Record(vec![
+                                (
+                                    Label::Borrowed("container"),
+                                    record_proj(var("e"), "container_obj"),
+                                ),
+                                (Label::Borrowed("index"), record_proj(var("e"), "obj_index")),
+                            ]),
+                        ),
                     ),
                     (
                         Pattern::Variant("free".into(), Box::new(Pattern::Wildcard)),
@@ -2047,7 +2063,7 @@ fn resolve_val(resolve_ref: FormatRef, args: [Expr; 4], v: Expr) -> Format {
     )
 }
 
-/// DaeDaLus `ResolveDeclRef`, restricted to objects at a byte offset (#355): the batch
+/// DaeDaLus `ResolveDeclRef` (#355): the batch
 /// `[pdf.resolve_ref, pdf.resolved_decl]`, both taking `base` (the position of the `%PDF-`
 /// header), `sections` (from `pdf.cos`), the object number `obj` and generation `gen` (as
 /// `u64`s), `resolving` and `lim`.
@@ -2061,12 +2077,16 @@ fn resolve_val(resolve_ref: FormatRef, args: [Expr; 4], v: Expr) -> Format {
 /// - an object that is already being resolved fails (a cycle, such as a stream whose
 ///   indirect `/Length` is itself); `resolving` holds those objects. `lim` bounds the depth.
 ///
-/// An object in an object stream (a type 2 entry) fails, as decoding object streams (DaeDaLus
-/// `ObjStream`) isn't supported yet.
+/// An object in an object stream (a type 2 entry, at generation `0`) is read from its
+/// container, as the host does: the container is resolved as `container 0` (and fails, rather
+/// than being `null`, if it isn't a stream), then DaeDaLus `ObjStream` (`/Type /ObjStm`, a body
+/// that decodes, `/N` pairs of object number and offset, the objects from `/First`) and
+/// `ObjStreamEntry` give the value at the entry's index, whose object number must be `obj`
+/// (`CheckExpected`). `/Extends` (a chain of object streams) is not followed, as in DaeDaLus.
 ///
 /// A stream's body is the `/Length` bytes after the `stream` line (DaeDaLus `StreamBody`),
-/// where an indirect `/Length` is resolved within the batch; that is the only nested
-/// resolution.
+/// where an indirect `/Length` is resolved within the batch. That, an object stream's container
+/// and its indirect `/Type`, `/N` and `/First` are the nested resolutions.
 #[allow(clippy::too_many_arguments)]
 fn resolve(
     module: &mut FormatModule,
@@ -2103,13 +2123,152 @@ fn resolve(
         ]
     };
     let null_decl = || compute(variant("value", variant("null", Expr::UNIT)));
+    // Nested resolution, with this object added to those being resolved
+    let nested = || {
+        [
+            var("base"),
+            var("sections"),
+            append(var("resolving"), Expr::Seq(vec![var("obj")])),
+            sub(var("lim"), Expr::U64(1)),
+        ]
+    };
+    // DaeDaLus `LookupResolve key dict`, within the batch
+    let lookup_resolve = move |resolve_ref: FormatRef, key: &[u8], dict: Expr, vt: ValueType| {
+        chain(
+            dict_get(key, dict, vt),
+            "_lookup",
+            resolve_val(resolve_ref, nested(), var("_lookup")),
+        )
+    };
     let vt = value_type.clone();
+    let vt_packed = value_type.clone();
     module.define_batch_with_args(
         [("pdf.resolve_ref", args()), ("pdf.resolved_decl", args())],
         [
-            Box::new(move |&[_, decl]: &[FormatRef; 2]| {
+            Box::new(move |&[resolve_ref, decl]: &[FormatRef; 2]| {
+                let vt = vt_packed.clone();
                 let entry = || Pattern::Variant("at".into(), Box::new(bind("at")));
-                let packed = || Pattern::Variant("packed".into(), Box::new(Pattern::Wildcard));
+                let packed = || Pattern::Variant("packed".into(), Box::new(bind("packed")));
+                let nat = |key: &'static [u8], dict: Expr| {
+                    chain(
+                        lookup_resolve(resolve_ref, key, dict, vt.clone()),
+                        "_nat_v",
+                        nat_value(var("_nat_v")),
+                    )
+                };
+                // DaeDaLus `ObjStream` of the container's stream `_stm`, then `ObjStreamEntry`
+                // at the entry's index, then `CheckExpected`
+                let header = || record_proj(var("_stm"), "header");
+                let obj_stream_entry = record_auto([
+                    (
+                        "__type",
+                        chain(
+                            lookup_resolve(resolve_ref, b"Type", header(), vt.clone()),
+                            "_type",
+                            fmt_match(
+                                var("_type"),
+                                [
+                                    (
+                                        Pattern::Variant(
+                                            "name".into(),
+                                            Box::new(pattern_bytestring(b"/ObjStm")),
+                                        ),
+                                        Format::EMPTY,
+                                    ),
+                                    (Pattern::Wildcard, Format::Fail), // "not /Type /ObjStm"
+                                ],
+                            ),
+                        ),
+                    ),
+                    (
+                        "_bytes",
+                        fmt_match(
+                            record_proj(var("_stm"), "body"),
+                            [
+                                (
+                                    Pattern::Variant("ok".into(), Box::new(bind("b"))),
+                                    compute(var("b")),
+                                ),
+                                (Pattern::Wildcard, Format::Fail), // "unsupported filter"
+                            ],
+                        ),
+                    ),
+                    ("_n", nat(b"N", header())),
+                    ("_first", nat(b"First", header())),
+                    (
+                        "_index",
+                        decode_bytes(
+                            var("_bytes"),
+                            repeat_count(
+                                var("_n"),
+                                record_auto([
+                                    ("oid", token(natural_u64(natural), any_ws)),
+                                    ("off", token(natural_u64(natural), any_ws)),
+                                ]),
+                            ),
+                        ),
+                    ),
+                    (
+                        "_info",
+                        fmt_match(
+                            index_checked(var("_index"), record_proj(var("packed"), "index")),
+                            [
+                                (pat_some(bind("info")), compute(var("info"))),
+                                (pat_none(), Format::Fail), // "index past /N"
+                            ],
+                        ),
+                    ),
+                    (
+                        "__check",
+                        if_then_else(
+                            expr_eq(record_proj(var("_info"), "oid"), var("obj")),
+                            Format::EMPTY,
+                            Format::Fail, // "object number doesn't match the xref"
+                        ),
+                    ),
+                    (
+                        "decl",
+                        decode_bytes(
+                            var("_bytes"),
+                            monad_seq(
+                                // `Drop first`, then `Drop off`
+                                repeat_count(var("_first"), Format::ANY_BYTE),
+                                monad_seq(
+                                    repeat_count(
+                                        record_proj(var("_info"), "off"),
+                                        Format::ANY_BYTE,
+                                    ),
+                                    map(
+                                        pdf_value.call_args(vec![Expr::U64(32)]),
+                                        lambda("v", variant("value", var("v"))),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ]);
+                let from_container = chain(
+                    resolve_ref.call_args(vec![
+                        var("base"),
+                        var("sections"),
+                        record_proj(var("packed"), "container"),
+                        Expr::U64(0),
+                        append(var("resolving"), Expr::Seq(vec![var("obj")])),
+                        sub(var("lim"), Expr::U64(1)),
+                    ]),
+                    "_container",
+                    fmt_match(
+                        var("_container"),
+                        [
+                            (
+                                Pattern::Variant("stream".into(), Box::new(bind("_stm"))),
+                                map(obj_stream_entry, lambda("e", record_proj(var("e"), "decl"))),
+                            ),
+                            // including `null`, a missing container (the host fails)
+                            (Pattern::Wildcard, Format::Fail), // "container is not a stream"
+                        ],
+                    ),
+                );
                 if_then_else(
                     or(
                         expr_eq(var("lim"), Expr::U64(0)), // "resolution too deep"
@@ -2137,7 +2296,7 @@ fn resolve(
                                 pat_some(packed()),
                                 if_then_else(
                                     expr_eq(var("gen"), Expr::U64(0)),
-                                    Format::Fail, // "object streams are not supported yet"
+                                    from_container,
                                     null_decl(),
                                 ),
                             ),
@@ -2148,15 +2307,6 @@ fn resolve(
             }),
             Box::new(move |&[resolve_ref, _]: &[FormatRef; 2]| {
                 let vt = vt.clone();
-                // Nested resolution, with this object added to those being resolved
-                let nested = || {
-                    [
-                        var("base"),
-                        var("sections"),
-                        append(var("resolving"), Expr::Seq(vec![var("obj")])),
-                        sub(var("lim"), Expr::U64(1)),
-                    ]
-                };
                 // DaeDaLus `StreamLen`: `LookupResolve "Length"`, a natural number
                 let stream_len = chain(
                     dict_get(b"Length", var("header"), vt.clone()),
@@ -3814,9 +3964,8 @@ mod tests {
     }
 
     /// A `%PDF-1.5` file whose only section is a cross-reference stream: object 1 (the text
-    /// `obj1`) at its offset, and object 2 packed in object stream 5 (which isn't there, as
-    /// resolving a packed object fails before reaching it), with the trailer's `/Root` as
-    /// given.
+    /// `obj1`) at its offset, and object 2 packed in object stream 5, which isn't there (see
+    /// [`objstm_pdf`] for one that is), with the trailer's `/Root` as given.
     fn packed_pdf(root: &str, obj1: &str) -> Vec<u8> {
         let header = b"%PDF-1.5\n".to_vec();
         let obj1_at = header.len();
@@ -3846,8 +3995,8 @@ mod tests {
     }
 
     /// `pdf.cos` resolves the newest trailer's `/Root` (here a dict, or `null` for a missing
-    /// object), through classic and stream sections alike; and an object packed in an object
-    /// stream fails to resolve (until `ObjStream` is supported), unless its generation isn't
+    /// object), through classic and stream sections alike, and from an object stream; an
+    /// object packed in a missing object stream fails to resolve, unless its generation isn't
     /// `0`, which makes it `null`. Each case gives the expected `root` value's kind (`None`
     /// for no `/Root`), or fails.
     #[test]
@@ -3884,9 +4033,27 @@ mod tests {
                 Some(Some("dict")),
             ),
             (
-                "a /Root packed in an object stream",
+                "a /Root packed in a missing object stream",
                 packed_pdf("2 0 R", "<< /Type /Catalog >>"),
                 None,
+            ),
+            (
+                "a /Root packed in an object stream",
+                objstm_pdf(
+                    "/Type /ObjStm /N 1",
+                    "1 0 ",
+                    "<< /Type /Catalog >>",
+                    None,
+                    &[
+                        Ent::Free,
+                        Ent::Packed(5, 0),
+                        Ent::Free,
+                        Ent::Free,
+                        Ent::Free,
+                        Ent::At(5),
+                    ],
+                ),
+                Some(Some("dict")),
             ),
             (
                 "a packed object of another generation",
@@ -3928,6 +4095,256 @@ mod tests {
                 prog.run(ReadCtxt::new(&input)).is_ok(),
                 expected.is_some(),
                 "{name}: expecting {expected:?} from {:?}",
+                String::from_utf8_lossy(&input)
+            );
+        }
+    }
+
+    /// An xref entry for [`objstm_pdf`]: free, at the offset of object `5` or `6`, or packed at
+    /// an index of an object stream.
+    enum Ent {
+        Free,
+        At(u64),
+        Packed(u64, u64),
+    }
+
+    /// A `%PDF-1.5` file with an object stream `5 0` (its dictionary is `stm_dict` plus `/First`
+    /// and `/Length`, unless `stm_dict` gives them, and its body is `index` then `values`), an
+    /// optional object `6 0` with the text `obj6`, and a cross-reference stream (`/W [1 2 1]`)
+    /// with an entry for each object number from `0`, and `/Root 1 0 R`.
+    fn objstm_pdf(
+        stm_dict: &str,
+        index: &str,
+        values: &str,
+        obj6: Option<&str>,
+        ents: &[Ent],
+    ) -> Vec<u8> {
+        let mut out = b"%PDF-1.5\n".to_vec();
+        let mut offsets = std::collections::BTreeMap::new();
+        let body = format!("{index}{values}");
+        let first = if stm_dict.contains("/First") {
+            String::new()
+        } else {
+            format!(" /First {}", index.len())
+        };
+        let len = if stm_dict.contains("/Length") {
+            String::new()
+        } else {
+            format!(" /Length {}", body.len())
+        };
+        offsets.insert(5, out.len());
+        out.extend(
+            format!("5 0 obj\n<< {stm_dict}{first}{len} >>\nstream\n{body}\nendstream\nendobj\n")
+                .into_bytes(),
+        );
+        if let Some(text) = obj6 {
+            offsets.insert(6, out.len());
+            out.extend(format!("6 0 obj\n{text}\nendobj\n").into_bytes());
+        }
+        let rows: Vec<Vec<u64>> = ents
+            .iter()
+            .map(|e| match e {
+                Ent::Free => vec![0, 0, 0],
+                Ent::At(n) => vec![1, offsets[n] as u64, 0],
+                Ent::Packed(c, i) => vec![2, *c, *i],
+            })
+            .collect();
+        let rows: Vec<&[u64]> = rows.iter().map(|r| r.as_slice()).collect();
+        let data = be_rows(&[1, 2, 1], &rows);
+        let xref_at = out.len();
+        out.extend(
+            format!(
+                "9 0 obj\n<< /Type /XRef /Size {} /W [1 2 1] /Root 1 0 R /Length {} >>\nstream\n",
+                ents.len(),
+                data.len()
+            )
+            .into_bytes(),
+        );
+        out.extend(data);
+        out.extend(format!("\nendstream\nendobj\nstartxref\n{xref_at}\n%%EOF\n").into_bytes());
+        out
+    }
+
+    /// `pdf.resolve_ref` reads an object packed in an object stream (DaeDaLus `ObjStream` and
+    /// `ObjStreamEntry`, as the host resolves a type 2 entry): the container (at generation
+    /// `0`) must be a stream of `/Type /ObjStm` whose body decodes, the entry's index must be
+    /// under `/N`, and the object number there must be the one asked for. `/N` and `/First` may
+    /// be indirect. Each case resolves `(number, 0)`.
+    #[test]
+    fn resolve_packed_objects() {
+        use Ent::*;
+        use Resolved::*;
+        const STM: &str = "/Type /ObjStm /N 2";
+        // objects 1 (a dict) and 2 (a number) at offsets 0 and 21 of the values
+        const INDEX: &str = "1 0 2 21 ";
+        const VALUES: &str = "<< /Type /Catalog >> 42";
+        let packed = || vec![Free, Packed(5, 0), Packed(5, 1), Free, Free, At(5)];
+        let with6 = |mut e: Vec<Ent>| {
+            e.push(At(6));
+            e
+        };
+        let cases: Vec<(&str, Vec<u8>, u64, Resolved)> = vec![
+            (
+                "the first packed object",
+                objstm_pdf(STM, INDEX, VALUES, None, &packed()),
+                1,
+                Kind("dict"),
+            ),
+            (
+                "the second packed object",
+                objstm_pdf(STM, INDEX, VALUES, None, &packed()),
+                2,
+                Number(b"42"),
+            ),
+            (
+                "an indirect /N",
+                objstm_pdf(
+                    "/Type /ObjStm /N 6 0 R",
+                    INDEX,
+                    VALUES,
+                    Some("2"),
+                    &with6(packed()),
+                ),
+                2,
+                Number(b"42"),
+            ),
+            (
+                "an indirect /First",
+                // the index "1 0 2 6 " is 8 bytes, and the number is 6 bytes into the values
+                objstm_pdf(
+                    "/Type /ObjStm /N 2 /First 6 0 R",
+                    "1 0 2 6 ",
+                    "<< >> 42",
+                    Some("8"),
+                    &with6(packed()),
+                ),
+                2,
+                Number(b"42"),
+            ),
+            (
+                "an index past /N",
+                objstm_pdf("/Type /ObjStm /N 1", INDEX, VALUES, None, &packed()),
+                2,
+                Fails,
+            ),
+            (
+                "an object number that doesn't match the entry",
+                objstm_pdf(STM, "7 0 2 21 ", VALUES, None, &packed()),
+                1,
+                Fails,
+            ),
+            (
+                "an offset past the values",
+                objstm_pdf(STM, "1 0 2 99 ", VALUES, None, &packed()),
+                2,
+                Fails,
+            ),
+            (
+                "a container that isn't /Type /ObjStm",
+                objstm_pdf("/Type /XObject /N 2", INDEX, VALUES, None, &packed()),
+                1,
+                Fails,
+            ),
+            (
+                "a container that isn't a stream",
+                objstm_pdf(
+                    STM,
+                    INDEX,
+                    VALUES,
+                    Some("<< /Type /ObjStm >>"),
+                    &[Free, Packed(6, 0), Free, Free, Free, At(5), At(6)],
+                ),
+                1,
+                Fails,
+            ),
+            (
+                "a container that is free",
+                objstm_pdf(
+                    STM,
+                    INDEX,
+                    VALUES,
+                    None,
+                    &[Free, Packed(4, 0), Free, Free, Free, At(5)],
+                ),
+                1,
+                Fails,
+            ),
+            (
+                "a container packed in itself",
+                objstm_pdf(
+                    STM,
+                    INDEX,
+                    VALUES,
+                    None,
+                    &[Free, Packed(5, 0), Free, Free, Free, Packed(5, 0)],
+                ),
+                1,
+                Fails,
+            ),
+            (
+                "a container with an unsupported filter",
+                objstm_pdf(
+                    "/Type /ObjStm /N 2 /Filter /LZWDecode",
+                    INDEX,
+                    VALUES,
+                    None,
+                    &packed(),
+                ),
+                1,
+                Fails,
+            ),
+        ];
+        let mut module = FormatModule::new();
+        let [_pdf_main, pdf_cos, resolve_ref] = top_formats(&mut module);
+        for (name, input, obj, expected) in cases {
+            let is = |p: Pattern| {
+                fmt_match(
+                    var("d"),
+                    [
+                        (Pattern::Variant("value".into(), Box::new(p)), Format::EMPTY),
+                        (Pattern::Wildcard, Format::Fail),
+                    ],
+                )
+            };
+            let (check, ok) = match &expected {
+                Kind(kind) => (
+                    is(Pattern::Variant(
+                        (*kind).into(),
+                        Box::new(Pattern::Wildcard),
+                    )),
+                    true,
+                ),
+                Number(n) => (
+                    is(Pattern::Variant(
+                        "number".into(),
+                        Box::new(pattern_bytestring(n)),
+                    )),
+                    true,
+                ),
+                Fails => (Format::EMPTY, false),
+                _ => unreachable!(),
+            };
+            let top = chain(
+                pdf_cos.call(),
+                "cos",
+                chain(
+                    resolve_ref.call_args(vec![
+                        record_proj(var("cos"), "header_offset"),
+                        record_proj(var("cos"), "sections"),
+                        Expr::U64(obj),
+                        Expr::U64(0),
+                        Expr::Seq(vec![]),
+                        Expr::U64(8),
+                    ]),
+                    "d",
+                    check,
+                ),
+            );
+            let prog = Compiler::compile_program(&module, &top).expect("must compile");
+            assert_eq!(
+                prog.run(ReadCtxt::new(&input)).is_ok(),
+                ok,
+                "{name}: resolving {obj} 0 in {:?}",
                 String::from_utf8_lossy(&input)
             );
         }
