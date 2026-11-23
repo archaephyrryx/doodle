@@ -389,6 +389,139 @@ fn number(module: &mut FormatModule, natural: FormatRef) -> FormatRef {
     )
 }
 
+/// DaeDaLus `NumberAsNat`, applied to a `pdf.util.number` token (as a `Seq(u8)`): the value of
+/// the token as a `u64`, or `None` if it is not a whole number in `0..=u64::MAX`.
+///
+/// DaeDaLus `NumberAsNat` accepts a `Number` with `num >= 0 && exp == 0`. At the byte level
+/// (where `pdf.util.number` has already dropped any leading `+`), that is a token of the form
+/// `-? D+ .?`:
+/// - `exp == 0` means no digit follows the `.` (so `12.` is accepted, but `12.0` and `.5`
+///   are not);
+/// - `num >= 0` means that, after a `-`, every digit is `0` (so `-0` is accepted, as `0`).
+///
+/// The digits are folded in the Numeric model, with `Auto` rep, so the value isn't bounded by
+/// a machine type until the final conversion, which is where a value over `u64::MAX` is
+/// rejected (as DaeDaLus does with `as? uint 64`, e.g. in `LookupSize`).
+// Not yet called outside the tests; it is for the cross-reference-stream work (#347).
+#[cfg_attr(not(test), allow(dead_code))]
+fn number_as_nat(number: Expr) -> Expr {
+    // Phases of the fold, in the order they can occur
+    const START: u8 = 0;
+    const SIGN: u8 = 1;
+    const INT: u8 = 2;
+    const POINT: u8 = 3;
+    const BAD: u8 = 4;
+
+    // Each byte as a token: a digit carries its value as an Auto-rep Numeric, so that the
+    // arithmetic over it stays in the Numeric model rather than taking on the byte's `u8` rep.
+    let token = expr_match(
+        var("b"),
+        (0..10u8)
+            .map(|k| (Pattern::U8(b'0' + k), variant("digit", poly_const(k))))
+            .chain([
+                (Pattern::U8(b'-'), variant("minus", Expr::UNIT)),
+                (Pattern::U8(b'.'), variant("point", Expr::UNIT)),
+                (Pattern::Wildcard, variant("other", Expr::UNIT)),
+            ]),
+    );
+    let state = |neg: Expr, val: Expr, phase: u8| Expr::Tuple(vec![neg, val, Expr::U8(phase)]);
+    let at = |phase: u8, tok: Pattern| {
+        Pattern::Tuple(vec![
+            Pattern::Tuple(vec![bind("neg"), bind("val"), Pattern::U8(phase)]),
+            tok,
+        ])
+    };
+    let digit = || Pattern::Variant("digit".into(), Box::new(bind("d")));
+    let unit = |label: &'static str| Pattern::Variant(label.into(), Box::new(Pattern::Wildcard));
+
+    let step_digit = || state(var("neg"), numeric(numexpr!("val" * 10 + "d")), INT);
+    let step = lambda_tuple(
+        ["acc", "b"],
+        expr_match(
+            Expr::Tuple(vec![var("acc"), token]),
+            [
+                (at(START, digit()), step_digit()),
+                (at(SIGN, digit()), step_digit()),
+                (at(INT, digit()), step_digit()),
+                (
+                    at(START, unit("minus")),
+                    state(Expr::Bool(true), var("val"), SIGN),
+                ),
+                (at(INT, unit("point")), state(var("neg"), var("val"), POINT)),
+                // a sign that isn't leading, a fraction digit, or anything else
+                (
+                    Pattern::Wildcard,
+                    state(Expr::Bool(false), poly_const(0u8), BAD),
+                ),
+            ],
+        ),
+    );
+    let init = state(Expr::Bool(false), poly_const(0u8), START);
+    let acc_type = ValueType::Tuple(vec![
+        ValueType::Base(BaseType::Bool),
+        ValueType::NumericHole,
+        ValueType::Base(BaseType::U8),
+    ]);
+
+    // The only conversion out of the Numeric model, and so the only overflow check
+    let to_u64 = |val: Expr| {
+        expr_match(
+            val.clone(),
+            [
+                (Pattern::ZRange((0u64..).into()), expr_some(as_u64(val))),
+                (Pattern::Wildcard, expr_none()),
+            ],
+        )
+    };
+    let finished =
+        |neg: Pattern, val: Pattern, phase: u8| Pattern::Tuple(vec![neg, val, Pattern::U8(phase)]);
+    let zero = || Pattern::ZConst(0.into());
+    expr_match(
+        left_fold(step, init, acc_type, number),
+        [
+            (
+                finished(Pattern::Bool(false), bind("v"), INT),
+                to_u64(var("v")),
+            ),
+            (
+                finished(Pattern::Bool(false), bind("v"), POINT),
+                to_u64(var("v")),
+            ),
+            (
+                finished(Pattern::Bool(true), zero(), INT),
+                expr_some(Expr::U64(0)),
+            ),
+            (
+                finished(Pattern::Bool(true), zero(), POINT),
+                expr_some(Expr::U64(0)),
+            ),
+            (Pattern::Wildcard, expr_none()),
+        ],
+    )
+}
+
+/// DaeDaLus `NatValue v`: `v` (a `pdf.value`) must be a number, and [`number_as_nat`] of
+/// it must succeed; fails otherwise.
+#[cfg_attr(not(test), allow(dead_code))]
+fn nat_value(value: Expr) -> Format {
+    fmt_match(
+        value,
+        [
+            (
+                Pattern::Variant("number".into(), Box::new(bind("n"))),
+                fmt_match(
+                    number_as_nat(var("n")),
+                    [
+                        (pat_some(bind("x")), compute(var("x"))),
+                        (pat_none(), Format::Fail), // "not a natural number"
+                    ],
+                ),
+            ),
+            (Pattern::Wildcard, Format::Fail), // "not a number"
+        ],
+    )
+}
+
 fn v_string(module: &mut FormatModule, any_ws: FormatRef, eol: FormatRef) -> Format {
     let known_esc = interpret([
         (is_byte(b'n'), Expr::Seq(vec![Expr::U8(b'\n')])),
@@ -1011,6 +1144,102 @@ mod tests {
             )),
         );
         let prog = Compiler::compile_program(&module, &top.call()).expect("get must compile");
+        for (input, ok) in cases {
+            assert_eq!(
+                prog.run(ReadCtxt::new(input)).is_ok(),
+                *ok,
+                "decoding {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// `number_as_nat` accepts exactly the `pdf.util.number` tokens with no fraction digits
+    /// and a non-negative value that fits in a `u64`. Each case gives the expected value, or
+    /// `None` where DaeDaLus `NumberAsNat` (with `as? uint 64`) fails.
+    #[test]
+    fn number_as_nat_cases() {
+        let cases: &[(&[u8], Option<u64>)] = &[
+            (b"0", Some(0)),
+            (b"7", Some(7)),
+            (b"+7", Some(7)),
+            (b"007", Some(7)),
+            (b"12.", Some(12)),
+            (b"-0", Some(0)),
+            (b"-00.", Some(0)),
+            (b"18446744073709551615", Some(u64::MAX)),
+            (b"18446744073709551616", None),
+            (b"340282366920938463463374607431768211456", None),
+            (b"-5", None),
+            (b"-0.0", None),
+            (b"12.0", None),
+            (b"1.5", None),
+            (b".5", None),
+            (b"-.0", None),
+        ];
+        for (input, expected) in cases {
+            let mut module = FormatModule::new();
+            let natural = natural(&mut module);
+            let number = number(&mut module, natural);
+            let expected_pat = match expected {
+                Some(n) => pat_some(Pattern::U64(*n)),
+                None => pat_none(),
+            };
+            let top = module.define_format(
+                "test.number_as_nat",
+                only(chain(
+                    number.call(),
+                    "n",
+                    fmt_match(
+                        number_as_nat(var("n")),
+                        [
+                            (expected_pat, Format::EMPTY),
+                            (Pattern::Wildcard, Format::Fail),
+                        ],
+                    ),
+                )),
+            );
+            let prog = Compiler::compile_program(&module, &top.call()).expect("must compile");
+            assert!(
+                prog.run(ReadCtxt::new(input)).is_ok(),
+                "number_as_nat({:?}), expecting {expected:?}",
+                String::from_utf8_lossy(input),
+            );
+        }
+    }
+
+    /// `nat_value` accepts a `pdf.value` that is a natural number, and fails on a negative or
+    /// fractional number and on a value that isn't a number.
+    #[test]
+    fn nat_value_requires_natural_number() {
+        let cases: &[(&[u8], bool)] = &[
+            (b"42", true),
+            (b"42.", true),
+            (b"-0", true),
+            (b"-1", false),
+            (b"4.2", false),
+            (b"/Name", false),
+            (b"[ 1 ]", false),
+            (b"1 0 R", false),
+        ];
+        let mut module = FormatModule::new();
+        let simple_eol = simple_eol(&mut module);
+        let eol = eol(&mut module, simple_eol);
+        let comment = comment(&mut module, eol);
+        let any_ws = any_ws(&mut module, eol, comment);
+        let v_name = v_name(&mut module, any_ws);
+        let natural = natural(&mut module);
+        let number = number(&mut module, natural);
+        let [value, _dict] = pdf_value(&mut module, any_ws, eol, natural, number, v_name);
+        let top = module.define_format(
+            "test.nat_value",
+            only(chain(
+                value.call_args(vec![Expr::U64(32)]),
+                "v",
+                nat_value(var("v")),
+            )),
+        );
+        let prog = Compiler::compile_program(&module, &top.call()).expect("must compile");
         for (input, ok) in cases {
             assert_eq!(
                 prog.run(ReadCtxt::new(input)).is_ok(),
