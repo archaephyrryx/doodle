@@ -579,6 +579,52 @@ fn pdf_value(
     [value, dict]
 }
 
+/// The value bound to the name `key` in `dict`, as an `Option`, where `dict` is the result
+/// of `pdf.value.dict` and `value_type` is the type of `pdf.value`.
+///
+/// `key` is written without its leading `/`. Entry keys are compared after `#xx` escapes
+/// have been decoded, so `/S#69ze` matches `b"Size"`.
+///
+/// DaeDaLus builds a dictionary with `insert`, so a later duplicate key replaces an earlier
+/// one. `pdf.value.dict` keeps every entry, so this returns the value of the *last* entry
+/// whose key is `key`.
+// Not yet called outside the tests; it is for the cross-reference-stream work (#347).
+#[cfg_attr(not(test), allow(dead_code))]
+fn dict_lookup(key: &[u8], dict: Expr, value_type: ValueType) -> Expr {
+    let name = [b"/", key].concat();
+    left_fold(
+        lambda_tuple(
+            ["found", "entry"],
+            expr_match(
+                record_proj(var("entry"), "key"),
+                [
+                    (
+                        pattern_bytestring(&name),
+                        expr_some(record_proj(var("entry"), "value")),
+                    ),
+                    (Pattern::Wildcard, var("found")),
+                ],
+            ),
+        ),
+        expr_none(),
+        ValueType::Option(Box::new(value_type)),
+        dict,
+    )
+}
+
+/// DaeDaLus `Lookup key dict`: like [`dict_lookup`], but as a parser that fails when `dict`
+/// has no entry for `key`, so a `Default`-style fallback can catch the failure.
+#[cfg_attr(not(test), allow(dead_code))]
+fn dict_get(key: &[u8], dict: Expr, value_type: ValueType) -> Format {
+    fmt_match(
+        dict_lookup(key, dict, value_type),
+        [
+            (pat_some(bind("v")), compute(var("v"))),
+            (pat_none(), Format::Fail), // "missing dictionary key"
+        ],
+    )
+}
+
 fn token(f: Format, any_ws: FormatRef) -> Format {
     chain(
         f,
@@ -870,6 +916,101 @@ mod tests {
             (b"xref\n0 1\n0000000000 65535 x\r\n", false),
             (b"xref\n0 1\n0000000000 65535 f\n", false),
         ];
+        for (input, ok) in cases {
+            assert_eq!(
+                prog.run(ReadCtxt::new(input)).is_ok(),
+                *ok,
+                "decoding {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// Builds `pdf.value` and `pdf.value.dict`, returning the dict format and the value type.
+    fn dict_module(module: &mut FormatModule) -> (FormatRef, ValueType) {
+        let simple_eol = simple_eol(module);
+        let eol = eol(module, simple_eol);
+        let comment = comment(module, eol);
+        let any_ws = any_ws(module, eol, comment);
+        let v_name = v_name(module, any_ws);
+        let natural = natural(module);
+        let number = number(module, natural);
+        let [value, dict] = pdf_value(module, any_ws, eol, natural, number, v_name);
+        let value_type = module.get_format_type(value.get_level()).clone();
+        (dict, value_type)
+    }
+
+    /// `dict_lookup` gives the value of the last entry with the given key (after escapes are
+    /// decoded), ignores entries of nested dicts and keys that only share a prefix, and gives
+    /// `None` when the key is absent. Each case gives the expected digits of a `number` value,
+    /// or `None` for an absent key.
+    #[test]
+    fn dict_lookup_last_match() {
+        let cases: &[(&[u8], Option<&[u8]>)] = &[
+            (b"<< /Size 7 >>", Some(b"7")),
+            (b"<< /Size 3 /Size 7 >>", Some(b"7")),
+            (b"<< /Size 3 /Other 5 >>", Some(b"3")),
+            (b"<< /S#69ze 7 >>", Some(b"7")),
+            (b"<< /A << /Size 9 >> /Size 7 >>", Some(b"7")),
+            (b"<< /A << /Size 9 >> >>", None),
+            (b"<< /Sizes 7 /Siz 8 >>", None),
+            (b"<<>>", None),
+        ];
+        for (input, expected) in cases {
+            let mut module = FormatModule::new();
+            let (dict, value_type) = dict_module(&mut module);
+            let expected_pat = match expected {
+                Some(digits) => pat_some(Pattern::Variant(
+                    "number".into(),
+                    Box::new(pattern_bytestring(digits)),
+                )),
+                None => pat_none(),
+            };
+            let top = module.define_format(
+                "test.dict_lookup",
+                only(chain(
+                    dict.call_args(vec![Expr::U64(32)]),
+                    "d",
+                    fmt_match(
+                        dict_lookup(b"Size", var("d"), value_type),
+                        [
+                            (expected_pat, Format::EMPTY),
+                            (Pattern::Wildcard, Format::Fail),
+                        ],
+                    ),
+                )),
+            );
+            let prog =
+                Compiler::compile_program(&module, &top.call()).expect("lookup must compile");
+            assert!(
+                prog.run(ReadCtxt::new(input)).is_ok(),
+                "looking up /Size in {:?}, expecting {:?}",
+                String::from_utf8_lossy(input),
+                expected.map(String::from_utf8_lossy)
+            );
+        }
+    }
+
+    /// `dict_get` yields the looked-up value and fails when the key is absent.
+    #[test]
+    fn dict_get_fails_on_missing_key() {
+        let cases: &[(&[u8], bool)] = &[
+            (b"<< /Size 7 >>", true),
+            (b"<< /Size 3 /Size << >> >>", true),
+            (b"<< /Other 7 >>", false),
+            (b"<<>>", false),
+        ];
+        let mut module = FormatModule::new();
+        let (dict, value_type) = dict_module(&mut module);
+        let top = module.define_format(
+            "test.dict_get",
+            only(chain(
+                dict.call_args(vec![Expr::U64(32)]),
+                "d",
+                dict_get(b"Size", var("d"), value_type),
+            )),
+        );
+        let prog = Compiler::compile_program(&module, &top.call()).expect("get must compile");
         for (input, ok) in cases {
             assert_eq!(
                 prog.run(ReadCtxt::new(input)).is_ok(),
