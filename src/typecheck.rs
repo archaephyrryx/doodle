@@ -3506,9 +3506,13 @@ impl TypeChecker {
                 let _ = self.unify_varmaps(v1, *vmid1, v2, *vmid2)?;
                 Ok(&self.constraints[v1.0])
             }
+            // A vacuous constraint (`Equiv` of `Hole` or `Empty`, the type of `Format::Fail`) is
+            // equivalent to `Indefinite`, so these mirror the `Indefinite` arms above: the
+            // union is copied onto the vacuous side, which (as the canonical variable, when it
+            // is `v1`) would otherwise keep `Empty` and lose the union.
             (Constraints::Variant(vmid), Constraints::Invariant(c)) => {
                 if c.is_vacuous() {
-                    Ok(&self.constraints[v1.0])
+                    Ok(self.replace_constraints_from_index(v2.0, v1.0))
                 } else {
                     Err(TCErrorKind::VarianceMismatch(
                         Ord::min(v1, v2),
@@ -3522,7 +3526,7 @@ impl TypeChecker {
             }
             (Constraints::Invariant(c), Constraints::Variant(vmid)) => {
                 if c.is_vacuous() {
-                    Ok(&self.constraints[v2.0])
+                    Ok(self.replace_constraints_from_index(v1.0, v2.0))
                 } else {
                     Err(TCErrorKind::VarianceMismatch(
                         Ord::min(v1, v2),

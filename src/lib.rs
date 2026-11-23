@@ -5296,6 +5296,43 @@ mod test {
         assert!(prog.run(ReadCtxt::new(b"SaZ")).is_ok());
     }
 
+    /// A `Fail` unified with a union-typed format keeps the union: `Fail`'s type, `Empty`, is
+    /// bottom also where it meets a union's variable (`TypeChecker::transfer_constraints`),
+    /// rather than leaving the combined variable `Empty`. Here the `Fail` branch comes first, so
+    /// the canonical variable starts out `Empty`.
+    #[test]
+    fn fail_branch_keeps_union_type() {
+        use crate::helper::{alts, expr_not, if_then_else, is_byte, var};
+        let union = || {
+            ValueType::Union(std::collections::BTreeMap::from([
+                (Label::Borrowed("a"), ValueType::Base(BaseType::U8)),
+                (Label::Borrowed("b"), ValueType::Base(BaseType::U8)),
+            ]))
+        };
+        for fail_first in [true, false] {
+            let mut module = FormatModule::new();
+            let [f] = module.define_batch_with_args(
+                [(
+                    "test.guarded_union",
+                    vec![(Label::Borrowed("ok"), ValueType::Base(BaseType::Bool))],
+                )],
+                [Box::new(move |_: &[FormatRef; 1]| {
+                    let branches = alts([("a", is_byte(b'a')), ("b", is_byte(b'b'))]);
+                    if fail_first {
+                        if_then_else(expr_not(var("ok")), Format::Fail, branches)
+                    } else {
+                        if_then_else(var("ok"), branches, Format::Fail)
+                    }
+                })],
+            );
+            assert_eq!(
+                module.get_format_type(f.get_level()),
+                &union(),
+                "fail_first: {fail_first}"
+            );
+        }
+    }
+
     /// A numeric cast whose operand's type is not yet known when the cast is inferred (a lambda
     /// or pattern variable) leaves the operand's type to the rest of inference, rather than
     /// giving it the cast's (`u8` here, not `u16`); and an operand nothing else determines (an
