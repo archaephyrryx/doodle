@@ -972,7 +972,7 @@ impl RustType {
         }
     }
 
-    /// Whether `self` is a sequence: a `Vec`, or a borrowed slice or `Vec`.
+    /// Returns `true` if self is a sequence or slice type, i.e. `Vec<T>` or `[T]` (or a borrow of either).
     pub(crate) fn is_seq_or_slice(&self) -> bool {
         match self {
             RustType::Atom(AtomType::Comp(CompType::Vec(..) | CompType::RawSlice(..))) => true,
@@ -983,8 +983,9 @@ impl RustType {
         }
     }
 
-    /// Returns the most natural form of `self` to be used when being borrowed, as
-    /// in `[T]` to replace `Vec<T>`.
+    /// For types with a more natural dereference for borrowing (e.g. `[T]` instead of `Vec<T>`), returns the dereferenced type.
+    ///
+    /// Otherwise, returns `self`.
     fn deref_tgt(self) -> RustType {
         match self {
             RustType::Atom(AtomType::Comp(CompType::Vec(t))) => {
@@ -994,6 +995,7 @@ impl RustType {
         }
     }
 
+    /// Returns the lifetime parameter associated with `self`, if any.
     pub(crate) fn lt_param(&self) -> Option<&RustLt> {
         match self {
             RustType::Atom(atom_type) => atom_type.lt_param(),
@@ -1003,6 +1005,9 @@ impl RustType {
         }
     }
 
+    /// Mutatably performs an alpha-conversion (re-labeling) of the lifetime parameter associated with `self`, if any, to `new_lt`.
+    ///
+    /// If `self` has no lifetime parameter, this is a no-op.
     pub(crate) fn alpha_convert_lifetime(&mut self, new_lt: RustLt) {
         match self {
             RustType::Atom(atom_type) => atom_type.alpha_convert_lifetime(new_lt),
@@ -1019,6 +1024,7 @@ impl RustType {
         }
     }
 
+    /// Attempts to convert `self` into a `NumType`, returning `Some(NumType)` if successful and `None` otherwise.
     pub(crate) fn try_as_num(&self) -> Option<NumType> {
         match self {
             RustType::Atom(at) => match at {
@@ -1056,14 +1062,19 @@ fn hotswap_lt(params: &mut Option<Box<UseParams>>, new_lt: RustLt) {
 }
 
 impl RustType {
-    /// Conservative heuristic for determining whether it is possible to implement `Copy` on a `RustTypeDef` containing embedded values of this `RustType` without
-    /// resulting in a compiler error.
+    /// Conservative heuristic for determining whether it is possible to implement the `Copy` trait
+    /// on a `RustTypeDef` containing embedded values of this `RustType` without causing a compiler error.
     ///
-    /// Returns `true` if `self` is a primitive type, an immutable reference, or if it is an anonymous tuple or `Result` consisting only of such value-types.
+    /// Returns `true` if `self` is a primitive type, an immutable reference,
+    /// or if it is an anonymous tuple, `Option`, or `Result` of such value-types.
     ///
-    /// Because inference is performed locally, no embedded `LocalDef` values are considered to be Copyable, even when they are locally-defined with a `#[derive(Copy)]` attribute.
+    /// # Notes
     ///
-    /// For a true answer that solves for LocalDef using additionally provided state, use [`CopyEligible::copy_hint`](analysis::CopyEligible::copy_hint) instead.
+    /// Because inference is performed locally, all [`LocalType::LocalDef`] items are reported as not copyable,
+    /// even when they are locally-defined with a `#[derive(Copy)]` attribute.
+    ///
+    /// For a true answer that solves for LocalDef using additionally provided state,
+    /// use [`CopyEligible::copy_hint`](analysis::CopyEligible::copy_hint) instead.
     pub(crate) fn can_be_copy(&self) -> bool {
         match self {
             RustType::Atom(at) => match at {
@@ -1084,7 +1095,7 @@ impl RustType {
                 },
             },
             RustType::AnonTuple(args) => args.iter().all(|t| t.can_be_copy()),
-            // NOTE - Without lexical analysis rules or more information stored in Verbatim, we have no good way to determine whether a verbatim-injected type-name is Copy-safe or not
+            // NOTE - Without lexical analysis rules or more information stored in Verbatim, there is no way to judge any Verbatim Copy-safe, so we always report false
             RustType::Verbatim(..) => false,
             RustType::ReadArray(..) => READ_ARRAY_IS_COPY,
             RustType::ViewObject(..) => VIEW_OBJECT_IS_COPY,
@@ -1131,6 +1142,8 @@ pub(crate) enum RustStruct {
 
 impl RustStruct {
     /// Rough heuristic to determine whether a `RustStruct` can derive `Copy` without resulting in a compiler error.
+    ///
+    /// See [`RustType::can_be_copy`] for more information on the limitations of this heuristic.
     pub(crate) fn can_be_copy(&self) -> bool {
         match self {
             RustStruct::Record(flds) => flds.iter().all(|(_, t)| t.can_be_copy()),
@@ -2207,6 +2220,7 @@ pub(crate) enum RustExpr {
     ResultOk(Option<Label>, Box<RustExpr>),
     ResultErr(Box<RustExpr>),
     Macro(RustMacro),
+    /// Abstract expression representing "owned-value form of `Option<&T>`". Takes [`OwnedKind`] to indicate how ownership should be obtained (e.g. clone/copy/dereference)
     OwnedOption(Box<RustExpr>, OwnedKind),
     // WIP - merge candidate with FunctionCall
     Invoke(FnEntity, Vec<RustExpr>),
