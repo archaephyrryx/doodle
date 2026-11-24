@@ -505,9 +505,9 @@ fn numeric_to_u64(val: Expr) -> Expr {
 /// Whether the value of `key` in `dict` is the name `name` (both written without the leading
 /// `/`), as a `Bool`. DaeDaLus `LookupName key dict == name`, without resolving a reference
 /// (#355).
-fn dict_name_is(key: &[u8], name: &[u8], dict: Expr, value_type: ValueType) -> Expr {
+fn dict_name_is(key: &[u8], name: &[u8], dict: Expr) -> Expr {
     expr_match(
-        dict_lookup(key, dict, value_type),
+        dict_lookup(key, dict),
         [
             (
                 pat_some(Pattern::Variant(
@@ -547,9 +547,9 @@ fn nat_value(value: Expr) -> Format {
 ///
 /// DaeDaLus `LookupNat` also resolves an indirect reference (`LookupResolve`). This doesn't
 /// (as for the other filter parameters, see [`apply_filters`]), so a reference gives `dflt`.
-fn lookup_nat_or(key: &[u8], dict: Expr, dflt: u64, value_type: ValueType) -> Expr {
+fn lookup_nat_or(key: &[u8], dict: Expr, dflt: u64) -> Expr {
     expr_match(
-        dict_lookup(key, dict, value_type),
+        dict_lookup(key, dict),
         [
             (
                 pat_some(Pattern::Variant("number".into(), Box::new(bind("n")))),
@@ -564,7 +564,7 @@ fn lookup_nat_or(key: &[u8], dict: Expr, dflt: u64, value_type: ValueType) -> Ex
 /// of a `/FlateDecode` filter, where `param` is the filter's `/DecodeParms` entry as an
 /// `Option` of a `pdf.value.dict` result (DaeDaLus `FilterParam`, which maps `null` to
 /// `nothing`). Absent entries, and an absent `param`, take the defaults `1`, `1`, `8` and `1`.
-fn flate_decode_params(param: Expr, value_type: ValueType) -> Expr {
+fn flate_decode_params(param: Expr) -> Expr {
     const DEFAULTS: [(&str, &[u8], u64); 4] = [
         ("predictor", b"Predictor", 1),
         ("colors", b"Colors", 1),
@@ -584,7 +584,7 @@ fn flate_decode_params(param: Expr, value_type: ValueType) -> Expr {
         [
             (
                 pat_some(bind("ps")),
-                params(&|key, dflt| lookup_nat_or(key, var("ps"), dflt, value_type.clone())),
+                params(&|key, dflt| lookup_nat_or(key, var("ps"), dflt)),
             ),
             (pat_none(), params(&|_, dflt| Expr::U64(dflt))),
         ],
@@ -975,41 +975,33 @@ fn pdf_value(
 }
 
 /// The value bound to the name `key` in `dict`, as an `Option`, where `dict` is the result
-/// of `pdf.value.dict` and `value_type` is the type of `pdf.value`.
+/// of `pdf.value.dict`.
 ///
 /// `key` is written without its leading `/`. Entry keys are compared after `#xx` escapes
 /// have been decoded, so `/S#69ze` matches `b"Size"`.
 ///
 /// DaeDaLus builds a dictionary with `insert`, so a later duplicate key replaces an earlier
 /// one. `pdf.value.dict` keeps every entry, so this returns the value of the *last* entry
-/// whose key is `key`.
-fn dict_lookup(key: &[u8], dict: Expr, value_type: ValueType) -> Expr {
+/// whose key is `key` ([`KeySearch::Last`]).
+fn dict_lookup(key: &[u8], dict: Expr) -> Expr {
     let name = [b"/", key].concat();
-    left_fold(
-        lambda_tuple(
-            ["found", "entry"],
-            expr_match(
-                record_proj(var("entry"), "key"),
-                [
-                    (
-                        pattern_bytestring(&name),
-                        expr_some(record_proj(var("entry"), "value")),
-                    ),
-                    (Pattern::Wildcard, var("found")),
-                ],
-            ),
-        ),
+    expr_option_map_or(
         expr_none(),
-        ValueType::Option(Box::new(value_type)),
-        dict,
+        |entry| expr_some(record_proj(entry, "value")),
+        find_by_key(
+            KeySearch::Last,
+            |entry| record_proj(entry, "key"),
+            expr_lift_seq(name, Expr::U8),
+            dict,
+        ),
     )
 }
 
 /// DaeDaLus `Lookup key dict`: like [`dict_lookup`], but as a parser that fails when `dict`
 /// has no entry for `key`, so a `Default`-style fallback can catch the failure.
-fn dict_get(key: &[u8], dict: Expr, value_type: ValueType) -> Format {
+fn dict_get(key: &[u8], dict: Expr) -> Format {
     fmt_match(
-        dict_lookup(key, dict, value_type),
+        dict_lookup(key, dict),
         [
             (pat_some(bind("v")), compute(var("v"))),
             (pat_none(), Format::Fail), // "missing dictionary key"
@@ -1223,10 +1215,10 @@ fn last_pdf_end(pdf_end: FormatRef) -> Format {
 /// `size` is required and must be a natural number. `root` must be a reference if present.
 /// `prev` and `xrefstm` are `None` if absent or not a natural number, as DaeDaLus `Optional`
 /// gives. DaeDaLus resolves an indirect `/XRefStm`; until #355 that gives `None` here.
-fn trailer_dict(dict: Expr, value_type: ValueType) -> Format {
+fn trailer_dict(dict: Expr) -> Format {
     let optional_nat = |key: &[u8]| {
         expr_match(
-            dict_lookup(key, dict.clone(), value_type.clone()),
+            dict_lookup(key, dict.clone()),
             [
                 (
                     pat_some(Pattern::Variant("number".into(), Box::new(bind("n")))),
@@ -1240,7 +1232,7 @@ fn trailer_dict(dict: Expr, value_type: ValueType) -> Format {
         (
             "size",
             chain(
-                dict_get(b"Size", dict.clone(), value_type.clone()),
+                dict_get(b"Size", dict.clone()),
                 "size",
                 nat_value(var("size")),
             ),
@@ -1248,7 +1240,7 @@ fn trailer_dict(dict: Expr, value_type: ValueType) -> Format {
         (
             "root",
             fmt_match(
-                dict_lookup(b"Root", dict.clone(), value_type.clone()),
+                dict_lookup(b"Root", dict.clone()),
                 [
                     (
                         pat_some(Pattern::Variant("ref".into(), Box::new(bind("r")))),
@@ -1362,11 +1354,11 @@ fn xref_entry(widths: Expr) -> Format {
 ///
 /// DaeDaLus resolves an indirect `/Size`, `/Index` or element of it; until #355 that makes
 /// `/Size` fail and `/Index` take its default.
-fn xref_index(header: Expr, value_type: ValueType) -> Format {
+fn xref_index(header: Expr) -> Format {
     let u64_seq = ValueType::Seq(Box::new(ValueType::Base(BaseType::U64)));
     // DaeDaLus `LookupNats "Index" header`, as an `Option`
     let index_nats = expr_match(
-        dict_lookup(b"Index", header.clone(), value_type.clone()),
+        dict_lookup(b"Index", header.clone()),
         [
             (
                 pat_some(Pattern::Variant("array".into(), Box::new(bind("vs")))),
@@ -1406,11 +1398,7 @@ fn xref_index(header: Expr, value_type: ValueType) -> Format {
         )
     };
     chain(
-        chain(
-            dict_get(b"Size", header, value_type),
-            "size",
-            nat_value(var("size")),
-        ),
+        chain(dict_get(b"Size", header), "size", nat_value(var("size"))),
         "size",
         chain(
             compute(expr_option_map_or(
@@ -1437,7 +1425,7 @@ fn xref_index(header: Expr, value_type: ValueType) -> Format {
 /// whole entry, the sum of all of `/W`. `/W` must be an array of natural numbers.
 ///
 /// DaeDaLus resolves an indirect `/W`; until #355 that fails here.
-fn xref_widths(header: Expr, value_type: ValueType) -> Format {
+fn xref_widths(header: Expr) -> Format {
     let b = |i: u32| {
         compute(expr_option_map_or(
             Expr::U64(0),
@@ -1458,7 +1446,7 @@ fn xref_widths(header: Expr, value_type: ValueType) -> Format {
         (
             "_w",
             fmt_match(
-                dict_lookup(b"W", header, value_type),
+                dict_lookup(b"W", header),
                 [
                     (
                         pat_some(Pattern::Variant("array".into(), Box::new(bind("vs")))),
@@ -1502,11 +1490,11 @@ fn xref_widths(header: Expr, value_type: ValueType) -> Format {
 ///
 /// A filter that isn't a name, or a `/DecodeParms` that isn't a dict or `null`, fails (DaeDaLus
 /// `Filter`, `FilterParam`), as does a `/FlateDecode` whose data doesn't decode.
-fn apply_filters(zlib: FormatRef, header: Expr, raw: Expr, value_type: ValueType) -> Format {
+fn apply_filters(zlib: FormatRef, header: Expr, raw: Expr) -> Format {
     // DaeDaLus `LookupOptArray`: absent is `[]`, and a single value is `[value]`
     let opt_array = |key: &[u8]| {
         expr_match(
-            dict_lookup(key, header.clone(), value_type.clone()),
+            dict_lookup(key, header.clone()),
             [
                 (pat_none(), Expr::Seq(vec![])),
                 (
@@ -1568,7 +1556,7 @@ fn apply_filters(zlib: FormatRef, header: Expr, raw: Expr, value_type: ValueType
         ),
     );
     let flate = chain(
-        compute(flate_decode_params(var("_param"), value_type.clone())),
+        compute(flate_decode_params(var("_param"))),
         "_fp",
         if_then_else(
             supported_predictor(var("_fp")),
@@ -1609,9 +1597,9 @@ fn apply_filters(zlib: FormatRef, header: Expr, raw: Expr, value_type: ValueType
 
 /// [`apply_filters`] for a cross-reference stream, whose filters must all be applied (DaeDaLus
 /// `str.body is ok`): the decoded bytes, failing if they're `unsupported`.
-fn xref_stream_filters(zlib: FormatRef, header: Expr, raw: Expr, value_type: ValueType) -> Format {
+fn xref_stream_filters(zlib: FormatRef, header: Expr, raw: Expr) -> Format {
     chain(
-        apply_filters(zlib, header, raw, value_type),
+        apply_filters(zlib, header, raw),
         "_filtered",
         fmt_match(
             var("_filtered"),
@@ -1640,7 +1628,6 @@ fn xref_obj(
     natural: FormatRef,
     pdf_value: FormatRef,
     zlib: FormatRef,
-    value_type: ValueType,
 ) -> FormatRef {
     let header = || var("_header");
     module.define_format(
@@ -1669,11 +1656,7 @@ fn xref_obj(
             ("__eol", simple_eol.call()),
             (
                 "_len",
-                chain(
-                    dict_get(b"Length", header(), value_type.clone()),
-                    "len",
-                    nat_value(var("len")),
-                ),
+                chain(dict_get(b"Length", header()), "len", nat_value(var("len"))),
             ),
             (
                 "_body",
@@ -1683,7 +1666,7 @@ fn xref_obj(
                         chain(
                             repeat(Format::ANY_BYTE),
                             "raw",
-                            xref_stream_filters(zlib, header(), var("raw"), value_type.clone()),
+                            xref_stream_filters(zlib, header(), var("raw")),
                         ),
                     ),
                     any_ws,
@@ -1695,13 +1678,13 @@ fn xref_obj(
             (
                 "__type",
                 if_then_else(
-                    dict_name_is(b"Type", b"XRef", header(), value_type.clone()),
+                    dict_name_is(b"Type", b"XRef", header()),
                     Format::EMPTY,
                     Format::Fail, // "not /Type /XRef"
                 ),
             ),
-            ("_index", xref_index(header(), value_type.clone())),
-            ("_widths", xref_widths(header(), value_type.clone())),
+            ("_index", xref_index(header())),
+            ("_widths", xref_widths(header())),
             // DaeDaLus `XRefObjTable`
             (
                 "xref",
@@ -1723,7 +1706,7 @@ fn xref_obj(
                     ),
                 ),
             ),
-            ("trailer", trailer_dict(header(), value_type)),
+            ("trailer", trailer_dict(header())),
         ]),
     )
 }
@@ -1738,7 +1721,6 @@ fn cross_ref(
     xref_table: FormatRef,
     pdf_dict: FormatRef,
     xref_obj: FormatRef,
-    value_type: ValueType,
 ) -> FormatRef {
     let just_white = union([void(byte_in(SIMPLE_WS)), eol.call()]);
     let old_xref = record_auto([
@@ -1748,7 +1730,7 @@ fn cross_ref(
         ("__ws", repeat(just_white)),
         ("__kw_trailer", kw(b"trailer", any_ws)),
         ("_dict", pdf_dict.call_args(vec![Expr::U64(32)])),
-        ("trailer", trailer_dict(var("_dict"), value_type)),
+        ("trailer", trailer_dict(var("_dict"))),
     ]);
     module.define_format(
         "pdf.cross_ref",
@@ -2096,7 +2078,6 @@ fn resolve(
     pdf_value: FormatRef,
     zlib: FormatRef,
     sections_type: ValueType,
-    value_type: ValueType,
 ) -> [FormatRef; 2] {
     let u64_type = || ValueType::Base(BaseType::U64);
     let args = || {
@@ -2133,25 +2114,22 @@ fn resolve(
         ]
     };
     // DaeDaLus `LookupResolve key dict`, within the batch
-    let lookup_resolve = move |resolve_ref: FormatRef, key: &[u8], dict: Expr, vt: ValueType| {
+    let lookup_resolve = move |resolve_ref: FormatRef, key: &[u8], dict: Expr| {
         chain(
-            dict_get(key, dict, vt),
+            dict_get(key, dict),
             "_lookup",
             resolve_val(resolve_ref, nested(), var("_lookup")),
         )
     };
-    let vt = value_type.clone();
-    let vt_packed = value_type.clone();
     module.define_batch_with_args(
         [("pdf.resolve_ref", args()), ("pdf.resolved_decl", args())],
         [
             Box::new(move |&[resolve_ref, decl]: &[FormatRef; 2]| {
-                let vt = vt_packed.clone();
                 let entry = || Pattern::Variant("at".into(), Box::new(bind("at")));
                 let packed = || Pattern::Variant("packed".into(), Box::new(bind("packed")));
                 let nat = |key: &'static [u8], dict: Expr| {
                     chain(
-                        lookup_resolve(resolve_ref, key, dict, vt.clone()),
+                        lookup_resolve(resolve_ref, key, dict),
                         "_nat_v",
                         nat_value(var("_nat_v")),
                     )
@@ -2163,7 +2141,7 @@ fn resolve(
                     (
                         "__type",
                         chain(
-                            lookup_resolve(resolve_ref, b"Type", header(), vt.clone()),
+                            lookup_resolve(resolve_ref, b"Type", header()),
                             "_type",
                             fmt_match(
                                 var("_type"),
@@ -2306,10 +2284,9 @@ fn resolve(
                 )
             }),
             Box::new(move |&[resolve_ref, _]: &[FormatRef; 2]| {
-                let vt = vt.clone();
                 // DaeDaLus `StreamLen`: `LookupResolve "Length"`, a natural number
                 let stream_len = chain(
-                    dict_get(b"Length", var("header"), vt.clone()),
+                    dict_get(b"Length", var("header")),
                     "_len_v",
                     chain(
                         resolve_val(resolve_ref, nested(), var("_len_v")),
@@ -2343,7 +2320,7 @@ fn resolve(
                                 chain(
                                     repeat(Format::ANY_BYTE),
                                     "raw",
-                                    apply_filters(zlib, var("header"), var("raw"), vt.clone()),
+                                    apply_filters(zlib, var("header"), var("raw")),
                                 ),
                             ),
                             any_ws,
@@ -2498,24 +2475,8 @@ fn top_formats(module: &mut FormatModule) -> [FormatRef; 3] {
     let pdf_end = pdf_end(module, eol, natural);
     let deflate = doodle_formats::format::deflate::main(module);
     let zlib = doodle_formats::format::zlib::main(module, deflate);
-    let xref_obj = xref_obj(
-        module,
-        any_ws,
-        simple_eol,
-        natural,
-        pdf_value,
-        zlib,
-        pdf_value_type.clone(),
-    );
-    let cross_ref = cross_ref(
-        module,
-        any_ws,
-        eol,
-        cross_ref_section,
-        pdf_dict,
-        xref_obj,
-        pdf_value_type.clone(),
-    );
+    let xref_obj = xref_obj(module, any_ws, simple_eol, natural, pdf_value, zlib);
+    let cross_ref = cross_ref(module, any_ws, eol, cross_ref_section, pdf_dict, xref_obj);
     let xref_chain = xref_chain(module, cross_ref);
     let sections_type = ValueType::Seq(Box::new(
         module.get_format_type(cross_ref.get_level()).clone(),
@@ -2528,7 +2489,6 @@ fn top_formats(module: &mut FormatModule) -> [FormatRef; 3] {
         pdf_value,
         zlib,
         sections_type,
-        pdf_value_type.clone(),
     );
     let pdf_cos = pdf_cos(module, pdf_end, xref_chain, resolve_ref);
 
@@ -2660,8 +2620,8 @@ mod tests {
         }
     }
 
-    /// Builds `pdf.value` and `pdf.value.dict`, returning the dict format and the value type.
-    fn dict_module(module: &mut FormatModule) -> (FormatRef, ValueType) {
+    /// Builds `pdf.value` and `pdf.value.dict`, returning the dict format.
+    fn dict_module(module: &mut FormatModule) -> FormatRef {
         let simple_eol = simple_eol(module);
         let eol = eol(module, simple_eol);
         let comment = comment(module, eol);
@@ -2669,9 +2629,8 @@ mod tests {
         let v_name = v_name(module, any_ws);
         let natural = natural(module);
         let number = number(module, natural);
-        let [value, dict] = pdf_value(module, any_ws, eol, natural, number, v_name);
-        let value_type = module.get_format_type(value.get_level()).clone();
-        (dict, value_type)
+        let [_value, dict] = pdf_value(module, any_ws, eol, natural, number, v_name);
+        dict
     }
 
     /// `dict_lookup` gives the value of the last entry with the given key (after escapes are
@@ -2692,7 +2651,7 @@ mod tests {
         ];
         for (input, expected) in cases {
             let mut module = FormatModule::new();
-            let (dict, value_type) = dict_module(&mut module);
+            let dict = dict_module(&mut module);
             let expected_pat = match expected {
                 Some(digits) => pat_some(Pattern::Variant(
                     "number".into(),
@@ -2706,7 +2665,7 @@ mod tests {
                     dict.call_args(vec![Expr::U64(32)]),
                     "d",
                     fmt_match(
-                        dict_lookup(b"Size", var("d"), value_type),
+                        dict_lookup(b"Size", var("d")),
                         [
                             (expected_pat, Format::EMPTY),
                             (Pattern::Wildcard, Format::Fail),
@@ -2735,13 +2694,13 @@ mod tests {
             (b"<<>>", false),
         ];
         let mut module = FormatModule::new();
-        let (dict, value_type) = dict_module(&mut module);
+        let dict = dict_module(&mut module);
         let top = module.define_format(
             "test.dict_get",
             only(chain(
                 dict.call_args(vec![Expr::U64(32)]),
                 "d",
-                dict_get(b"Size", var("d"), value_type),
+                dict_get(b"Size", var("d")),
             )),
         );
         let prog = Compiler::compile_program(&module, &top.call()).expect("get must compile");
@@ -2880,7 +2839,6 @@ mod tests {
         let natural = natural(module);
         let number = number(module, natural);
         let [value, _dict] = pdf_value(module, any_ws, eol, natural, number, v_name);
-        let value_type = module.get_format_type(value.get_level()).clone();
         chain(
             value.call_args(vec![Expr::U64(32)]),
             "v",
@@ -2899,11 +2857,7 @@ mod tests {
                     ],
                 ),
                 "param",
-                chain(
-                    compute(flate_decode_params(var("param"), value_type)),
-                    "params",
-                    rest,
-                ),
+                chain(compute(flate_decode_params(var("param"))), "params", rest),
             ),
         )
     }
