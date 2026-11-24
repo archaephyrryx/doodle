@@ -546,7 +546,10 @@ reaching the cap fails a debug assertion, and otherwise gives the head its `top`
 Logging every `call_continuation` result over doodle-formats' main format (through both compilers)
 and doodle-pdf gives the same results with this resolution as with a single pass that keeps only
 results relying on nothing, so for those grammars the two agree; the difference is in how many
-analyses it takes.
+analyses it takes. The comparison matters because the single pass is not obviously exact:
+`lookahead_budget` measures a callee's value against a cut of the caller's continuation rather than
+passing it through as a plain `max`, so a single pass could under-count, and an under-count would let
+the decoder cache share one decoder between continuations that differ in bytes it consults.
 
 #### `TypedFormat`'s own cycle-safe traversals
 
@@ -733,6 +736,11 @@ the other types they cannot convert.
   settles only if a larger estimate never gives a smaller answer, which is argued but not proven for
   `lookahead_budget`. `MAX_FIXPOINT_PASSES` bounds the passes either way, and debug builds assert
   that it is never reached.
+- **Constant factors in the lookahead analyses.** With the fixpoint bounding the number of analyses,
+  what remains is per-analysis cost. The hottest leaf code is SipHash over `Rc<Next>`/`Format` keys
+  (in `LevelAnalytics` and `MatchTreeLevel::merge_branch`); caching hashes or a faster hasher would
+  cut it. The order of `LOOKAHEAD_BUDGETS` is likewise only a constant-factor tuning knob now: before
+  the fixpoint, each cut that failed multiplied the work at every level of nesting through a cycle.
 - **Batch members taking views.** `define_batch_with_args` supports expression arguments only;
   every batch member is reserved with no view parameters. A views form would also need
   `solve_batch_types` to bind each unreached member's view names, as it binds its parameters.
