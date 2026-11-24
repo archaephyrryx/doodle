@@ -40,24 +40,20 @@ const ASCII_SPACE: u8 = b' ';
 const __WS_MASK: u64 = 1u64 | 1 << ASCII_TAB | 1 << ASCII_FF | 1 << ASCII_SPACE;
 
 /// Const ByteSet for daedalus `$simpleWS`
-///
-/// ```
-/// # use doodle::prelude::ByteSet;
-/// # use doodle_pdf::pdf::SIMPLE_WS;
-/// let simple_ws = ByteSet::from([b'\0', b'\t', 0x0C, b' ']);
-/// assert_eq!(simple_ws, SIMPLE_WS);
-/// ```
 pub(super) const SIMPLE_WS: ByteSet = ByteSet::from_bits([__WS_MASK, 0, 0, 0]);
 
+const _: () = {
+    let simple_ws = ByteSet::from_bytes(&[b'\0', b'\t', 0x0C, b' ']);
+    assert!(SIMPLE_WS.eq_set(&simple_ws));
+};
+
 /// Const ByteSet for daedalus Digit
-///
-/// ```
-/// # use doodle::prelude::ByteSet;
-/// # use doodle_pdf::pdf::DIGIT;
-/// let digit = ByteSet::from(b'0'..=b'9');
-/// debug_assert_eq!(digit, DIGIT);
-/// ```
 pub(super) const DIGIT: ByteSet = ByteSet::from_bits([0b11_1111_1111 << b'0', 0, 0, 0]);
+
+const _: () = {
+    let digit = ByteSet::from_bytes(b"0123456789");
+    assert!(DIGIT.eq_set(&digit));
+};
 
 pub(super) fn simple_eol(module: &mut FormatModule) -> FormatRef {
     module.define_format(
