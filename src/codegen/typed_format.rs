@@ -45,6 +45,13 @@ impl GenType {
         }
     }
 
+    pub(crate) fn as_vec_type(&self) -> Option<&RustType> {
+        match self {
+            GenType::Inline(rt) => rt.as_vec_type(),
+            _ => None,
+        }
+    }
+
     /// Attempt to extract the type-index and corresponding name (`Label`) (along with any generic parameters) from `self`.
     ///
     /// Returns `None` if the type in question is not itself a concrete definition (`GenType::Def`)

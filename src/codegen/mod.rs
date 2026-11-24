@@ -1780,7 +1780,8 @@ fn embed_expr(expr: &GTExpr, info: ExprInfo) -> RustExpr {
             let is_bytes = query
                 .get_type()
                 .is_some_and(|t| t.to_rust_type().is_seq_or_slice());
-            let method = match (mode, is_bytes) {
+            // identifier-string for the correct prelude-function to call, based on the search mode and key type
+            let which_fn = match (mode, is_bytes) {
                 (KeySearch::Sorted, false) => "find_by_key_sorted",
                 (KeySearch::First, false) => "find_by_key_unsorted",
                 (KeySearch::Last, false) => "find_by_key_last",
@@ -1799,20 +1800,13 @@ fn embed_expr(expr: &GTExpr, info: ExprInfo) -> RustExpr {
                     embed_expr(query, ExprInfo::Natural),
                 )
             };
-            fn mk_name() -> &'static str {
-                "tmp"
-            }
-            embed_expr_nat(seq).use_as_persistent(
-                |seq| {
-                    // The prelude searches a slice. A `Vec`-typed sequence may be an owned `Vec` (e.g.
-                    // decoded locally) or a slice (a decoder argument), and `vec_as_slice` suits both.
-                    let seq = seq.vec_as_slice();
-                    RustExpr::local(method)
-                        .call_with([embed_lambda_dft(f, key_kind, false), query, seq])
-                        .owned_opt_ref(ty.to_rust_type())
-                },
-                mk_name,
-            )
+            let seq = embed_expr_nat(seq).vec_as_slice();
+            // The prelude searches a slice. A `Vec`-typed sequence may be an owned `Vec` (e.g.
+            // decoded locally) or a slice (a decoder argument), and `vec_as_slice` suits both.
+            let f_extract_key = embed_lambda_dft(f, key_kind, false);
+            RustExpr::local(which_fn)
+                .call_with([f_extract_key, query, seq])
+                .owned_opt_ref(ty.to_rust_type())
         }
         TypedExpr::Dup(_, n, expr) => {
             // NOTE - the dup count should be simple, but the duplicated expression must be move-safe
@@ -1851,6 +1845,7 @@ fn embed_numeric_expr(num: &TypedNumExpr<GenType>) -> RustExpr {
     synthesize(num)
 }
 
+/// Embeds a `match` expression, given the scrutinee and its type, and the set of patterns and their corresponding branch-values.
 fn embed_match_expr(
     expr: &GTExpr,
     expr_type: &GenType,
@@ -1858,16 +1853,10 @@ fn embed_match_expr(
     cases: &Vec<(GTPattern, GTExpr)>,
     info: ExprInfo,
 ) -> RustExpr {
-    fn mk_name() -> &'static str {
-        "tmp"
-    }
-    let scrutinized = embed_expr_nat(scrutinee);
-    let head = match scrutinee.get_type().unwrap().as_ref() {
-        GenType::Inline(RustType::Atom(AtomType::Comp(CompType::Vec(..)))) => scrutinized
-            .make_persistent(mk_name)
-            .into_owned()
-            .vec_as_slice(),
-        _ => scrutinized,
+    let head = match scrutinee.get_type().as_deref().and_then(GenType::as_vec_type) {
+        // if the scrutinee is a `Vec`, we need to ensure that it is not moved into the match, so we borrow such scrutinees as a slice
+        Some(..) => embed_expr_nat(scrutinee).vec_as_slice(),
+        None => embed_expr_nat(scrutinee),
     };
 
     if matches!(

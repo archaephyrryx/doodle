@@ -1033,8 +1033,21 @@ impl RustType {
             | RustType::ViewObject(..) => None,
         }
     }
+
+    /// If `self` is directly `Vec<T>` for some `T`, returns `Some(T)`.
+    ///
+    /// Otherwise, returns `None`.
+    pub(crate) fn as_vec_type(&self) -> Option<&RustType> {
+        match self {
+            RustType::Atom(AtomType::Comp(CompType::Vec(inner))) => Some(inner),
+            _ => None,
+        }
+    }
 }
 
+/// Takes an optional parameter-list and replaces a single lifetime parameter (if any) with `new_lt`.
+///
+/// If the parameter-list is `None`, or it is `Some` but contains no lifetime parameters, this is a no-op.
 fn hotswap_lt(params: &mut Option<Box<UseParams>>, new_lt: RustLt) {
     if let Some(params) = params.as_deref_mut() {
         assert_eq!(params.lt_params.len(), 1);
@@ -2838,41 +2851,6 @@ impl RustExpr {
                         // NOTE - there are legal cases for ranges involving unknown types (i.e. those with untyped variables) but we cannot rule one way or another on those
                         _ => false,
                     }
-            }
-        }
-    }
-
-    /// Embed a RustExpr into a new non-temporary value, or return it if it is already non-temporary
-    pub(crate) fn make_persistent<Name: IntoLabel + Clone>(
-        &self,
-        mk_name: impl FnOnce() -> Name,
-    ) -> Cow<'_, Self> {
-        match self {
-            RustExpr::Entity(..) => Cow::Borrowed(self),
-            // REVIEW - consider which non-entity cases are already 'persistent'
-            _ => {
-                let name = mk_name();
-                Cow::Owned(RustExpr::BlockScope(
-                    vec![RustStmt::assign(name.clone(), self.clone())],
-                    Box::new(RustExpr::local(name)),
-                ))
-            }
-        }
-    }
-
-    pub(crate) fn use_as_persistent<Name: IntoLabel + Clone>(
-        self,
-        f: impl FnOnce(Self) -> Self,
-        mk_name: impl FnOnce() -> Name,
-    ) -> Self {
-        match self {
-            this @ RustExpr::Entity(..) => f(this),
-            _ => {
-                let name = mk_name();
-                RustExpr::BlockScope(
-                    vec![RustStmt::assign(name.clone(), self)],
-                    Box::new(f(RustExpr::local(name))),
-                )
             }
         }
     }
