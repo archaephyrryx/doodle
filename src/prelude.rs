@@ -228,7 +228,7 @@ where
 /// Short-circuiting, and does not bother to check any further elements after a match is
 /// found. This means that even if there are multiple candidate matches, only the first
 /// is encountered and returned.
-pub fn find_by_key_unsorted<T, K>(mut f: impl FnMut(&T) -> K, query: K, slice: &[T]) -> Option<&T>
+pub fn find_by_key_first<T, K>(mut f: impl FnMut(&T) -> K, query: K, slice: &[T]) -> Option<&T>
 where
     K: Eq + Copy,
 {
@@ -255,7 +255,7 @@ pub fn find_by_bytes_key_sorted<'a, T>(
     slice.get(ix).filter(|x| f(x) == query)
 }
 
-/// As [`find_by_key_unsorted`], for a byte-string key that `f` borrows from each element.
+/// As [`find_by_key_first`], for a byte-string key that `f` borrows from each element.
 pub fn find_by_bytes_key_first<'a, T>(
     f: impl Fn(&T) -> &[u8],
     query: &[u8],

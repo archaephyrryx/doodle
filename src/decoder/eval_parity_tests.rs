@@ -377,7 +377,7 @@ fn cases() -> Vec<Case> {
             ),
         ),
         parity(
-            "find_by_key_unsorted",
+            "find_by_key_first",
             Expr::FindByKey(
                 KeySearch::First,
                 b(lam("x", var("x"))),

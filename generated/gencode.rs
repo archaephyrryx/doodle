@@ -13188,7 +13188,7 @@ PResult::Ok(opentype_table_record { table_id, checksum, offset, length })
 
 /// d#52
 fn Decoder_opentype_table_directory_table_links<'input>(input: &mut Parser<'input>, tables: &[opentype_table_record], font_view: View<'input>) -> Result<opentype_table_directory_table_links<'input>, ParseError> {
-let cmap = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1668112752u32, slice_all(&tables))).copied() {
+let cmap = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1668112752u32, slice_all(&tables))).copied() {
 Some(ref matching_table) => {
 let mut view_parser = Parser::from(font_view.offset(matching_table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13203,7 +13203,7 @@ _other => {
 unreachable!(r#"ExprMatch refuted: match refuted with unexpected value {_other:?}"#);
 }
 };
-let head = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1751474532u32, slice_all(&tables))).copied() {
+let head = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1751474532u32, slice_all(&tables))).copied() {
 Some(ref matching_table) => {
 let mut view_parser = Parser::from(font_view.offset(matching_table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13218,7 +13218,7 @@ _other => {
 unreachable!(r#"ExprMatch refuted: match refuted with unexpected value {_other:?}"#);
 }
 };
-let hhea = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1751672161u32, slice_all(&tables))).copied() {
+let hhea = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1751672161u32, slice_all(&tables))).copied() {
 Some(ref matching_table) => {
 let mut view_parser = Parser::from(font_view.offset(matching_table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13233,7 +13233,7 @@ _other => {
 unreachable!(r#"ExprMatch refuted: match refuted with unexpected value {_other:?}"#);
 }
 };
-let maxp = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1835104368u32, slice_all(&tables))).copied() {
+let maxp = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1835104368u32, slice_all(&tables))).copied() {
 Some(ref matching_table) => {
 let mut view_parser = Parser::from(font_view.offset(matching_table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13248,7 +13248,7 @@ _other => {
 unreachable!(r#"ExprMatch refuted: match refuted with unexpected value {_other:?}"#);
 }
 };
-let hmtx = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1752003704u32, slice_all(&tables))).copied() {
+let hmtx = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1752003704u32, slice_all(&tables))).copied() {
 Some(ref matching_table) => {
 let mut view_parser = Parser::from(font_view.offset(matching_table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13263,7 +13263,7 @@ _other => {
 unreachable!(r#"ExprMatch refuted: match refuted with unexpected value {_other:?}"#);
 }
 };
-let name = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1851878757u32, slice_all(&tables))).copied() {
+let name = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1851878757u32, slice_all(&tables))).copied() {
 Some(ref matching_table) => {
 let mut view_parser = Parser::from(font_view.offset(matching_table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13278,7 +13278,7 @@ _other => {
 unreachable!(r#"ExprMatch refuted: match refuted with unexpected value {_other:?}"#);
 }
 };
-let os2 = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1330851634u32, slice_all(&tables))).copied() {
+let os2 = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1330851634u32, slice_all(&tables))).copied() {
 Some(ref matching_table) => {
 let mut view_parser = Parser::from(font_view.offset(matching_table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13294,7 +13294,7 @@ _other => {
 unreachable!(r#"ExprMatch refuted: match refuted with unexpected value {_other:?}"#);
 }
 };
-let post = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1886352244u32, slice_all(&tables))).copied() {
+let post = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1886352244u32, slice_all(&tables))).copied() {
 Some(ref matching_table) => {
 let mut view_parser = Parser::from(font_view.offset(matching_table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13309,7 +13309,7 @@ _other => {
 unreachable!(r#"ExprMatch refuted: match refuted with unexpected value {_other:?}"#);
 }
 };
-let cvt = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1668707360u32, slice_all(&tables))).copied() {
+let cvt = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1668707360u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13350,7 +13350,7 @@ None => {
 None
 }
 };
-let fpgm = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1718642541u32, slice_all(&tables))).copied() {
+let fpgm = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1718642541u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13385,7 +13385,7 @@ None => {
 None
 }
 };
-let loca = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1819239265u32, slice_all(&tables))).copied() {
+let loca = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1819239265u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13400,7 +13400,7 @@ None => {
 None
 }
 };
-let glyf = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1735162214u32, slice_all(&tables))).copied() {
+let glyf = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1735162214u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13423,7 +13423,7 @@ None => {
 None
 }
 };
-let prep = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1886545264u32, slice_all(&tables))).copied() {
+let prep = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1886545264u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13458,7 +13458,7 @@ None => {
 None
 }
 };
-let gasp = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1734439792u32, slice_all(&tables))).copied() {
+let gasp = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1734439792u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13473,7 +13473,7 @@ None => {
 None
 }
 };
-let base = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1111577413u32, slice_all(&tables))).copied() {
+let base = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1111577413u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13488,7 +13488,7 @@ None => {
 None
 }
 };
-let gdef = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1195656518u32, slice_all(&tables))).copied() {
+let gdef = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1195656518u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13503,7 +13503,7 @@ None => {
 None
 }
 };
-let gpos = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1196445523u32, slice_all(&tables))).copied() {
+let gpos = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1196445523u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13518,7 +13518,7 @@ None => {
 None
 }
 };
-let gsub = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1196643650u32, slice_all(&tables))).copied() {
+let gsub = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1196643650u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13533,7 +13533,7 @@ None => {
 None
 }
 };
-let avar = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1635148146u32, slice_all(&tables))).copied() {
+let avar = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1635148146u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13548,7 +13548,7 @@ None => {
 None
 }
 };
-let fvar = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1719034226u32, slice_all(&tables))).copied() {
+let fvar = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1719034226u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13563,7 +13563,7 @@ None => {
 None
 }
 };
-let gvar = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1735811442u32, slice_all(&tables))).copied() {
+let gvar = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1735811442u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13578,7 +13578,7 @@ None => {
 None
 }
 };
-let hvar = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1213612370u32, slice_all(&tables))).copied() {
+let hvar = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1213612370u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13593,7 +13593,7 @@ None => {
 None
 }
 };
-let mvar = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1297498450u32, slice_all(&tables))).copied() {
+let mvar = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1297498450u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13608,7 +13608,7 @@ None => {
 None
 }
 };
-let colr = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1129270354u32, slice_all(&tables))).copied() {
+let colr = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1129270354u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13623,7 +13623,7 @@ None => {
 None
 }
 };
-let cpal = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1129333068u32, slice_all(&tables))).copied() {
+let cpal = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1129333068u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13638,7 +13638,7 @@ None => {
 None
 }
 };
-let svg = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1398163232u32, slice_all(&tables))).copied() {
+let svg = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1398163232u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13653,7 +13653,7 @@ None => {
 None
 }
 };
-let kern = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1801810542u32, slice_all(&tables))).copied() {
+let kern = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1801810542u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13668,7 +13668,7 @@ None => {
 None
 }
 };
-let stat = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1398030676u32, slice_all(&tables))).copied() {
+let stat = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1398030676u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13683,7 +13683,7 @@ None => {
 None
 }
 };
-let vhea = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1986553185u32, slice_all(&tables))).copied() {
+let vhea = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1986553185u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13698,7 +13698,7 @@ None => {
 None
 }
 };
-let vmtx = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1986884728u32, slice_all(&tables))).copied() {
+let vmtx = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1986884728u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13722,7 +13722,7 @@ None
 }
 };
 let dsig = {
-let res = (|| match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1146308935u32, slice_all(&tables))).copied() {
+let res = (|| match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1146308935u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13749,7 +13749,7 @@ log::error!("data-level parse error suppressed by Permit: {}", err);
 }
 }
 };
-let hdmx = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1751412088u32, slice_all(&tables))).copied() {
+let hdmx = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1751412088u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;
@@ -13764,7 +13764,7 @@ None => {
 None
 }
 };
-let vdmx = match (find_by_key_unsorted(|elem: &opentype_table_record| elem.table_id, 1447316824u32, slice_all(&tables))).copied() {
+let vdmx = match (find_by_key_first(|elem: &opentype_table_record| elem.table_id, 1447316824u32, slice_all(&tables))).copied() {
 Some(ref table) => {
 let mut view_parser = Parser::from(font_view.offset(table.offset as usize)?);
 let view_input = &mut view_parser;

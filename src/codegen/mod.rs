@@ -1783,7 +1783,7 @@ fn embed_expr(expr: &GTExpr, info: ExprInfo) -> RustExpr {
             // identifier-string for the correct prelude-function to call, based on the search mode and key type
             let which_fn = match (mode, is_bytes) {
                 (KeySearch::Sorted, false) => "find_by_key_sorted",
-                (KeySearch::First, false) => "find_by_key_unsorted",
+                (KeySearch::First, false) => "find_by_key_first",
                 (KeySearch::Last, false) => "find_by_key_last",
                 (KeySearch::Sorted, true) => "find_by_bytes_key_sorted",
                 (KeySearch::First, true) => "find_by_bytes_key_first",

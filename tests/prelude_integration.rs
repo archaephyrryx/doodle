@@ -105,7 +105,7 @@ fn test_find_by_key_duplicates() {
         Some(&(2, 'b'))
     );
     assert_eq!(
-        prelude::find_by_key_unsorted(key, 2, &entries),
+        prelude::find_by_key_first(key, 2, &entries),
         Some(&(2, 'b'))
     );
     assert_eq!(prelude::find_by_key_last(key, 2, &entries), Some(&(2, 'd')));
@@ -165,7 +165,7 @@ proptest! {
         let key = |e: &(u8, usize)| e.0;
         prop_assert_eq!(
             prelude::find_by_key_sorted(key, q, &entries),
-            prelude::find_by_key_unsorted(key, q, &entries)
+            prelude::find_by_key_first(key, q, &entries)
         );
         let bytes: Vec<(Vec<u8>, usize)> = keys.iter().map(|&k| vec![b'a'; k as usize]).zip(0..).collect();
         fn bkey(e: &(Vec<u8>, usize)) -> &[u8] {

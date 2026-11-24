@@ -131,7 +131,7 @@ let borrowed_last = (find_by_bytes_key_last(|elem: &test_borrowed<'input>| slice
 let borrowed_sorted_missing = (find_by_bytes_key_sorted(|elem: &test_borrowed<'input>| slice_all(&elem.k), slice_all(&q_miss), slice_all(&borrowed))).cloned();
 let borrowed_last_missing = (find_by_bytes_key_last(|elem: &test_borrowed<'input>| slice_all(&elem.k), slice_all(&q_miss), slice_all(&borrowed))).cloned();
 let n_sorted = (find_by_key_sorted(|elem: &test_owned| elem.n, 7u8, slice_all(&owned))).cloned();
-let n_first = (find_by_key_unsorted(|elem: &test_owned| elem.n, 7u8, slice_all(&owned))).cloned();
+let n_first = (find_by_key_first(|elem: &test_owned| elem.n, 7u8, slice_all(&owned))).cloned();
 let n_last = (find_by_key_last(|elem: &test_owned| elem.n, 7u8, slice_all(&owned))).cloned();
 PResult::Ok(test_main { owned, borrowed, q_hit, _q_hit, q_miss, _q_miss, owned_sorted, owned_first, owned_last, owned_sorted_missing, owned_last_missing, borrowed_sorted, borrowed_first, borrowed_last, borrowed_sorted_missing, borrowed_last_missing, n_sorted, n_first, n_last })
 }
@@ -167,4 +167,3 @@ accum
 let n = input.read_byte()?;
 PResult::Ok(test_borrowed { k, _k, n })
 }
-
