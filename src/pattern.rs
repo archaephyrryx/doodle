@@ -153,6 +153,15 @@ impl Pattern {
                     scope.push(name.clone(), ValueType::Any);
                 }
             }
+            // `Empty` is the type of a value that never exists (e.g. that of `Format::Fail`),
+            // so a pattern matches it vacuously, with each variable it binds also `Empty`.
+            // (Registration's `Any` placeholder meeting `Empty` gives `Empty`, so this is also
+            // how a placeholder that a match has joined with a `Fail` arm comes to be matched.)
+            (p, ValueType::Empty) => {
+                for name in p.binding_names() {
+                    scope.push(name.clone(), ValueType::Empty);
+                }
+            }
             (l, r) => return Err(anyhow!("pattern {l:?} does not match type {r:?}")),
         }
         Ok(())
@@ -212,6 +221,11 @@ impl Pattern {
             (p, ValueTypeExt::Any) => {
                 for name in p.binding_names() {
                     scope.push(name.clone(), ValueTypeExt::Any);
+                }
+            }
+            (p, ValueTypeExt::Empty) => {
+                for name in p.binding_names() {
+                    scope.push(name.clone(), ValueTypeExt::Empty);
                 }
             }
             (l, r) => return Err(anyhow!("pattern {l:?} does not match type {r:?}")),

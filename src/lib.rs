@@ -5565,6 +5565,78 @@ mod test {
         assert!(prog.run(ReadCtxt::new(b"NNL")).is_err());
     }
 
+    /// A pattern matches a value of type `Empty` vacuously (`Pattern::build_scope`). Here it is
+    /// a batch member's own call result, passed through a format-level match with a `Fail` arm:
+    /// registration's first pass types the call as the `Any` placeholder, and `compute(Any)`
+    /// meets `Fail : Empty` at `Empty`, which is then matched.
+    #[test]
+    fn batch_member_matches_placeholder_joined_with_fail() {
+        use crate::helper::{alts, bind, chain, compute, fmt_match, is_byte, monad_seq, var};
+        let leaf = |p: Pattern| Pattern::Variant("leaf".into(), Box::new(p));
+        let mut module = FormatModule::new();
+        // As `test.unwrap_self` in `batch_member_matches_own_call_result`, through a match
+        let [f] = module.define_batch_with_args(
+            [("test.unwrap_self_fail", vec![])],
+            [Box::new(move |&[f]: &[FormatRef; 1]| {
+                let only_leaf = fmt_match(
+                    var("r"),
+                    [
+                        (leaf(Pattern::Wildcard), compute(var("r"))),
+                        (Pattern::Wildcard, Format::Fail),
+                    ],
+                );
+                let unwrap_leaf = fmt_match(
+                    var("o"),
+                    [
+                        (leaf(bind("x")), compute(var("x"))),
+                        (Pattern::Wildcard, Format::Fail),
+                    ],
+                );
+                alts([
+                    ("leaf", is_byte(b'L')),
+                    (
+                        "node",
+                        monad_seq(
+                            is_byte(b'N'),
+                            chain(f.call(), "r", chain(only_leaf, "o", unwrap_leaf)),
+                        ),
+                    ),
+                ])
+            })],
+        );
+        assert_eq!(
+            module.get_format_type(f.get_level()),
+            &ValueType::Union(std::collections::BTreeMap::from([
+                (Label::Borrowed("leaf"), ValueType::Base(BaseType::U8)),
+                (Label::Borrowed("node"), ValueType::Base(BaseType::U8)),
+            ]))
+        );
+        let prog = super::decoder::Compiler::compile_program(&module, &f.call()).unwrap();
+        assert!(prog.run(ReadCtxt::new(b"NL")).is_ok());
+        assert!(prog.run(ReadCtxt::new(b"NNL")).is_err());
+    }
+
+    /// A pattern matches the value of a `Format::Fail`, of type `Empty`, vacuously.
+    #[test]
+    fn pattern_matches_empty() {
+        use crate::helper::{bind, chain, compute, fmt_match, var};
+        let f = chain(
+            Format::Fail,
+            "r",
+            fmt_match(
+                var("r"),
+                [(
+                    Pattern::Variant("a".into(), Box::new(bind("x"))),
+                    compute(var("x")),
+                )],
+            ),
+        );
+        let mut module = FormatModule::new();
+        let top = module.define_format("test.match_fail", f);
+        let prog = super::decoder::Compiler::compile_program(&module, &top.call()).unwrap();
+        assert!(prog.run(ReadCtxt::new(b"")).is_err());
+    }
+
     /// A `Fail` unified with a union-typed format keeps the union: `Fail`'s type, `Empty`, is
     /// bottom also where it meets a union's variable (`TypeChecker::transfer_constraints`),
     /// rather than leaving the combined variable `Empty`. Here the `Fail` branch comes first, so
