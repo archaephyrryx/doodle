@@ -108,13 +108,13 @@ impl ByteSet {
         if let Some(i) = max_set_bit(self.bits[3]) {
             return Some(0xc0 + i);
         }
-        if let Some(i) = max_set_bit(!self.bits[2]) {
+        if let Some(i) = max_set_bit(self.bits[2]) {
             return Some(0x80 + i);
         }
-        if let Some(i) = max_set_bit(!self.bits[1]) {
+        if let Some(i) = max_set_bit(self.bits[1]) {
             return Some(0x40 + i);
         }
-        if let Some(i) = max_set_bit(!self.bits[0]) {
+        if let Some(i) = max_set_bit(self.bits[0]) {
             return Some(i);
         }
         None
@@ -412,6 +412,30 @@ mod tests {
             #[test]
             fn test_difference_right(bs0 in any_byte_set(), bs1 in any_byte_set()) {
                 assert!(ByteSet::is_disjoint(&bs0, &ByteSet::difference(&bs1, &bs0)));
+            }
+        }
+    }
+
+    mod min_max_elem {
+        use super::*;
+
+        #[test]
+        fn test_empty() {
+            assert_eq!(ByteSet::empty().min_elem(), None);
+            assert_eq!(ByteSet::empty().max_elem(), None);
+        }
+
+        proptest! {
+            #[test]
+            fn test_any(bs in any_byte_set()) {
+                prop_assert_eq!(bs.min_elem(), bs.iter().min());
+                prop_assert_eq!(bs.max_elem(), bs.iter().max());
+            }
+
+            #[test]
+            fn test_singleton(b in any::<u8>()) {
+                prop_assert_eq!(ByteSet::singleton(b).min_elem(), Some(b));
+                prop_assert_eq!(ByteSet::singleton(b).max_elem(), Some(b));
             }
         }
     }
