@@ -2,11 +2,6 @@
 
 use doodle::{Expr, Format, FormatRef, IntoLabel, Label, helper::*};
 
-/// Format that parses nothing and returns a byte-sequence meant to be an ascii string
-fn const_str(str: &[u8]) -> Format {
-    compute(Expr::Seq(str.iter().copied().map(Expr::U8).collect()))
-}
-
 /// Daedalus style record
 ///
 /// Treat `$$` as a singleton-specifier, otherwise equivalent to record-auto

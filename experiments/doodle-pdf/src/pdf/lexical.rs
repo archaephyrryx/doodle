@@ -31,15 +31,10 @@ pub(super) fn read_nat(len: u32) -> Format {
 }
 
 pub(super) const ASCII_LF: u8 = b'\n';
-
 pub(super) const ASCII_CR: u8 = b'\r';
 
-const ASCII_NUL: u8 = b'\0';
-
 const ASCII_TAB: u8 = b'\t';
-
 const ASCII_FF: u8 = b'\x0c';
-
 const ASCII_SPACE: u8 = b' ';
 
 const __WS_MASK: u64 = 1u64 | 1 << ASCII_TAB | 1 << ASCII_FF | 1 << ASCII_SPACE;
