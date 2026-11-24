@@ -54,7 +54,7 @@ pub(super) fn interpret(assocs: impl IntoIterator<Item = (Format, Expr)>) -> For
 pub(super) fn skip_to(f: Format) -> Format {
     map(
         Format::SkipTo(Box::new(f)),
-        lambda("skipped", tuple_proj(var("skipped"), 1)),
+        lambda_tuple(["_count", "val"], var("val")),
     )
 }
 
@@ -70,7 +70,7 @@ pub(super) fn skip_to(f: Format) -> Format {
 pub(super) fn count_to(p: Format) -> Format {
     map(
         Format::SkipTo(Box::new(p)),
-        lambda("skipped", tuple_proj(var("skipped"), 0)),
+        lambda_tuple(["count", "_val"], var("count")),
     )
 }
 
