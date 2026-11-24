@@ -1,3 +1,6 @@
+//! Human-readable rendering of [`ByteSet`]s (ranges, named ASCII classes, etc.),
+//! along with the range-analysis helpers it relies on.
+
 use super::ByteSet;
 use crate::{
     Label,
@@ -18,7 +21,7 @@ pub enum PartitionedByteSet {
 }
 
 impl ByteSet {
-    /// Returns the number of elements between the first and last byte in the set (inclusive).
+    /// Returns `(min, max)` of the set, or `None` if the set is empty.
     pub fn bounds(&self) -> Option<(u8, u8)> {
         match (self.min_elem(), self.max_elem()) {
             (Some(min), Some(max)) => Some((min, max)),

@@ -6,12 +6,24 @@ use serde::ser::{Serialize, SerializeSeq, SerializeStruct, Serializer};
 pub mod pretty_print;
 
 /// Compact, allocation-free set of `u8`s.
+///
+/// # Terminology
+///
+/// The public API speaks only of *bytes* (elements of the set, `0..=255`).
+/// Internally, the set is a 256-bit bitmap stored as four *words* (`u64`s);
+/// word `w` covers bytes `64*w .. 64*w + 64`, and byte `b` is *bit* `b % 64`
+/// (counting from the LSB) of word `b / 64`. A *mask* is a `u64` with some
+/// bits set. The only place this layout is exposed is [`ByteSet::from_bits`] /
+/// [`ByteSet::to_bits`].
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct ByteSet {
     /// Each bit of the array represents a number in the range `0..=255`
+    ///
+    /// A given `0 <= n < 256` is represented by `bits[q] & (1 << m)` where `q := n / 64` and `m := n % 64`.
     bits: [u64; 4],
 }
 
+/// Helper function to compute the index of the least-significant set bit in a `u64`, returning `None` if the input is zero.
 const fn min_set_bit(x: u64) -> Option<u8> {
     match x.trailing_zeros() {
         64 => None,
@@ -19,6 +31,7 @@ const fn min_set_bit(x: u64) -> Option<u8> {
     }
 }
 
+/// Helper function to compute the index of the most-significant set bit in a `u64`, returning `None` if the input is zero.
 const fn max_set_bit(x: u64) -> Option<u8> {
     match x.leading_zeros() {
         64 => None,
@@ -26,68 +39,82 @@ const fn max_set_bit(x: u64) -> Option<u8> {
     }
 }
 
-const fn bit_to_quad(bit: u8, offset: u8) -> u64 {
-    if offset > bit {
-        0
-    } else {
-        match 1u64.overflowing_shl((bit - offset) as u32) {
-            (n, false) => n,
-            (_, true) => 0,
-        }
-    }
+/// Word index and single-bit mask that represent `byte` in a ByteSet
+const fn locate(byte: u8) -> (usize, u64) {
+    ((byte / 64) as usize, 1u64 << (byte % 64))
 }
 
 impl ByteSet {
+    pub(crate) const NULL_RAW: [u64; 4] = [0; 4];
+    pub(crate) const FULL_RAW: [u64; 4] = [u64::MAX; 4];
+
+    /// Equivalent to [`ByteSet::empty`].
     pub const fn new() -> ByteSet {
         ByteSet::empty()
     }
 
-    /// Construct a ByteSet that contains all bytes `B` such that bit `B % 64` is set
-    /// in the binary representation of the 64-bit value at index `i / 4` of the argument array `bits`.
+    pub const fn from_bytes(bytes: &[u8]) -> ByteSet {
+        let mut bs = ByteSet::empty();
+        let mut i = 0;
+        while i < bytes.len() {
+            bs.insert(bytes[i]);
+            i += 1;
+        }
+        bs
+    }
+
+    /// Constructs a ByteSet directly from its 256-bit representation: byte `B`
+    /// is included iff bit `B % 64` (counting from the LSB) of `bits[B / 64]`
+    /// is set. So `bits[0]` covers bytes `0..64`, and `bits[3]` covers `192..=255`.
     ///
-    /// For indexing purposes, this method treats the LSB of each 64-bit value as (relative) index 0, and its MSB as index 63.
-    ///
-    /// In contrast, index 0 of `bits` represents the lowest range of bytes (0..64).
+    /// This is public and `const` so that ByteSet constants can be written
+    /// (and emitted by codegen) without any runtime construction; the layout is
+    /// therefore a stable contract between the generator and generated code.
     pub const fn from_bits(bits: [u64; 4]) -> ByteSet {
         ByteSet { bits }
     }
 
-    /// Constructs a ByteSet that is the union of the two ByteSets `a` and `b`.
-    pub const fn union(&self, b: &Self) -> Self {
-        Self::from_bits([
-            self.bits[0] | b.bits[0],
-            self.bits[1] | b.bits[1],
-            self.bits[2] | b.bits[2],
-            self.bits[3] | b.bits[3],
-        ])
-    }
-
+    /// Returns the 256-bit representation of this set, in the layout accepted by
+    /// [`ByteSet::from_bits`] (of which this is the inverse).
     pub const fn to_bits(&self) -> [u64; 4] {
         self.bits
     }
 
-    pub const fn empty() -> ByteSet {
-        ByteSet::from_bits([0; 4])
+    /// Constructs the union of `self` and `other`.
+    pub const fn union(&self, other: &Self) -> Self {
+        Self::from_bits([
+            self.bits[0] | other.bits[0],
+            self.bits[1] | other.bits[1],
+            self.bits[2] | other.bits[2],
+            self.bits[3] | other.bits[3],
+        ])
     }
 
-    pub const fn singleton(bit: u8) -> ByteSet {
-        let bits = [
-            bit_to_quad(bit, 0),
-            bit_to_quad(bit, 0x40),
-            bit_to_quad(bit, 0x80),
-            bit_to_quad(bit, 0xc0),
-        ];
-        ByteSet { bits }
+    pub const fn empty() -> ByteSet {
+        ByteSet::from_bits(ByteSet::NULL_RAW)
+    }
+
+    /// Constructs the set containing only `byte`.
+    pub const fn singleton(byte: u8) -> ByteSet {
+        let mut words = [0; 4];
+        let (word, mask) = locate(byte);
+        words[word] = mask;
+        ByteSet::from_bits(words)
     }
 
     pub const fn full() -> ByteSet {
-        ByteSet::from_bits([u64::MAX; 4])
+        ByteSet::from_bits(ByteSet::FULL_RAW)
     }
 
+    /// Iterates over the members of the set in ascending order.
+    ///
+    /// Note that this tests each of the 256 candidate bytes, regardless of how
+    /// many are actually in the set.
     pub fn iter(&self) -> impl '_ + Iterator<Item = u8> {
         (0..=255).filter(|b| self.contains(*b))
     }
 
+    /// Returns the smallest byte in the set, or `None` iff the set is empty.
     pub const fn min_elem(&self) -> Option<u8> {
         if let Some(i) = min_set_bit(self.bits[0]) {
             return Some(i);
@@ -104,6 +131,7 @@ impl ByteSet {
         None
     }
 
+    /// Returns the largest byte in the set, or `None` iff the set is empty.
     pub const fn max_elem(&self) -> Option<u8> {
         if let Some(i) = max_set_bit(self.bits[3]) {
             return Some(0xc0 + i);
@@ -120,80 +148,58 @@ impl ByteSet {
         None
     }
 
-    fn get_bit_with<T>(&self, b: u8, f: impl FnOnce(u64, u8) -> T) -> T {
-        match b {
-            0..=63 => f(self.bits[0], b),
-            64..=127 => f(self.bits[1], b - 64),
-            128..=191 => f(self.bits[2], b - 128),
-            192..=255 => f(self.bits[3], b - 192),
-        }
-    }
-
-    fn set_bit_with(&mut self, b: u8, f: impl FnOnce(&mut u64, u8)) {
-        match b {
-            0..=63 => f(&mut self.bits[0], b),
-            64..=127 => f(&mut self.bits[1], b - 64),
-            128..=191 => f(&mut self.bits[2], b - 128),
-            192..=255 => f(&mut self.bits[3], b - 192),
-        }
-    }
-
-    fn map_bits(&self, f: impl Fn(u64) -> u64) -> ByteSet {
-        ByteSet::from_bits([
-            f(self.bits[0]),
-            f(self.bits[1]),
-            f(self.bits[2]),
-            f(self.bits[3]),
-        ])
-    }
-
-    fn zip_bits_with(&self, other: &ByteSet, f: impl Fn(u64, u64) -> u64) -> ByteSet {
-        ByteSet::from_bits([
-            f(self.bits[0], other.bits[0]),
-            f(self.bits[1], other.bits[1]),
-            f(self.bits[2], other.bits[2]),
-            f(self.bits[3], other.bits[3]),
-        ])
-    }
-
-    pub fn len(&self) -> u32 {
+    /// Returns the number of bytes in the set.
+    ///
+    /// The result is a `u32` because a full set has 256 members, which does not fit in a `u8`.
+    pub const fn len(&self) -> u32 {
         self.bits[0].count_ones()
             + self.bits[1].count_ones()
             + self.bits[2].count_ones()
             + self.bits[3].count_ones()
     }
 
-    pub fn is_empty(&self) -> bool {
-        *self == ByteSet::empty()
+    pub const fn is_empty(&self) -> bool {
+        (self.bits[0] | self.bits[1] | self.bits[2] | self.bits[3]) == 0
     }
 
-    pub fn is_full(&self) -> bool {
-        *self == ByteSet::full()
+    pub const fn is_full(&self) -> bool {
+        (self.bits[0] & self.bits[1] & self.bits[2] & self.bits[3]) == u64::MAX
     }
 
-    pub fn insert(&mut self, b: u8) {
-        self.set_bit_with(b, |bits, i| {
-            *bits |= 1 << i;
-        });
+    pub const fn eq_set(&self, other: &ByteSet) -> bool {
+        self.bits[0] == other.bits[0]
+            && self.bits[1] == other.bits[1]
+            && self.bits[2] == other.bits[2]
+            && self.bits[3] == other.bits[3]
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn remove(&mut self, b: u8) {
-        self.set_bit_with(b, |byte, i| {
-            *byte &= !(1 << i);
-        });
+    pub const fn insert(&mut self, byte: u8) {
+        let (word, mask) = locate(byte);
+        self.bits[word] |= mask;
     }
 
-    pub fn contains(&self, b: u8) -> bool {
-        self.get_bit_with(b, |bits, i| (bits & (1 << i)) != 0)
+    pub const fn remove(&mut self, byte: u8) {
+        let (word, mask) = locate(byte);
+        self.bits[word] &= !mask;
     }
 
-    pub fn complement(&self) -> ByteSet {
-        self.map_bits(|bits| !bits)
+    pub const fn contains(&self, byte: u8) -> bool {
+        let (word, mask) = locate(byte);
+        self.bits[word] & mask != 0
     }
 
-    pub fn difference(&self, other: &ByteSet) -> ByteSet {
-        ByteSet::zip_bits_with(self, other, |b0, b1| b0 & !b1)
+    pub const fn complement(&self) -> ByteSet {
+        ByteSet::from_bits([!self.bits[0], !self.bits[1], !self.bits[2], !self.bits[3]])
+    }
+
+    /// Constructs the set of bytes in `self` but not in `other`.
+    pub const fn difference(&self, other: &ByteSet) -> ByteSet {
+        ByteSet::from_bits([
+            self.bits[0] & !other.bits[0],
+            self.bits[1] & !other.bits[1],
+            self.bits[2] & !other.bits[2],
+            self.bits[3] & !other.bits[3],
+        ])
     }
 
     pub const fn intersection(&self, other: &ByteSet) -> ByteSet {
@@ -205,7 +211,7 @@ impl ByteSet {
         ])
     }
 
-    pub fn is_disjoint(&self, other: &ByteSet) -> bool {
+    pub const fn is_disjoint(&self, other: &ByteSet) -> bool {
         ByteSet::intersection(self, other).is_empty()
     }
 }
@@ -242,28 +248,22 @@ impl From<Range<u8>> for ByteSet {
 
 impl From<RangeInclusive<u8>> for ByteSet {
     fn from(value: RangeInclusive<u8>) -> Self {
-        // because the values are adjacent, we can optimize if they are within the same quadrant
         let lo = value.start();
         let hi = value.end();
+        // optimize for singletons and empty-sets
         match lo.cmp(hi) {
             std::cmp::Ordering::Less => (),
             std::cmp::Ordering::Equal => return ByteSet::from([*lo]),
             std::cmp::Ordering::Greater => return ByteSet::empty(),
         }
-        let start_ix = *lo >> 6;
-        let end_ix = *hi >> 6;
+        let start_ix = *lo / 64;
+        let end_ix = *hi / 64;
         if start_ix == end_ix {
-            let mut mask = 0u64;
-            for i in value {
-                mask |= 1 << (i & 63);
-            }
-            let bits = match start_ix {
-                0 => [mask, 0, 0, 0],
-                1 => [0, mask, 0, 0],
-                2 => [0, 0, mask, 0],
-                3 => [0, 0, 0, mask],
-                _ => unreachable!("u8 / 64 not in range 0..=3 ??"),
-            };
+            // because the values are contiguous, if they are within the same word
+            // the mask is just the bits from `lo % 64` up to `hi % 64` (inclusive)
+            let mask = (u64::MAX << (*lo % 64)) & (u64::MAX >> (63 - *hi % 64));
+            let mut bits = [0; 4];
+            bits[start_ix as usize] = mask;
             ByteSet { bits }
         } else {
             // Fall-back to FromIter implementation, which is less efficient in general
@@ -272,7 +272,6 @@ impl From<RangeInclusive<u8>> for ByteSet {
     }
 }
 
-// REVIEW - there might be an optimization we can perform here
 impl FromIterator<u8> for ByteSet {
     fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
         let mut bs = ByteSet::empty();
@@ -283,6 +282,8 @@ impl FromIterator<u8> for ByteSet {
     }
 }
 
+/// Sets with fewer than 128 members are shown as `{b0, b1, ...}`; sets with
+/// 128 or more are shown as `!{...}`, listing the complement instead.
 impl fmt::Debug for ByteSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.len() < 128 {
@@ -310,6 +311,9 @@ impl ops::Not for ByteSet {
     }
 }
 
+/// Serializes as a struct `{ tag, data }`, where `data` is an ascending sequence of bytes.
+/// Sets with fewer than 128 members use `tag: "includes"` and list their members;
+/// sets with 128 or more use `tag: "excludes"` and list the bytes *not* in the set.
 impl Serialize for ByteSet {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         struct All(ByteSet);
