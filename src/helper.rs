@@ -1377,11 +1377,8 @@ pub fn void(f: Format) -> Format {
     monad_seq(f, compute(Expr::UNIT))
 }
 
-/// Helper for destructuring an `Expr`-level tuple-value into a set of locally bound variables.
-///
-/// # Notes
-///
-/// The entire tuple does not have to be enumerated, but there must not be more labels than the arity of the tuple allows for.
+/// Helper for destructuring an [`Expr`]-level tuple-value into a set of locally bound variables,
+/// in order to parse a [`Format`] that depends on the values of those variables.
 pub fn with_tuple<const N: usize>(
     tuple: Expr,
     labels: [&'static str; N],
@@ -1396,18 +1393,25 @@ pub fn with_tuple<const N: usize>(
     )
 }
 
-/// Shortcut for matching an explicit pattern of bytes wrapped in a sequence.
+/// Helper for matching an explicit pattern of bytes wrapped in a sequence.
 pub fn pattern_bytestring(bytes: &[u8]) -> Pattern {
     Pattern::Seq(bytes.iter().map(|b| Pattern::U8(*b)).collect())
 }
 
-/// Helper for the identity function as an Expr::Lambda
+/// Helper for the [`Expr::Lambda`] that returns its argument unchanged, i.e. the identity function.
 pub fn f_id() -> Expr {
     lambda("x", var("x"))
 }
 
 /// Shorthand for matching on a boolean-typed Expr `scrutinee` and returning one of two values
 /// depending on if it is true (`if_true`) or false (`if_false`)
+///
+/// # Notes
+///
+/// This construction produces a [`Expr::Match`] in order to avoid the need for `if`-`else` or `bool::then`
+/// constructions in the Expr model-language, which do not currently exist.
+///
+/// The `if_true` and `if_false` expressions must have the same type, or else the resulting Expr will be ill-typed.
 #[inline]
 pub fn expr_if_else(scrutinee: Expr, if_true: Expr, if_false: Expr) -> Expr {
     expr_match(
@@ -1520,7 +1524,11 @@ pub fn seq_proj(seq: Expr, index: usize) -> Expr {
     index_unchecked(seq, Expr::U32(index))
 }
 
-/// Boilerplate helper for simulating multi-argument lambda via pattern-match tuple destruction
+/// Helper function for writing [`Expr::Lambda`] over a tuple-valued argument
+/// in a multi-parameter style, where the tuple is destructured into a set of named variables
+/// for use in the lambda body.
+///
+/// Compared to
 pub fn lambda_tuple<const N: usize>(names: [&'static str; N], body: Expr) -> Expr {
     const HEAD_VAR: &str = "tuple_var";
     lambda(
