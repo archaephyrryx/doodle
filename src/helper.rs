@@ -1525,10 +1525,12 @@ pub fn seq_proj(seq: Expr, index: usize) -> Expr {
 }
 
 /// Helper function for writing [`Expr::Lambda`] over a tuple-valued argument
-/// in a multi-parameter style, where the tuple is destructured into a set of named variables
-/// for use in the lambda body.
+/// in a multi-parameter style, where the tuple is destructured into a set of
+/// named variables that can be used directly in the lambda body.
 ///
-/// Compared to
+/// Compared to single-head-variable tuple-projections, allows usage-sites
+/// to self-document the semantics of the tuple, and guards against silent
+/// drift if the arguments are reordered or the tuple arity changes.
 pub fn lambda_tuple<const N: usize>(names: [&'static str; N], body: Expr) -> Expr {
     const HEAD_VAR: &str = "tuple_var";
     lambda(
