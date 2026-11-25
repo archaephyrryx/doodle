@@ -1,12 +1,13 @@
 //! `pdf.cos`, the parse driven from the end of the file (`startxref`), as the DaeDaLus host does.
 
-use doodle::{Expr, Format, FormatModule, FormatRef, Pattern, helper::*};
+use doodle::{Expr, Format, FormatRef, Pattern, helper::*};
 
+use super::PdfModule;
 use super::combinators::{count_to, match_str, record_daedalus, skip_to};
 use super::decl::resolve_decl;
 use super::lexical::{SIMPLE_WS, white_till_eol};
 use super::value::{dict_lookup, natural_u64};
-use super::xref::section_trailer;
+use super::xref::{section_trailer, xref_chain};
 
 /// The trailer of the newest section, in `pdf.cos`
 fn newest_trailer() -> Expr {
@@ -15,7 +16,10 @@ fn newest_trailer() -> Expr {
 
 /// DaeDaLus `PdfEnd`: `startxref`, the offset of the last cross-reference section, and `%%EOF`,
 /// each on its own line. Yields the offset.
-pub(super) fn pdf_end(module: &mut FormatModule, eol: FormatRef, natural: FormatRef) -> FormatRef {
+pub(super) fn pdf_end(pm: &mut PdfModule<'_>) -> FormatRef {
+    let eol = pm.eol();
+    let natural = pm.natural();
+    let module = pm.module();
     let ws = || repeat(byte_in(SIMPLE_WS));
     module.define_format(
         "pdf.end",
@@ -66,12 +70,11 @@ fn last_pdf_end(pdf_end: FormatRef) -> Format {
 ///
 /// Sits alongside `pdf.main` (a front-to-back parse), and leaves any bytes after the final
 /// `%%EOF` unread.
-pub(super) fn pdf_cos(
-    module: &mut FormatModule,
-    pdf_end: FormatRef,
-    xref_chain: FormatRef,
-    resolve_ref: FormatRef,
-) -> FormatRef {
+pub(super) fn pdf_cos(pm: &mut PdfModule<'_>) -> FormatRef {
+    let pdf_end = pdf_end(pm);
+    let xref_chain = xref_chain(pm);
+    let resolve_ref = pm.resolve_ref();
+    let module = pm.module();
     module.define_format(
         "pdf.cos",
         record_auto([
@@ -151,7 +154,7 @@ mod tests {
     use doodle::{decoder::Compiler, read::ReadCtxt};
 
     use crate::pdf::test_support::{Ent, Obj, be_rows, build_objects, build_pdf, objstm_pdf, sec};
-    use crate::pdf::top_formats;
+    use doodle::FormatModule;
 
     /// A `%PDF-1.5` file whose only section is a cross-reference stream: object 1 (the text
     /// `obj1`) at its offset, and object 2 packed in object stream 5, which isn't there (see
@@ -276,7 +279,7 @@ mod tests {
             ),
         ];
         let mut module = FormatModule::new();
-        let pdf_cos = top_formats(&mut module).cos;
+        let pdf_cos = PdfModule::new(&mut module).cos();
         for (name, input, expected) in cases {
             let check = match expected {
                 Some(Some(kind)) => fmt_match(
@@ -331,7 +334,7 @@ mod tests {
             .unwrap();
         encrypted.splice(at..at, b"/Encrypt << /Filter /Standard >> ".iter().copied());
         let mut module = FormatModule::new();
-        let pdf_cos = top_formats(&mut module).cos;
+        let pdf_cos = PdfModule::new(&mut module).cos();
         for (name, input, expected) in [("plain", plain, false), ("encrypted", encrypted, true)] {
             let top = chain(
                 pdf_cos.call(),

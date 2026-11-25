@@ -14,14 +14,37 @@
 
 use anyhow::{Result, anyhow, bail};
 use doodle::{
-    Expr, Format, FormatModule,
+    Expr, Format, FormatModule, FormatRef,
     decoder::{Compiler, Value},
     helper::*,
     numeric::core::Expr as NumExpr,
     read::ReadCtxt,
 };
 
-use super::TopFormats;
+use super::PdfModule;
+
+/// The formats the host calls, taken from a [`PdfModule`] (defining any not yet defined), so
+/// that the host then needs only the `FormatModule`, read-only
+#[derive(Clone, Copy)]
+pub(crate) struct HostFormats {
+    cos: FormatRef,
+    resolve_ref: FormatRef,
+    filter_chain: FormatRef,
+    flate_decode: FormatRef,
+    obj_stream_entry: FormatRef,
+}
+
+impl HostFormats {
+    pub(crate) fn new(pm: &mut PdfModule<'_>) -> Self {
+        HostFormats {
+            cos: pm.cos(),
+            resolve_ref: pm.resolve_ref(),
+            filter_chain: pm.filter_chain(),
+            flate_decode: pm.flate_decode(),
+            obj_stream_entry: pm.obj_stream_entry(),
+        }
+    }
+}
 
 /// What the host supplies: the DaeDaLus host primitives that the grammar leaves to it.
 pub(crate) trait HostPrimitives {
@@ -48,7 +71,7 @@ pub(crate) enum HostDecl {
 /// resolves objects, finishing with `prims` what the grammar leaves.
 pub(crate) struct Host<'a, P> {
     module: &'a FormatModule,
-    formats: &'a TopFormats,
+    formats: HostFormats,
     input: &'a [u8],
     prims: P,
     /// the `pdf.cos` result
@@ -58,7 +81,7 @@ pub(crate) struct Host<'a, P> {
 impl<'a, P: HostPrimitives> Host<'a, P> {
     pub(crate) fn new(
         module: &'a FormatModule,
-        formats: &'a TopFormats,
+        formats: HostFormats,
         input: &'a [u8],
         prims: P,
     ) -> Result<Self> {
@@ -354,7 +377,7 @@ mod tests {
         Ent::Free,
         Ent::At(5),
     ];
-    use crate::pdf::top_formats;
+    use crate::pdf::PdfModule;
 
     /// The example of ISO 32000-1 7.4.4.2: `-----A---B` is the codes
     /// `256 45 258 258 65 259 66 257`, in 9 bits each.
@@ -427,7 +450,7 @@ mod tests {
     #[test]
     fn host_applies_filters() {
         let mut module = FormatModule::new();
-        let formats = top_formats(&mut module);
+        let formats = HostFormats::new(&mut PdfModule::new(&mut module));
         let calls = RefCell::new(Vec::new());
 
         let hello = b"hello hello hello hello";
@@ -448,7 +471,7 @@ mod tests {
             ),
             (4, 0, Obj::Def(stream_obj(" /Filter /DCTDecode", b"jpeg"))),
         ]]);
-        let host = Host::new(&module, &formats, &input, host_prims(&calls)).unwrap();
+        let host = Host::new(&module, formats, &input, host_prims(&calls)).unwrap();
         assert_eq!(expect_bytes(host.resolve(2, 0).unwrap()), hello);
         assert_eq!(expect_bytes(host.resolve(3, 0).unwrap()), hello);
         assert!(host.resolve(4, 0).is_err());
@@ -460,7 +483,7 @@ mod tests {
             &lzw_encode(b"1 0 2 21 << /Type /Catalog >> 42"),
             &PACKED_ENTS,
         );
-        let host = Host::new(&module, &formats, &packed, host_prims(&calls)).unwrap();
+        let host = Host::new(&module, formats, &packed, host_prims(&calls)).unwrap();
         assert_eq!(expect_value_kind(&host.resolve(1, 0).unwrap()), "dict");
         assert_eq!(expect_value_kind(&host.resolve(2, 0).unwrap()), "number");
         assert!(calls.borrow().is_empty(), "nothing is encrypted");
@@ -472,7 +495,7 @@ mod tests {
     #[test]
     fn host_decrypts() {
         let mut module = FormatModule::new();
-        let formats = top_formats(&mut module);
+        let formats = HostFormats::new(&mut PdfModule::new(&mut module));
         let calls = RefCell::new(Vec::new());
         let rev = |b: &[u8]| b.iter().rev().copied().collect::<Vec<u8>>();
 
@@ -501,7 +524,7 @@ mod tests {
         ]]);
         let at = input.windows(9).position(|w| w == b"/Root 1 0").unwrap();
         input.splice(at..at, b"/Encrypt << /Filter /Standard >> ".iter().copied());
-        let host = Host::new(&module, &formats, &input, host_prims(&calls)).unwrap();
+        let host = Host::new(&module, formats, &input, host_prims(&calls)).unwrap();
         assert_eq!(expect_bytes(host.resolve(2, 0).unwrap()), b"plain text");
         assert_eq!(expect_bytes(host.resolve(3, 0).unwrap()), hello);
         assert_eq!(expect_bytes(host.resolve(4, 0).unwrap()), hello);
@@ -517,7 +540,7 @@ mod tests {
         );
         let at = packed.windows(9).position(|w| w == b"/Root 1 0").unwrap();
         packed.splice(at..at, b"/Encrypt << /Filter /Standard >> ".iter().copied());
-        let host = Host::new(&module, &formats, &packed, host_prims(&calls)).unwrap();
+        let host = Host::new(&module, formats, &packed, host_prims(&calls)).unwrap();
         let root = match nominal(field(host.cos(), "root").unwrap()) {
             Value::Option(Some(d)) => variant(d).unwrap().0,
             other => panic!("no /Root: {other:?}"),

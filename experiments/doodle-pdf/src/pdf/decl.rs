@@ -1,10 +1,8 @@
 //! Top-level declarations: streams and the resolution of indirect references, DaeDaLus `PdfDecl.ddl`.
 
-use doodle::{
-    BaseType, DepFormat, Expr, Format, FormatModule, FormatRef, Label, Pattern, ValueType,
-    helper::*,
-};
+use doodle::{BaseType, DepFormat, Expr, Format, FormatRef, Label, Pattern, ValueType, helper::*};
 
+use super::PdfModule;
 use super::combinators::{count_to, match_str, record_daedalus};
 use super::filters::apply_filters;
 use super::lexical::{kw, token};
@@ -13,13 +11,12 @@ use super::value::{dict_get, nat_value, natural_u64, number_as_nat};
 /// Daedalus `Stream (val : Value)`. `val` is a whole `Value` (as passed by `pdf.top_decl`), and
 /// `header = val is dict` narrows it. As in the Daedalus definition, `CountTo` consumes the
 /// `endstream` keyword, and `body` is taken from the view saved before it.
-pub(super) fn stream(
-    module: &mut FormatModule,
-    simple_eol: FormatRef,
-    any_ws: FormatRef,
-    value_type: ValueType,
-) -> DepFormat<1, 0> {
-    module.register_format_args(
+pub(super) fn stream(pm: &mut PdfModule<'_>) -> DepFormat<1, 0> {
+    let simple_eol = pm.simple_eol();
+    let any_ws = pm.any_ws();
+    let pdf_value = pm.pdf_value();
+    let value_type = pm.format_type(pdf_value);
+    pm.module().register_format_args(
         "pdf.stream",
         [(Label::Borrowed("val"), value_type)],
         record_daedalus([
@@ -277,14 +274,12 @@ pub(super) fn resolve_decl(resolve_ref: FormatRef, args: [Expr; 5], r: Expr) -> 
 ///
 /// [`resolve`] calls it for a container whose body decodes, and the host for one it decodes
 /// itself (a `packed` result, see `pdf::host`).
-pub(super) fn obj_stream_entry(
-    module: &mut FormatModule,
-    any_ws: FormatRef,
-    natural: FormatRef,
-    pdf_value: FormatRef,
-) -> FormatRef {
+pub(super) fn obj_stream_entry(pm: &mut PdfModule<'_>) -> FormatRef {
+    let any_ws = pm.any_ws();
+    let natural = pm.natural();
+    let pdf_value = pm.pdf_value();
     let u64_arg = |name: &'static str| (Label::Borrowed(name), ValueType::Base(BaseType::U64));
-    module.define_format_args(
+    pm.module().define_format_args(
         "pdf.obj_stream_entry",
         vec![
             (
@@ -378,17 +373,16 @@ pub(super) fn obj_stream_entry(
 /// A stream's body is the `/Length` bytes after the `stream` line (DaeDaLus `StreamBody`),
 /// where an indirect `/Length` is resolved within the batch. That, an object stream's container
 /// and its indirect `/Type`, `/N` and `/First` are the nested resolutions.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn resolve(
-    module: &mut FormatModule,
-    any_ws: FormatRef,
-    simple_eol: FormatRef,
-    natural: FormatRef,
-    pdf_value: FormatRef,
-    zlib: FormatRef,
-    obj_stream_entry: FormatRef,
-    sections_type: ValueType,
-) -> [FormatRef; 2] {
+pub(super) fn resolve(pm: &mut PdfModule<'_>) -> [FormatRef; 2] {
+    let any_ws = pm.any_ws();
+    let simple_eol = pm.simple_eol();
+    let natural = pm.natural();
+    let pdf_value = pm.pdf_value();
+    let zlib = pm.zlib();
+    let obj_stream_entry = pm.obj_stream_entry();
+    let cross_ref = pm.cross_ref();
+    let sections_type = ValueType::Seq(Box::new(pm.format_type(cross_ref)));
+    let module = pm.module();
     let u64_type = || ValueType::Base(BaseType::U64);
     let args = || {
         vec![
@@ -665,27 +659,19 @@ mod tests {
 
     use doodle::{decoder::Compiler, read::ReadCtxt};
 
+    use doodle::FormatModule;
+
     use crate::pdf::combinators::only;
-    use crate::pdf::lexical::{any_ws, comment, eol, simple_eol};
     use crate::pdf::test_support::{Ent, HELLO_Z, Obj, build_objects, objstm_pdf};
-    use crate::pdf::value::{natural, number, pdf_value, v_name};
-    use crate::pdf::{TopFormats, top_formats};
 
     /// `pdf.stream` accepts a dict followed by `stream`, an EOL, and a body running up to
     /// `endstream`, and rejects a non-dict value.
     #[test]
     fn stream_after_dict() {
         let mut module = FormatModule::new();
-        let simple_eol = simple_eol(&mut module);
-        let eol = eol(&mut module, simple_eol);
-        let comment = comment(&mut module, eol);
-        let any_ws = any_ws(&mut module, eol, comment);
-        let v_name = v_name(&mut module, any_ws);
-        let natural = natural(&mut module);
-        let number = number(&mut module, natural);
-        let [value, _dict] = pdf_value(&mut module, any_ws, eol, natural, number, v_name);
-        let value_type = module.get_format_type(value.get_level()).clone();
-        let stream = stream(&mut module, simple_eol, any_ws, value_type);
+        let mut pm = PdfModule::new(&mut module);
+        let value = pm.pdf_value();
+        let stream = stream(&mut pm);
         let top = module.define_format(
             "test.stream",
             only(chain(
@@ -918,11 +904,8 @@ mod tests {
             ),
         ];
         let mut module = FormatModule::new();
-        let TopFormats {
-            cos: pdf_cos,
-            resolve_ref,
-            ..
-        } = top_formats(&mut module);
+        let mut pm = PdfModule::new(&mut module);
+        let (pdf_cos, resolve_ref) = (pm.cos(), pm.resolve_ref());
         for (name, input, (obj, gen_), lim, expected) in cases {
             let value = |p: Pattern| Pattern::Variant("value".into(), Box::new(p));
             let body = |p: Pattern| {
@@ -1060,11 +1043,8 @@ mod tests {
             ("a packed object", &packed, 2, LeftPacked(1)),
         ];
         let mut module = FormatModule::new();
-        let TopFormats {
-            cos: pdf_cos,
-            resolve_ref,
-            ..
-        } = top_formats(&mut module);
+        let mut pm = PdfModule::new(&mut module);
+        let (pdf_cos, resolve_ref) = (pm.cos(), pm.resolve_ref());
         for (name, input, obj, expected) in cases {
             let body = |p: Pattern| {
                 fmt_match(
@@ -1277,11 +1257,8 @@ mod tests {
             ),
         ];
         let mut module = FormatModule::new();
-        let TopFormats {
-            cos: pdf_cos,
-            resolve_ref,
-            ..
-        } = top_formats(&mut module);
+        let mut pm = PdfModule::new(&mut module);
+        let (pdf_cos, resolve_ref) = (pm.cos(), pm.resolve_ref());
         for (name, input, obj, expected) in cases {
             let is = |p: Pattern| {
                 fmt_match(

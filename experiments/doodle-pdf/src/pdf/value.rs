@@ -9,6 +9,7 @@ use doodle::{
 };
 use doodle_numexpr_macro::numexpr;
 
+use super::PdfModule;
 use super::combinators::{interpret, record_daedalus, void};
 use super::lexical::{DIGIT, between, kw, token};
 
@@ -158,7 +159,9 @@ pub(super) fn natural(module: &mut FormatModule) -> FormatRef {
 }
 
 // TODO: add support to allow de-stringification of numbers
-pub(super) fn number(module: &mut FormatModule, natural: FormatRef) -> FormatRef {
+pub(super) fn number(pm: &mut PdfModule<'_>) -> FormatRef {
+    let natural = pm.natural();
+    let module = pm.module();
     let unsigned_lead_digits = chain(
         natural.call(),
         "n",
@@ -373,7 +376,10 @@ pub(super) fn lookup_nat_or(key: &[u8], dict: Expr, dflt: u64) -> Expr {
     )
 }
 
-fn v_string(module: &mut FormatModule, any_ws: FormatRef, eol: FormatRef) -> Format {
+fn v_string(pm: &mut PdfModule<'_>) -> Format {
+    let any_ws = pm.any_ws();
+    let eol = pm.eol();
+    let module = pm.module();
     let known_esc = interpret([
         (is_byte(b'n'), Expr::Seq(vec![Expr::U8(b'\n')])),
         (is_byte(b'r'), Expr::Seq(vec![Expr::U8(b'\r')])),
@@ -453,7 +459,8 @@ fn v_string(module: &mut FormatModule, any_ws: FormatRef, eol: FormatRef) -> For
     ])
 }
 
-pub(super) fn v_name(module: &mut FormatModule, any_ws: FormatRef) -> FormatRef {
+pub(super) fn v_name(pm: &mut PdfModule<'_>) -> FormatRef {
+    let any_ws = pm.any_ws();
     let name_char = {
         let ok_raw = ByteSet::from(*b"\0\t\n\x0C\r ()<>[]{}/%#").complement();
         let name_esc = monad_seq(
@@ -472,21 +479,19 @@ pub(super) fn v_name(module: &mut FormatModule, any_ws: FormatRef) -> FormatRef 
             compute(var("name")),
         ),
     );
-    module.define_format("pdf.value.name", token(name, any_ws))
+    pm.module()
+        .define_format("pdf.value.name", token(name, any_ws))
 }
 
 /// Daedalus `Value`, as a recursive batch of `pdf.value`, `pdf.value.array` and `pdf.value.dict`.
 ///
 /// Each member takes a nesting limit `lim : u64`; entering an array or dict decrements it, and
 /// nesting deeper than the limit fails. Returns `[value, dict]`, both expecting `lim`.
-pub(super) fn pdf_value(
-    module: &mut FormatModule,
-    any_ws: FormatRef,
-    eol: FormatRef,
-    natural: FormatRef,
-    number: FormatRef,
-    v_name: FormatRef,
-) -> [FormatRef; 2] {
+pub(super) fn pdf_value(pm: &mut PdfModule<'_>) -> [FormatRef; 2] {
+    let any_ws = pm.any_ws();
+    let natural = pm.natural();
+    let number = pm.number();
+    let v_name = pm.v_name();
     let v_null = void(kw(b"null", any_ws));
     let v_bool = interpret([
         (kw(b"true", any_ws), Expr::Bool(true)),
@@ -499,7 +504,7 @@ pub(super) fn pdf_value(
     ]);
     let v_number = token(number.call(), any_ws);
 
-    let v_string = v_string(module, any_ws, eol);
+    let v_string = v_string(pm);
     let v_hex_string = v_hex_string(any_ws);
 
     // Fails once nesting exceeds the limit, otherwise parses `f`. Used after the opening bracket
@@ -514,7 +519,7 @@ pub(super) fn pdf_value(
     let inner_lim = || vec![sub(var("lim"), Expr::U64(1))];
 
     let lim = || vec![(Label::Borrowed("lim"), ValueType::Base(BaseType::U64))];
-    let [value, _array, dict] = module.define_batch_with_args(
+    let [value, _array, dict] = pm.module().define_batch_with_args(
         [
             ("pdf.value", lim()),
             ("pdf.value.array", lim()),
@@ -620,20 +625,13 @@ mod tests {
 
     use doodle::{decoder::Compiler, read::ReadCtxt};
 
+    use doodle::FormatModule;
+
     use crate::pdf::combinators::only;
-    use crate::pdf::lexical::{any_ws, comment, eol, simple_eol};
 
     /// Builds `pdf.value` and `pdf.value.dict`, returning the dict format.
     fn dict_module(module: &mut FormatModule) -> FormatRef {
-        let simple_eol = simple_eol(module);
-        let eol = eol(module, simple_eol);
-        let comment = comment(module, eol);
-        let any_ws = any_ws(module, eol, comment);
-        let v_name = v_name(module, any_ws);
-        let natural = natural(module);
-        let number = number(module, natural);
-        let [_value, dict] = pdf_value(module, any_ws, eol, natural, number, v_name);
-        dict
+        PdfModule::new(module).pdf_dict()
     }
 
     /// `dict_lookup` gives the value of the last entry with the given key (after escapes are
@@ -742,8 +740,7 @@ mod tests {
         ];
         for (input, expected) in cases {
             let mut module = FormatModule::new();
-            let natural = natural(&mut module);
-            let number = number(&mut module, natural);
+            let number = PdfModule::new(&mut module).number();
             let expected_pat = match expected {
                 Some(n) => pat_some(Pattern::U64(*n)),
                 None => pat_none(),
@@ -786,14 +783,7 @@ mod tests {
             (b"1 0 R", false),
         ];
         let mut module = FormatModule::new();
-        let simple_eol = simple_eol(&mut module);
-        let eol = eol(&mut module, simple_eol);
-        let comment = comment(&mut module, eol);
-        let any_ws = any_ws(&mut module, eol, comment);
-        let v_name = v_name(&mut module, any_ws);
-        let natural = natural(&mut module);
-        let number = number(&mut module, natural);
-        let [value, _dict] = pdf_value(&mut module, any_ws, eol, natural, number, v_name);
+        let value = PdfModule::new(&mut module).pdf_value();
         let top = module.define_format(
             "test.nat_value",
             only(chain(

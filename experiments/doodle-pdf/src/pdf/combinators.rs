@@ -101,7 +101,7 @@ mod tests {
 
     use doodle::{FormatModule, decoder::Compiler, read::ReadCtxt};
 
-    use crate::pdf::value::{natural, number};
+    use crate::pdf::PdfModule;
 
     /// Decodes each input with `skip_to(f)` and checks whether it succeeds.
     fn check_skip_to(module: &mut FormatModule, f: Format, cases: &[(&[u8], bool)]) {
@@ -133,8 +133,7 @@ mod tests {
             (&long, true),
         ];
         let mut module = FormatModule::new();
-        let natural = natural(&mut module);
-        let number = number(&mut module, natural);
+        let number = PdfModule::new(&mut module).number();
         check_skip_to(
             &mut module,
             monad_seq(is_bytes(b"%PDF-"), number.call()),

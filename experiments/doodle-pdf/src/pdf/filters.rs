@@ -1,10 +1,9 @@
 //! Stream filters: DaeDaLus `ApplyFilters` and `FlateDecode` (`PdfDecl.ddl`), with PNG predictors.
 
-use doodle::{
-    BaseType, Expr, Format, FormatModule, FormatRef, Label, Pattern, ValueType, helper::*,
-};
+use doodle::{BaseType, Expr, Format, FormatRef, Label, Pattern, ValueType, helper::*};
 use doodle_numexpr_macro::numexpr;
 
+use super::PdfModule;
 use super::value::{dict_lookup, lookup_nat_or};
 
 /// DaeDaLus `FlateDecodeParams`: the `predictor`, `colors`, `bpc` and `columns` (all `u64`)
@@ -320,11 +319,11 @@ fn filter_param(param: Expr) -> Format {
 /// - `pdf.flate_decode`: given `param` (an `Option` of a `pdf.value`, as for `filter_param`)
 ///   and `bytes`, DaeDaLus `FlateDecode` of `bytes` (see [`flate_decode`]), which fails for
 ///   an unsupported predictor.
-pub(super) fn host_filter_formats(
-    module: &mut FormatModule,
-    zlib: FormatRef,
-    value_type: ValueType,
-) -> [FormatRef; 2] {
+pub(super) fn host_filter_formats(pm: &mut PdfModule<'_>) -> [FormatRef; 2] {
+    let zlib = pm.zlib();
+    let pdf_value = pm.pdf_value();
+    let value_type = pm.format_type(pdf_value);
+    let module = pm.module();
     let filter_chain = module.define_format_args(
         "pdf.filter_chain",
         vec![(Label::Borrowed("val"), value_type.clone())],
@@ -465,10 +464,9 @@ mod tests {
 
     use doodle::{FormatModule, decoder::Compiler, read::ReadCtxt};
 
+    use crate::pdf::PdfModule;
     use crate::pdf::combinators::only;
-    use crate::pdf::lexical::{any_ws, comment, eol, simple_eol};
     use crate::pdf::test_support::HELLO_Z;
-    use crate::pdf::value::{natural, number, pdf_value, v_name};
 
     /// zlib of `abc` (one stored block)
     const ABC_Z: &[u8] = &[
@@ -486,14 +484,7 @@ mod tests {
     /// Parses a `pdf.value` that is a dict or `null` (as a `/DecodeParms` entry), then `rest`
     /// with the [`flate_decode_params`] record bound to `params`.
     fn with_flate_params(module: &mut FormatModule, rest: Format) -> Format {
-        let simple_eol = simple_eol(module);
-        let eol = eol(module, simple_eol);
-        let comment = comment(module, eol);
-        let any_ws = any_ws(module, eol, comment);
-        let v_name = v_name(module, any_ws);
-        let natural = natural(module);
-        let number = number(module, natural);
-        let [value, _dict] = pdf_value(module, any_ws, eol, natural, number, v_name);
+        let value = PdfModule::new(module).pdf_value();
         chain(
             value.call_args(vec![Expr::U64(32)]),
             "v",

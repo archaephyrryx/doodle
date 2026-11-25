@@ -4,6 +4,7 @@ use doodle::{
     BaseType, Expr, Format, FormatModule, FormatRef, ValueType, helper::*, prelude::ByteSet,
 };
 
+use super::PdfModule;
 use super::combinators::{match_str, void};
 
 /// Folds a sequence of ASCII decimal digits into the u64 value it spells out
@@ -65,23 +66,27 @@ pub(super) fn simple_eol(module: &mut FormatModule) -> FormatRef {
     )
 }
 
-pub(super) fn eol(module: &mut FormatModule, simple_eol: FormatRef) -> FormatRef {
-    module.define_format(
+pub(super) fn eol(pm: &mut PdfModule<'_>) -> FormatRef {
+    let simple_eol = pm.simple_eol();
+    pm.module().define_format(
         "pdf.util.eol",
         Format::UnionNondet(vec![simple_eol.call(), void(is_byte(ASCII_CR))]),
     )
 }
 
-pub(super) fn comment(module: &mut FormatModule, eol: FormatRef) -> FormatRef {
+pub(super) fn comment(pm: &mut PdfModule<'_>) -> FormatRef {
+    let eol = pm.eol();
     let inline_char = Format::Byte(ByteSet::from([ASCII_LF, ASCII_CR]).complement());
-    module.define_format(
+    pm.module().define_format(
         "pdf.util.comment",
         monad_seq(is_byte(b'%'), monad_seq(repeat(inline_char), eol.call())),
     )
 }
 
-pub(super) fn any_ws(module: &mut FormatModule, eol: FormatRef, comment: FormatRef) -> FormatRef {
-    let any_ws = module.define_format(
+pub(super) fn any_ws(pm: &mut PdfModule<'_>) -> FormatRef {
+    let eol = pm.eol();
+    let comment = pm.comment();
+    let any_ws = pm.module().define_format(
         "pdf.util.any_ws",
         Format::UnionNondet(vec![
             void(byte_in(SIMPLE_WS)), // $simpleWS

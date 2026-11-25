@@ -1,10 +1,9 @@
 //! Cross-reference sections and streams and the trailer chain: DaeDaLus `PdfXRef.ddl`.
 
-use doodle::{
-    BaseType, Expr, Format, FormatModule, FormatRef, Label, Pattern, ValueType, helper::*,
-};
+use doodle::{BaseType, Expr, Format, FormatRef, Label, Pattern, ValueType, helper::*};
 use doodle_numexpr_macro::numexpr;
 
+use super::PdfModule;
 use super::combinators::{interpret, match_str, void};
 use super::filters::apply_filters;
 use super::lexical::{ASCII_CR, ASCII_LF, SIMPLE_WS, decimal_value, kw, read_nat, token};
@@ -15,11 +14,10 @@ use super::value::{
 /// Cross-reference table: `xref` followed by one or more subsections.
 ///
 /// Prototype: only the classic table form is handled (not cross-reference streams).
-pub(super) fn cross_ref_section(
-    module: &mut FormatModule,
-    any_ws: FormatRef,
-    natural: FormatRef,
-) -> FormatRef {
+pub(super) fn cross_ref_section(pm: &mut PdfModule<'_>) -> FormatRef {
+    let any_ws = pm.any_ws();
+    let natural = pm.natural();
+    let module = pm.module();
     // Each entry is exactly 20 bytes: `nnnnnnnnnn ggggg f` plus a two-byte end-of-line,
     // where `f` is `n` (in use, `offset` is a byte offset) or `f` (free, `offset` is the
     // next free object number).
@@ -367,14 +365,13 @@ fn xref_stream_filters(zlib: FormatRef, header: Expr, raw: Expr) -> Format {
 /// As DaeDaLus `StreamBody` does, the body is the `/Length` bytes after the `stream` line,
 /// decoded by [`xref_stream_filters`], and the table is read from the decoded bytes, ignoring
 /// any after the last entry. DaeDaLus resolves an indirect `/Length`; until #355 that fails.
-pub(super) fn xref_obj(
-    module: &mut FormatModule,
-    any_ws: FormatRef,
-    simple_eol: FormatRef,
-    natural: FormatRef,
-    pdf_value: FormatRef,
-    zlib: FormatRef,
-) -> FormatRef {
+pub(super) fn xref_obj(pm: &mut PdfModule<'_>) -> FormatRef {
+    let any_ws = pm.any_ws();
+    let simple_eol = pm.simple_eol();
+    let natural = pm.natural();
+    let pdf_value = pm.pdf_value();
+    let zlib = pm.zlib();
+    let module = pm.module();
     let header = || var("_header");
     module.define_format(
         "pdf.xref_obj",
@@ -460,14 +457,13 @@ pub(super) fn xref_obj(
 /// DaeDaLus `CrossRef`: the cross-reference section found at an offset, either `old_xref`
 /// (`CrossRefAndTrailer`: an `xref` table, then `trailer` and its dict) or `new_xref` (a
 /// cross-reference stream, [`xref_obj`]), trying them in that order (DaeDaLus `First`).
-pub(super) fn cross_ref(
-    module: &mut FormatModule,
-    any_ws: FormatRef,
-    eol: FormatRef,
-    xref_table: FormatRef,
-    pdf_dict: FormatRef,
-    xref_obj: FormatRef,
-) -> FormatRef {
+pub(super) fn cross_ref(pm: &mut PdfModule<'_>) -> FormatRef {
+    let any_ws = pm.any_ws();
+    let eol = pm.eol();
+    let xref_table = pm.cross_ref_section();
+    let pdf_dict = pm.pdf_dict();
+    let xref_obj = xref_obj(pm);
+    let module = pm.module();
     let just_white = union([void(byte_in(SIMPLE_WS)), eol.call()]);
     let old_xref = record_auto([
         // DaeDaLus `CrossRefSection` allows whitespace and comments before `xref`
@@ -496,7 +492,9 @@ pub(super) fn cross_ref(
 ///
 /// `lim` bounds the depth of the links followed; the visited check alone already guarantees
 /// termination, so `lim` only guards against a very long chain overflowing the stack.
-pub(super) fn xref_chain(module: &mut FormatModule, cross_ref: FormatRef) -> FormatRef {
+pub(super) fn xref_chain(pm: &mut PdfModule<'_>) -> FormatRef {
+    let cross_ref = pm.cross_ref();
+    let module = pm.module();
     let u64_type = || ValueType::Base(BaseType::U64);
     let args = vec![
         (Label::Borrowed("base"), u64_type()),
@@ -597,23 +595,17 @@ mod tests {
 
     use doodle::{decoder::Compiler, read::ReadCtxt};
 
+    use doodle::FormatModule;
+
     use crate::pdf::combinators::only;
-    use crate::pdf::lexical::{any_ws, comment, eol, simple_eol};
     use crate::pdf::test_support::{Sec, be_rows, build_pdf, sec, stm};
-    use crate::pdf::top_formats;
-    use crate::pdf::value::natural;
 
     /// `pdf.xref` reads subsections of fixed-width 20-byte entries, with any of the three
     /// two-byte end-of-line forms, and rejects entries of the wrong width or with a bad flag.
     #[test]
     fn xref_section() {
         let mut module = FormatModule::new();
-        let simple_eol = simple_eol(&mut module);
-        let eol = eol(&mut module, simple_eol);
-        let comment = comment(&mut module, eol);
-        let any_ws = any_ws(&mut module, eol, comment);
-        let natural = natural(&mut module);
-        let xref = cross_ref_section(&mut module, any_ws, natural);
+        let xref = PdfModule::new(&mut module).cross_ref_section();
         let top = module.define_format("test.xref", only(xref.call()));
         let prog = Compiler::compile_program(&module, &top.call()).expect("xref must compile");
         let cases: &[(&[u8], bool)] = &[
@@ -772,7 +764,7 @@ mod tests {
             ),
         ];
         let mut module = FormatModule::new();
-        let pdf_cos = top_formats(&mut module).cos;
+        let pdf_cos = PdfModule::new(&mut module).cos();
         for (name, input, expected) in cases {
             let sizes = flat_map(
                 lambda(
@@ -989,7 +981,7 @@ mod tests {
             ),
         ];
         let mut module = FormatModule::new();
-        let pdf_cos = top_formats(&mut module).cos;
+        let pdf_cos = PdfModule::new(&mut module).cos();
         let seq1 = |e: Expr| Expr::Seq(vec![e]);
         let entry = |name: &'static str, f2: &'static str, f3: &'static str| {
             (
