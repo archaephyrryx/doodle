@@ -1853,7 +1853,11 @@ fn embed_match_expr(
     cases: &Vec<(GTPattern, GTExpr)>,
     info: ExprInfo,
 ) -> RustExpr {
-    let head = match scrutinee.get_type().as_deref().and_then(GenType::as_vec_type) {
+    let head = match scrutinee
+        .get_type()
+        .as_deref()
+        .and_then(GenType::as_vec_type)
+    {
         // if the scrutinee is a `Vec`, we need to ensure that it is not moved into the match, so we borrow such scrutinees as a slice
         Some(..) => embed_expr_nat(scrutinee).vec_as_slice(),
         None => embed_expr_nat(scrutinee),

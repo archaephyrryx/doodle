@@ -5434,8 +5434,8 @@ mod test {
     fn batch_member_uses_own_call_result() {
         use crate::helper::{
             add, alts, as_u64, bind, chain, compute, decode_bytes, fmt_match, is_byte,
-            lambda_tuple, left_fold, monad_seq, record_auto, record_proj, repeat_count,
-            seq_length, var,
+            lambda_tuple, left_fold, monad_seq, record_auto, record_proj, repeat_count, seq_length,
+            var,
         };
         let mut module = FormatModule::new();
         // `L` then two bytes is a `leaf`; `N` then a `leaf` is a `node` describing its bytes
@@ -5520,9 +5520,7 @@ mod test {
     /// gets the batch's real type from the `TypeChecker` afterwards.
     #[test]
     fn batch_member_matches_own_call_result() {
-        use crate::helper::{
-            alts, bind, chain, compute, fmt_match, is_byte, monad_seq, var,
-        };
+        use crate::helper::{alts, bind, chain, compute, fmt_match, is_byte, monad_seq, var};
         let mut module = FormatModule::new();
         // `L` is `leaf('L')`; `N` then a `leaf(x)` is `node(x)`, and `N` then a `node` fails
         let [f] = module.define_batch_with_args(

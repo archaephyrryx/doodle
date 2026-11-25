@@ -190,10 +190,23 @@ where
     Ok(accum)
 }
 
-/// Performs a flat-map using an auxiliary accumulator, which is updated by `f(accum, elem)` after each step
-/// but ultimately discarded, leaving only the flattened list of `U`-values.
+/// Stateful flat-map over a fallible closure, that short-circuits on first `Err`
 ///
-/// Will short-circuit if `f` ever returns `Err(_)`, preserving the error returned.
+/// `try_fold_map_curried` expands an iterable sequence (in practice, almost always slice-based, e.g. `Vec`)
+/// over one type `T` into a `Vec<U>`, through a stateful flat-map driven by `f`, which maps `(accum, x)` to
+/// `(new_accum, ys)` or returns `Err`.
+///
+/// Every iteration, the return value of `f` is used to simultaneously update the state-value (accumulator)
+/// and to extend the `Vec<U>` we ultimately return.
+///
+/// The state-value is only used internally in each subsequent call to `f`, and is discarded once the iteration
+/// over `iter` is finished, with only the finished `Vec<U>` being returned.
+///
+/// If at any point `f` returns `Err`, the entire function short-circuits and returns that error.
+///
+/// # Notes
+///
+/// This function is the prelude backing-function for [`Expr::FlatMapAccum`](crate::Expr::FlatMapAccum).
 pub fn try_fold_map_curried<T, U, V, E, F>(
     iter: impl Iterator<Item = T>,
     init: V,
