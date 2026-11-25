@@ -1,12 +1,17 @@
 //! `pdf.cos`, the parse driven from the end of the file (`startxref`), as the DaeDaLus host does.
 
-use doodle::{Expr, Format, FormatModule, FormatRef, helper::*};
+use doodle::{Expr, Format, FormatModule, FormatRef, Pattern, helper::*};
 
 use super::combinators::{count_to, match_str, record_daedalus, skip_to};
-use super::decl::resolve_val;
+use super::decl::resolve_decl;
 use super::lexical::{SIMPLE_WS, white_till_eol};
-use super::value::natural_u64;
+use super::value::{dict_lookup, natural_u64};
 use super::xref::section_trailer;
+
+/// The trailer of the newest section, in `pdf.cos`
+fn newest_trailer() -> Expr {
+    section_trailer(index_unchecked(var("sections"), Expr::U32(0)))
+}
 
 /// DaeDaLus `PdfEnd`: `startxref`, the offset of the last cross-reference section, and `%%EOF`,
 /// each on its own line. Yields the offset.
@@ -82,30 +87,53 @@ pub(super) fn pdf_cos(
                 ]),
             ),
             ("sections", compute(record_proj(var("_chain"), "sections"))),
-            // the newest trailer's `/Root`, resolved
+            // DaeDaLus `TrailerDict`'s `encrypt`, taken from the newest trailer as the host
+            // does; only whether there is one matters here (see `apply_filters`)
+            (
+                "encrypted",
+                compute(expr_match(
+                    dict_lookup(b"Encrypt", record_proj(newest_trailer(), "all")),
+                    [
+                        (pat_some(Pattern::Wildcard), Expr::Bool(true)),
+                        (pat_none(), Expr::Bool(false)),
+                    ],
+                )),
+            ),
+            // the newest trailer's `/Root`, resolved: a `value`, or `packed` for the host
+            // (see `resolve`); a stream fails
             (
                 "root",
                 fmt_match(
-                    record_proj(
-                        section_trailer(index_unchecked(var("sections"), Expr::U32(0))),
-                        "root",
-                    ),
+                    record_proj(newest_trailer(), "root"),
                     [
                         (
                             pat_some(bind("root_ref")),
                             fmt_some(chain(
-                                resolve_val(
+                                resolve_decl(
                                     resolve_ref,
                                     [
                                         var("header_offset"),
                                         var("sections"),
+                                        var("encrypted"),
                                         Expr::Seq(vec![]),
                                         Expr::U64(256),
                                     ],
-                                    variant("ref", var("root_ref")),
+                                    var("root_ref"),
                                 ),
-                                "root_v",
-                                compute(var("root_v")),
+                                "root_d",
+                                fmt_match(
+                                    var("root_d"),
+                                    [
+                                        (
+                                            Pattern::Variant(
+                                                "stream".into(),
+                                                Box::new(Pattern::Wildcard),
+                                            ),
+                                            Format::Fail, // "/Root is a stream"
+                                        ),
+                                        (Pattern::Wildcard, compute(var("root_d"))),
+                                    ],
+                                ),
                             )),
                         ),
                         (pat_none(), compute(expr_none())),
@@ -120,7 +148,7 @@ pub(super) fn pdf_cos(
 mod tests {
     use super::*;
 
-    use doodle::{Pattern, decoder::Compiler, read::ReadCtxt};
+    use doodle::{decoder::Compiler, read::ReadCtxt};
 
     use crate::pdf::test_support::{Ent, Obj, be_rows, build_objects, build_pdf, objstm_pdf, sec};
     use crate::pdf::top_formats;
@@ -157,10 +185,11 @@ mod tests {
     }
 
     /// `pdf.cos` resolves the newest trailer's `/Root` (here a dict, or `null` for a missing
-    /// object), through classic and stream sections alike, and from an object stream; an
-    /// object packed in a missing object stream fails to resolve, unless its generation isn't
-    /// `0`, which makes it `null`. Each case gives the expected `root` value's kind (`None`
-    /// for no `/Root`), or fails.
+    /// object), through classic and stream sections alike, and from an object stream, or
+    /// leaves it `packed` for the host when that stream's filter is unsupported; an object
+    /// packed in a missing object stream fails to resolve, unless its generation isn't `0`,
+    /// which makes it `null`. Each case gives the expected `root` value's kind (or `packed`;
+    /// `None` for no `/Root`), or fails.
     #[test]
     fn pdf_cos_resolves_root() {
         let classic = |root: &str| {
@@ -218,6 +247,24 @@ mod tests {
                 Some(Some("dict")),
             ),
             (
+                "a /Root packed in an object stream left to the host",
+                objstm_pdf(
+                    "/Type /ObjStm /N 1 /Filter /LZWDecode",
+                    "1 0 ",
+                    "<< /Type /Catalog >>",
+                    None,
+                    &[
+                        Ent::Free,
+                        Ent::Packed(5, 0),
+                        Ent::Free,
+                        Ent::Free,
+                        Ent::Free,
+                        Ent::At(5),
+                    ],
+                ),
+                Some(Some("packed")),
+            ),
+            (
                 "a packed object of another generation",
                 packed_pdf("2 1 R", "<< /Type /Catalog >>"),
                 Some(Some("null")),
@@ -229,14 +276,25 @@ mod tests {
             ),
         ];
         let mut module = FormatModule::new();
-        let [_pdf_main, pdf_cos, _resolve_ref] = top_formats(&mut module);
+        let pdf_cos = top_formats(&mut module).cos;
         for (name, input, expected) in cases {
             let check = match expected {
                 Some(Some(kind)) => fmt_match(
                     record_proj(var("cos"), "root"),
                     [
                         (
-                            pat_some(Pattern::Variant(kind.into(), Box::new(Pattern::Wildcard))),
+                            pat_some(match kind {
+                                "packed" => {
+                                    Pattern::Variant(kind.into(), Box::new(Pattern::Wildcard))
+                                }
+                                _ => Pattern::Variant(
+                                    "value".into(),
+                                    Box::new(Pattern::Variant(
+                                        kind.into(),
+                                        Box::new(Pattern::Wildcard),
+                                    )),
+                                ),
+                            }),
                             Format::EMPTY,
                         ),
                         (Pattern::Wildcard, Format::Fail),
@@ -259,6 +317,41 @@ mod tests {
                 "{name}: expecting {expected:?} from {:?}",
                 String::from_utf8_lossy(&input)
             );
+        }
+    }
+
+    /// `pdf.cos` reports whether the newest trailer has an `/Encrypt` entry.
+    #[test]
+    fn pdf_cos_encrypted() {
+        let plain = build_objects(&[&[(1, 0, Obj::Def(b"<< /Type /Catalog >>"))]]);
+        let mut encrypted = plain.clone();
+        let at = encrypted
+            .windows(9)
+            .position(|w| w == b"/Root 1 0")
+            .unwrap();
+        encrypted.splice(at..at, b"/Encrypt << /Filter /Standard >> ".iter().copied());
+        let mut module = FormatModule::new();
+        let pdf_cos = top_formats(&mut module).cos;
+        for (name, input, expected) in [("plain", plain, false), ("encrypted", encrypted, true)] {
+            let top = chain(
+                pdf_cos.call(),
+                "cos",
+                if_then_else(
+                    record_proj(var("cos"), "encrypted"),
+                    if expected {
+                        Format::EMPTY
+                    } else {
+                        Format::Fail
+                    },
+                    if expected {
+                        Format::Fail
+                    } else {
+                        Format::EMPTY
+                    },
+                ),
+            );
+            let prog = Compiler::compile_program(&module, &top).expect("must compile");
+            assert!(prog.run(ReadCtxt::new(&input)).is_ok(), "{name}");
         }
     }
 }

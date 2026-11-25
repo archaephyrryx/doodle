@@ -345,7 +345,7 @@ fn xref_widths(header: Expr) -> Format {
 /// `str.body is ok`): the decoded bytes, failing if they're `unsupported`.
 fn xref_stream_filters(zlib: FormatRef, header: Expr, raw: Expr) -> Format {
     chain(
-        apply_filters(zlib, header, raw),
+        apply_filters(zlib, header, raw, Expr::Bool(false)),
         "_filtered",
         fmt_match(
             var("_filtered"),
@@ -772,7 +772,7 @@ mod tests {
             ),
         ];
         let mut module = FormatModule::new();
-        let [_pdf_main, pdf_cos, _resolve_ref] = top_formats(&mut module);
+        let pdf_cos = top_formats(&mut module).cos;
         for (name, input, expected) in cases {
             let sizes = flat_map(
                 lambda(
@@ -989,7 +989,7 @@ mod tests {
             ),
         ];
         let mut module = FormatModule::new();
-        let [_pdf_main, pdf_cos, _resolve_ref] = top_formats(&mut module);
+        let pdf_cos = top_formats(&mut module).cos;
         let seq1 = |e: Expr| Expr::Seq(vec![e]);
         let entry = |name: &'static str, f2: &'static str, f3: &'static str| {
             (

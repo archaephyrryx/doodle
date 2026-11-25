@@ -181,24 +181,37 @@ pub(super) fn objstm_pdf(
     obj6: Option<&str>,
     ents: &[Ent],
 ) -> Vec<u8> {
-    let mut out = b"%PDF-1.5\n".to_vec();
-    let mut offsets = std::collections::BTreeMap::new();
-    let body = format!("{index}{values}");
     let first = if stm_dict.contains("/First") {
         String::new()
     } else {
         format!(" /First {}", index.len())
     };
+    objstm_pdf_with(
+        &format!("{stm_dict}{first}"),
+        format!("{index}{values}").as_bytes(),
+        obj6,
+        ents,
+    )
+}
+
+/// [`objstm_pdf`] with the object stream's body given as raw bytes (such as an encoded one),
+/// and no object `6`; `stm_dict` must give `/First`
+pub(super) fn objstm_pdf_raw(stm_dict: &str, body: &[u8], ents: &[Ent]) -> Vec<u8> {
+    objstm_pdf_with(stm_dict, body, None, ents)
+}
+
+fn objstm_pdf_with(stm_dict: &str, body: &[u8], obj6: Option<&str>, ents: &[Ent]) -> Vec<u8> {
+    let mut out = b"%PDF-1.5\n".to_vec();
+    let mut offsets = std::collections::BTreeMap::new();
     let len = if stm_dict.contains("/Length") {
         String::new()
     } else {
         format!(" /Length {}", body.len())
     };
     offsets.insert(5, out.len());
-    out.extend(
-        format!("5 0 obj\n<< {stm_dict}{first}{len} >>\nstream\n{body}\nendstream\nendobj\n")
-            .into_bytes(),
-    );
+    out.extend(format!("5 0 obj\n<< {stm_dict}{len} >>\nstream\n").into_bytes());
+    out.extend_from_slice(body);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
     if let Some(text) = obj6 {
         offsets.insert(6, out.len());
         out.extend(format!("6 0 obj\n{text}\nendobj\n").into_bytes());
@@ -224,5 +237,67 @@ pub(super) fn objstm_pdf(
     );
     out.extend(data);
     out.extend(format!("\nendstream\nendobj\nstartxref\n{xref_at}\n%%EOF\n").into_bytes());
+    out
+}
+
+/// PDF `LZWDecode`'s encoding (ISO 32000-1 7.4.4), with `/EarlyChange 1`: a clear code, the
+/// codes of `data` (each the longest run already in the table), then the end code, packed
+/// big-endian in 9 to 12 bits. The table is cleared again before it would pass 4096 entries.
+pub(super) fn lzw_encode(data: &[u8]) -> Vec<u8> {
+    use std::collections::HashMap;
+    let mut out = Vec::new();
+    let (mut buf, mut nbits) = (0u32, 0u32);
+    let mut emit = |code: u32, width: u32, out: &mut Vec<u8>| {
+        buf = (buf << width) | code;
+        nbits += width;
+        while nbits >= 8 {
+            out.push((buf >> (nbits - 8)) as u8);
+            nbits -= 8;
+        }
+        buf &= (1 << nbits) - 1;
+    };
+    let fresh = || {
+        (0..=255u8)
+            .map(|b| (vec![b], u32::from(b)))
+            .collect::<HashMap<_, _>>()
+    };
+    let mut table = fresh();
+    // the next code to add; the decoder's table is one entry behind, so the width grows when
+    // `next` reaches the decoder's threshold (`len + 1 >= 2^width`, with `len = next - 1`)
+    let mut next = 258u32;
+    let width = |next: u32| match next {
+        ..512 => 9,
+        512..1024 => 10,
+        1024..2048 => 11,
+        _ => 12,
+    };
+    emit(256, 9, &mut out);
+    let mut w: Vec<u8> = Vec::new();
+    for &c in data {
+        let mut wc = w.clone();
+        wc.push(c);
+        if table.contains_key(&wc) {
+            w = wc;
+            continue;
+        }
+        emit(table[&w], width(next), &mut out);
+        if next == 4095 {
+            emit(256, width(next), &mut out);
+            table = fresh();
+            next = 258;
+        } else {
+            table.insert(wc, next);
+            next += 1;
+        }
+        w = vec![c];
+    }
+    if !w.is_empty() {
+        emit(table[&w], width(next), &mut out);
+        next += 1;
+    }
+    emit(257, width(next.min(4095)), &mut out);
+    if nbits > 0 {
+        out.push((buf << (8 - nbits)) as u8);
+    }
     out
 }

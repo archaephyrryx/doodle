@@ -2,6 +2,8 @@ mod combinators;
 mod cos;
 mod decl;
 mod filters;
+#[cfg_attr(not(test), allow(dead_code))]
+mod host;
 mod lexical;
 #[cfg(test)]
 mod test_support;
@@ -12,19 +14,35 @@ use doodle::{Expr, FormatModule, FormatRef, Label, ValueType, helper::*};
 
 use combinators::{match_str, only, skip_to, then_eol};
 use cos::{pdf_cos, pdf_end};
-use decl::{resolve, stream};
+use decl::{obj_stream_entry, resolve, stream};
+use filters::host_filter_formats;
 use lexical::{any_ws, comment, eol, kw, simple_eol, token};
 use value::{natural, number, pdf_value, v_name};
 use xref::{cross_ref, cross_ref_section, xref_chain, xref_obj};
 
 pub fn main(module: &mut FormatModule) -> FormatRef {
-    let [pdf_main, _pdf_cos, _resolve_ref] = top_formats(module);
-    pdf_main
+    top_formats(module).main
 }
 
-/// Defines the module's formats, returning the two top-level ones, `pdf.main` (front to back)
-/// and `pdf.cos` (from the end, following the cross-reference chain), and `pdf.resolve_ref`.
-fn top_formats(module: &mut FormatModule) -> [FormatRef; 3] {
+/// The formats of [`top_formats`] that are called from outside the module's own definitions.
+#[cfg_attr(not(test), allow(dead_code))]
+struct TopFormats {
+    /// `pdf.main`, a front-to-back parse
+    main: FormatRef,
+    /// `pdf.cos`, from the end, following the cross-reference chain
+    cos: FormatRef,
+    /// `pdf.resolve_ref`
+    resolve_ref: FormatRef,
+    /// `pdf.filter_chain`, for the host (see `host`)
+    filter_chain: FormatRef,
+    /// `pdf.flate_decode`, for the host (see `host`)
+    flate_decode: FormatRef,
+    /// `pdf.obj_stream_entry`, for the host (see `host`)
+    obj_stream_entry: FormatRef,
+}
+
+/// Defines the module's formats.
+fn top_formats(module: &mut FormatModule) -> TopFormats {
     let simple_eol = simple_eol(module);
     let eol = eol(module, simple_eol);
     let comment = comment(module, eol);
@@ -77,6 +95,8 @@ fn top_formats(module: &mut FormatModule) -> [FormatRef; 3] {
     let sections_type = ValueType::Seq(Box::new(
         module.get_format_type(cross_ref.get_level()).clone(),
     ));
+    let [filter_chain, flate_decode] = host_filter_formats(module, zlib, pdf_value_type.clone());
+    let obj_stream_entry = obj_stream_entry(module, any_ws, natural, pdf_value);
     let [resolve_ref, _resolved_decl] = resolve(
         module,
         any_ws,
@@ -84,6 +104,7 @@ fn top_formats(module: &mut FormatModule) -> [FormatRef; 3] {
         natural,
         pdf_value,
         zlib,
+        obj_stream_entry,
         sections_type,
     );
     let pdf_cos = pdf_cos(module, pdf_end, xref_chain, resolve_ref);
@@ -112,5 +133,12 @@ fn top_formats(module: &mut FormatModule) -> [FormatRef; 3] {
             // adding `Many AnyWS` here breaks matchtree because pdf_chunk can end in whitespace
         ])),
     );
-    [pdf_main, pdf_cos, resolve_ref]
+    TopFormats {
+        main: pdf_main,
+        cos: pdf_cos,
+        resolve_ref,
+        filter_chain,
+        flate_decode,
+        obj_stream_entry,
+    }
 }

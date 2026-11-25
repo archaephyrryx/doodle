@@ -211,46 +211,31 @@ fn xref_entry_for(sections: Expr, obj: Expr) -> Expr {
 /// `ResolveValRef` is `ResolveDeclRef r is value`), as does an object or generation number
 /// over `u64` (as in the DaeDaLus host).
 ///
-/// `args` are `resolve_ref`'s other arguments: `base`, `sections`, `resolving` and `lim`.
-pub(super) fn resolve_val(resolve_ref: FormatRef, args: [Expr; 4], v: Expr) -> Format {
-    let [base, sections, resolving, lim] = args;
+/// A reference to an object that the host is left to read (`packed`, see [`resolve`]) fails
+/// too, as only the host could give its value.
+///
+/// `args` are `resolve_ref`'s other arguments: `base`, `sections`, `encrypted`, `resolving`
+/// and `lim`.
+pub(super) fn resolve_val(resolve_ref: FormatRef, args: [Expr; 5], v: Expr) -> Format {
     fmt_match(
         v.clone(),
         [
             (
                 Pattern::Variant("ref".into(), Box::new(bind("r"))),
-                fmt_match(
-                    Expr::Tuple(vec![
-                        number_as_nat(record_proj(var("r"), "obj")),
-                        number_as_nat(record_proj(var("r"), "gen")),
-                    ]),
-                    [
-                        (
-                            Pattern::Tuple(vec![pat_some(bind("r_obj")), pat_some(bind("r_gen"))]),
-                            chain(
-                                resolve_ref.call_args(vec![
-                                    base,
-                                    sections,
-                                    var("r_obj"),
-                                    var("r_gen"),
-                                    resolving,
-                                    lim,
-                                ]),
-                                "r_decl",
-                                fmt_match(
-                                    var("r_decl"),
-                                    [
-                                        (
-                                            Pattern::Variant("value".into(), Box::new(bind("rv"))),
-                                            compute(var("rv")),
-                                        ),
-                                        (Pattern::Wildcard, Format::Fail), // "is a stream"
-                                    ],
-                                ),
+                chain(
+                    resolve_decl(resolve_ref, args, var("r")),
+                    "r_decl",
+                    fmt_match(
+                        var("r_decl"),
+                        [
+                            (
+                                Pattern::Variant("value".into(), Box::new(bind("rv"))),
+                                compute(var("rv")),
                             ),
-                        ),
-                        (Pattern::Wildcard, Format::Fail), // "invalid object number"
-                    ],
+                            // "is a stream", or only the host can read it
+                            (Pattern::Wildcard, Format::Fail),
+                        ],
+                    ),
                 ),
             ),
             (Pattern::Wildcard, compute(v)),
@@ -258,13 +243,120 @@ pub(super) fn resolve_val(resolve_ref: FormatRef, args: [Expr; 4], v: Expr) -> F
     )
 }
 
+/// The `pdf.resolve_ref` result for the reference `r` (the record of a `pdf.value` `ref`),
+/// whose object and generation numbers must be natural numbers within `u64` (as in the
+/// DaeDaLus host); `args` are as for [`resolve_val`].
+pub(super) fn resolve_decl(resolve_ref: FormatRef, args: [Expr; 5], r: Expr) -> Format {
+    let [base, sections, encrypted, resolving, lim] = args;
+    fmt_match(
+        Expr::Tuple(vec![
+            number_as_nat(record_proj(r.clone(), "obj")),
+            number_as_nat(record_proj(r, "gen")),
+        ]),
+        [
+            (
+                Pattern::Tuple(vec![pat_some(bind("r_obj")), pat_some(bind("r_gen"))]),
+                resolve_ref.call_args(vec![
+                    base,
+                    sections,
+                    encrypted,
+                    var("r_obj"),
+                    var("r_gen"),
+                    resolving,
+                    lim,
+                ]),
+            ),
+            (Pattern::Wildcard, Format::Fail), // "invalid object number"
+        ],
+    )
+}
+
+/// `pdf.obj_stream_entry`: DaeDaLus `ObjStream` and `ObjStreamEntry`, given an object
+/// stream's decoded body `bytes` and its `/N` (`n`) and `/First` (`first`): the value at index
+/// `index`, which must be numbered `obj` (`CheckExpected`). All but `bytes` are `u64`s.
+///
+/// [`resolve`] calls it for a container whose body decodes, and the host for one it decodes
+/// itself (a `packed` result, see `pdf::host`).
+pub(super) fn obj_stream_entry(
+    module: &mut FormatModule,
+    any_ws: FormatRef,
+    natural: FormatRef,
+    pdf_value: FormatRef,
+) -> FormatRef {
+    let u64_arg = |name: &'static str| (Label::Borrowed(name), ValueType::Base(BaseType::U64));
+    module.define_format_args(
+        "pdf.obj_stream_entry",
+        vec![
+            (
+                Label::Borrowed("bytes"),
+                ValueType::Seq(Box::new(ValueType::Base(BaseType::U8))),
+            ),
+            u64_arg("n"),
+            u64_arg("first"),
+            u64_arg("obj"),
+            u64_arg("index"),
+        ],
+        map(
+            record_auto([
+                (
+                    "_index",
+                    decode_bytes(
+                        var("bytes"),
+                        repeat_count(
+                            var("n"),
+                            record_auto([
+                                ("oid", token(natural_u64(natural), any_ws)),
+                                ("off", token(natural_u64(natural), any_ws)),
+                            ]),
+                        ),
+                    ),
+                ),
+                (
+                    "_info",
+                    fmt_match(
+                        index_checked(var("_index"), var("index")),
+                        [
+                            (pat_some(bind("info")), compute(var("info"))),
+                            (pat_none(), Format::Fail), // "index past /N"
+                        ],
+                    ),
+                ),
+                (
+                    "__check",
+                    if_then_else(
+                        expr_eq(record_proj(var("_info"), "oid"), var("obj")),
+                        Format::EMPTY,
+                        Format::Fail, // "object number doesn't match the xref"
+                    ),
+                ),
+                (
+                    "value",
+                    decode_bytes(
+                        var("bytes"),
+                        monad_seq(
+                            // `Drop first`, then `Drop off`
+                            repeat_count(var("first"), Format::ANY_BYTE),
+                            monad_seq(
+                                repeat_count(record_proj(var("_info"), "off"), Format::ANY_BYTE),
+                                pdf_value.call_args(vec![Expr::U64(32)]),
+                            ),
+                        ),
+                    ),
+                ),
+            ]),
+            lambda("e", record_proj(var("e"), "value")),
+        ),
+    )
+}
+
 /// DaeDaLus `ResolveDeclRef` (#355): the batch
 /// `[pdf.resolve_ref, pdf.resolved_decl]`, both taking `base` (the position of the `%PDF-`
-/// header), `sections` (from `pdf.cos`), the object number `obj` and generation `gen` (as
-/// `u64`s), `resolving` and `lim`.
+/// header), `sections` and `encrypted` (from `pdf.cos`), the object number `obj` and
+/// generation `gen` (as `u64`s), `resolving` and `lim`.
 ///
 /// `pdf.resolve_ref` gives the object's DaeDaLus `TopDeclDef`: a `stream` (its `header` and
-/// its `body`, see [`apply_filters`]) or a `value`. As in the DaeDaLus host:
+/// its `body`, see [`apply_filters`]) or a `value`, or else `packed` (below), which leaves the
+/// object to the host. As in the DaeDaLus host:
 /// - an object with no entry, a free entry, a `null` entry, or an entry of another
 ///   generation is the value `null`;
 /// - otherwise the object is parsed at its offset (`pdf.resolved_decl`), and must be numbered
@@ -277,7 +369,11 @@ pub(super) fn resolve_val(resolve_ref: FormatRef, args: [Expr; 4], v: Expr) -> F
 /// than being `null`, if it isn't a stream), then DaeDaLus `ObjStream` (`/Type /ObjStm`, a body
 /// that decodes, `/N` pairs of object number and offset, the objects from `/First`) and
 /// `ObjStreamEntry` give the value at the entry's index, whose object number must be `obj`
-/// (`CheckExpected`). `/Extends` (a chain of object streams) is not followed, as in DaeDaLus.
+/// (`CheckExpected`, see [`obj_stream_entry`]). `/Extends` (a chain of object streams) is not
+/// followed, as in DaeDaLus. If the container's body is `encrypted` or `unsupported` (its
+/// `/Type`, `/N` and `/First` are still checked), the result is `packed`: the `container`'s
+/// number and `stream`, `n`, `first` and the entry's `index`, from which the host decodes the
+/// body and calls `pdf.obj_stream_entry` (see `pdf::host`).
 ///
 /// A stream's body is the `/Length` bytes after the `stream` line (DaeDaLus `StreamBody`),
 /// where an indirect `/Length` is resolved within the batch. That, an object stream's container
@@ -290,6 +386,7 @@ pub(super) fn resolve(
     natural: FormatRef,
     pdf_value: FormatRef,
     zlib: FormatRef,
+    obj_stream_entry: FormatRef,
     sections_type: ValueType,
 ) -> [FormatRef; 2] {
     let u64_type = || ValueType::Base(BaseType::U64);
@@ -297,6 +394,10 @@ pub(super) fn resolve(
         vec![
             (Label::Borrowed("base"), u64_type()),
             (Label::Borrowed("sections"), sections_type.clone()),
+            (
+                Label::Borrowed("encrypted"),
+                ValueType::Base(BaseType::Bool),
+            ),
             (Label::Borrowed("obj"), u64_type()),
             (Label::Borrowed("gen"), u64_type()),
             (
@@ -310,6 +411,7 @@ pub(super) fn resolve(
         vec![
             var("base"),
             var("sections"),
+            var("encrypted"),
             var("obj"),
             var("gen"),
             var("resolving"),
@@ -322,6 +424,7 @@ pub(super) fn resolve(
         [
             var("base"),
             var("sections"),
+            var("encrypted"),
             append(var("resolving"), Expr::Seq(vec![var("obj")])),
             sub(var("lim"), Expr::U64(1)),
         ]
@@ -371,70 +474,47 @@ pub(super) fn resolve(
                             ),
                         ),
                     ),
+                    ("_n", nat(b"N", header())),
+                    ("_first", nat(b"First", header())),
                     (
-                        "_bytes",
+                        "decl",
                         fmt_match(
                             record_proj(var("_stm"), "body"),
                             [
                                 (
                                     Pattern::Variant("ok".into(), Box::new(bind("b"))),
-                                    compute(var("b")),
-                                ),
-                                (Pattern::Wildcard, Format::Fail), // "unsupported filter"
-                            ],
-                        ),
-                    ),
-                    ("_n", nat(b"N", header())),
-                    ("_first", nat(b"First", header())),
-                    (
-                        "_index",
-                        decode_bytes(
-                            var("_bytes"),
-                            repeat_count(
-                                var("_n"),
-                                record_auto([
-                                    ("oid", token(natural_u64(natural), any_ws)),
-                                    ("off", token(natural_u64(natural), any_ws)),
-                                ]),
-                            ),
-                        ),
-                    ),
-                    (
-                        "_info",
-                        fmt_match(
-                            index_checked(var("_index"), record_proj(var("packed"), "index")),
-                            [
-                                (pat_some(bind("info")), compute(var("info"))),
-                                (pat_none(), Format::Fail), // "index past /N"
-                            ],
-                        ),
-                    ),
-                    (
-                        "__check",
-                        if_then_else(
-                            expr_eq(record_proj(var("_info"), "oid"), var("obj")),
-                            Format::EMPTY,
-                            Format::Fail, // "object number doesn't match the xref"
-                        ),
-                    ),
-                    (
-                        "decl",
-                        decode_bytes(
-                            var("_bytes"),
-                            monad_seq(
-                                // `Drop first`, then `Drop off`
-                                repeat_count(var("_first"), Format::ANY_BYTE),
-                                monad_seq(
-                                    repeat_count(
-                                        record_proj(var("_info"), "off"),
-                                        Format::ANY_BYTE,
-                                    ),
                                     map(
-                                        pdf_value.call_args(vec![Expr::U64(32)]),
+                                        obj_stream_entry.call_args(vec![
+                                            var("b"),
+                                            var("_n"),
+                                            var("_first"),
+                                            var("obj"),
+                                            record_proj(var("packed"), "index"),
+                                        ]),
                                         lambda("v", variant("value", var("v"))),
                                     ),
                                 ),
-                            ),
+                                // `encrypted` or `unsupported`: left to the host
+                                (
+                                    Pattern::Wildcard,
+                                    compute(variant(
+                                        "packed",
+                                        Expr::Record(vec![
+                                            (
+                                                Label::Borrowed("container"),
+                                                record_proj(var("packed"), "container"),
+                                            ),
+                                            (Label::Borrowed("stream"), var("_stm")),
+                                            (Label::Borrowed("n"), var("_n")),
+                                            (Label::Borrowed("first"), var("_first")),
+                                            (
+                                                Label::Borrowed("index"),
+                                                record_proj(var("packed"), "index"),
+                                            ),
+                                        ]),
+                                    )),
+                                ),
+                            ],
                         ),
                     ),
                 ]);
@@ -442,6 +522,7 @@ pub(super) fn resolve(
                     resolve_ref.call_args(vec![
                         var("base"),
                         var("sections"),
+                        var("encrypted"),
                         record_proj(var("packed"), "container"),
                         Expr::U64(0),
                         append(var("resolving"), Expr::Seq(vec![var("obj")])),
@@ -533,7 +614,12 @@ pub(super) fn resolve(
                                 chain(
                                     repeat(Format::ANY_BYTE),
                                     "raw",
-                                    apply_filters(zlib, var("header"), var("raw")),
+                                    apply_filters(
+                                        zlib,
+                                        var("header"),
+                                        var("raw"),
+                                        var("encrypted"),
+                                    ),
                                 ),
                             ),
                             any_ws,
@@ -582,8 +668,8 @@ mod tests {
     use crate::pdf::combinators::only;
     use crate::pdf::lexical::{any_ws, comment, eol, simple_eol};
     use crate::pdf::test_support::{Ent, HELLO_Z, Obj, build_objects, objstm_pdf};
-    use crate::pdf::top_formats;
     use crate::pdf::value::{natural, number, pdf_value, v_name};
+    use crate::pdf::{TopFormats, top_formats};
 
     /// `pdf.stream` accepts a dict followed by `stream`, an EOL, and a body running up to
     /// `endstream`, and rejects a non-dict value.
@@ -634,8 +720,75 @@ mod tests {
         /// a value of this kind (`pdf.value` variant)
         Kind(&'static str),
         StreamOk(&'static [u8]),
-        Unsupported(&'static [u8]),
+        /// `unsupported`, naming this filter, with the raw body
+        Unsupported(&'static [u8], &'static [u8]),
+        /// `encrypted`, with this raw body
+        Encrypted(&'static [u8]),
+        /// `packed`, left to the host, at this index of a container with this raw body
+        LeftPacked(u64),
         Fails,
+    }
+
+    /// Succeeds if the stream `d` (a `pdf.resolve_ref` result) has an `unsupported` body
+    /// naming `filter`, with the raw body `raw`
+    fn unsupported_is(d: &Expr, filter: &[u8], raw: &[u8]) -> Format {
+        let eq = |e: Expr, b: &[u8]| {
+            expr_match(
+                e,
+                [
+                    (pattern_bytestring(b), Expr::Bool(true)),
+                    (Pattern::Wildcard, Expr::Bool(false)),
+                ],
+            )
+        };
+        fmt_match(
+            d.clone(),
+            [
+                (
+                    Pattern::Variant("stream".into(), Box::new(bind("s"))),
+                    fmt_match(
+                        record_proj(var("s"), "body"),
+                        [
+                            (
+                                Pattern::Variant("unsupported".into(), Box::new(bind("u"))),
+                                if_then_else(
+                                    and(
+                                        eq(record_proj(var("u"), "filter"), filter),
+                                        eq(record_proj(var("u"), "raw"), raw),
+                                    ),
+                                    Format::EMPTY,
+                                    Format::Fail,
+                                ),
+                            ),
+                            (Pattern::Wildcard, Format::Fail),
+                        ],
+                    ),
+                ),
+                (Pattern::Wildcard, Format::Fail),
+            ],
+        )
+    }
+
+    /// Succeeds if `d` (a `pdf.resolve_ref` result) is `packed`, at `index` of a container
+    /// with `/N` `n`
+    fn packed_is(d: &Expr, index: u64, n: u64) -> Format {
+        fmt_match(
+            d.clone(),
+            [
+                (
+                    Pattern::Variant("packed".into(), Box::new(bind("p"))),
+                    if_then_else(
+                        and(
+                            expr_eq(record_proj(var("p"), "index"), Expr::U64(index)),
+                            expr_eq(record_proj(var("p"), "n"), Expr::U64(n)),
+                        ),
+                        Format::EMPTY,
+                        Format::Fail,
+                    ),
+                ),
+                (Pattern::Wildcard, Format::Fail),
+            ],
+        )
     }
 
     /// `pdf.resolve_ref` follows the DaeDaLus host: the newest entry decides; a missing, free
@@ -714,22 +867,28 @@ mod tests {
                 &base,
                 (9, 0),
                 8,
-                Unsupported(b"/DCTDecode"),
+                Unsupported(b"/DCTDecode", b"hello"),
             ),
             (
                 "an unsupported predictor",
                 &base,
                 (10, 0),
                 8,
-                Unsupported(b"/FlateDecode (with params)"),
+                Unsupported(b"/FlateDecode (with params)", b"hello"),
             ),
-            ("two filters", &base, (11, 0), 8, Unsupported(b"/LZWDecode")),
+            (
+                "two filters",
+                &base,
+                (11, 0),
+                8,
+                Unsupported(b"/LZWDecode", b"hello"),
+            ),
             (
                 "two filters, the first /FlateDecode",
                 &base,
                 (19, 0),
                 8,
-                Unsupported(b"/FlateDecode"),
+                Unsupported(b"/FlateDecode", b"hello"),
             ),
             ("a /Length that is itself", &base, (12, 0), 8, Fails),
             ("a /Length that is a stream", &base, (13, 0), 8, Fails),
@@ -759,7 +918,11 @@ mod tests {
             ),
         ];
         let mut module = FormatModule::new();
-        let [_pdf_main, pdf_cos, resolve_ref] = top_formats(&mut module);
+        let TopFormats {
+            cos: pdf_cos,
+            resolve_ref,
+            ..
+        } = top_formats(&mut module);
         for (name, input, (obj, gen_), lim, expected) in cases {
             let value = |p: Pattern| Pattern::Variant("value".into(), Box::new(p));
             let body = |p: Pattern| {
@@ -812,13 +975,8 @@ mod tests {
                     )),
                     true,
                 ),
-                Unsupported(b) => (
-                    body(Pattern::Variant(
-                        "unsupported".into(),
-                        Box::new(pattern_bytestring(b)),
-                    )),
-                    true,
-                ),
+                Unsupported(filter, raw) => (unsupported_is(&var("d"), filter, raw), true),
+                Encrypted(_) | LeftPacked(_) => unreachable!(),
                 Fails => (Format::EMPTY, false),
             };
             let top = chain(
@@ -828,6 +986,7 @@ mod tests {
                     resolve_ref.call_args(vec![
                         record_proj(var("cos"), "header_offset"),
                         record_proj(var("cos"), "sections"),
+                        Expr::Bool(false),
                         Expr::U64(obj),
                         Expr::U64(gen_),
                         Expr::Seq(vec![]),
@@ -842,6 +1001,135 @@ mod tests {
                 prog.run(ReadCtxt::new(input)).is_ok(),
                 ok,
                 "{name}: resolving {obj} {gen_} in {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// In an `encrypted` file, `pdf.resolve_ref` leaves every stream's body to the host as
+    /// `encrypted` (its raw bytes, no filter applied), except a `/Type /XRef` stream's, which
+    /// DaeDaLus doesn't decrypt; values are unaffected, and an object packed in an (encrypted)
+    /// object stream is `packed`. Each case resolves `(number, 0)` with `encrypted` set.
+    #[test]
+    fn resolve_ref_encrypted() {
+        use Obj::*;
+        use Resolved::*;
+        let dict = |extra: &str| {
+            format!(
+                "<< /Length {} /Filter /FlateDecode{extra} >>\nstream\n",
+                HELLO_Z.len()
+            )
+        };
+        let flate = |extra: &str| -> &'static [u8] {
+            [dict(extra).as_bytes(), HELLO_Z, b"\nendstream"]
+                .concat()
+                .leak()
+        };
+        let base: Vec<u8> = build_objects(&[&[
+            (1, 0, Def(b"<< /Type /Catalog >>")),
+            (2, 0, Def(b"<< /Length 5 >>\nstream\nhello\nendstream")),
+            (3, 0, Def(flate(""))),
+            (4, 0, Def(flate(" /Type /XRef"))),
+            (5, 0, Def(flate(" /Type /ObjStm"))),
+        ]]);
+        let packed = objstm_pdf(
+            "/Type /ObjStm /N 2",
+            "1 0 2 21 ",
+            "<< /Type /Catalog >> 42",
+            None,
+            &[
+                Ent::Free,
+                Ent::Packed(5, 0),
+                Ent::Packed(5, 1),
+                Ent::Free,
+                Ent::Free,
+                Ent::At(5),
+            ],
+        );
+        let cases: Vec<(&str, &[u8], u64, Resolved)> = vec![
+            ("a value", &base, 1, Kind("dict")),
+            ("an unfiltered stream", &base, 2, Encrypted(b"hello")),
+            ("a /FlateDecode stream", &base, 3, Encrypted(HELLO_Z)),
+            (
+                "a /Type /XRef stream",
+                &base,
+                4,
+                StreamOk(b"hello hello hello hello"),
+            ),
+            ("a /Type /ObjStm stream", &base, 5, Encrypted(HELLO_Z)),
+            ("a packed object", &packed, 2, LeftPacked(1)),
+        ];
+        let mut module = FormatModule::new();
+        let TopFormats {
+            cos: pdf_cos,
+            resolve_ref,
+            ..
+        } = top_formats(&mut module);
+        for (name, input, obj, expected) in cases {
+            let body = |p: Pattern| {
+                fmt_match(
+                    var("d"),
+                    [
+                        (
+                            Pattern::Variant("stream".into(), Box::new(bind("s"))),
+                            fmt_match(
+                                record_proj(var("s"), "body"),
+                                [(p, Format::EMPTY), (Pattern::Wildcard, Format::Fail)],
+                            ),
+                        ),
+                        (Pattern::Wildcard, Format::Fail),
+                    ],
+                )
+            };
+            let check = match &expected {
+                Kind(kind) => fmt_match(
+                    var("d"),
+                    [
+                        (
+                            Pattern::Variant(
+                                "value".into(),
+                                Box::new(Pattern::Variant(
+                                    (*kind).into(),
+                                    Box::new(Pattern::Wildcard),
+                                )),
+                            ),
+                            Format::EMPTY,
+                        ),
+                        (Pattern::Wildcard, Format::Fail),
+                    ],
+                ),
+                Encrypted(b) => body(Pattern::Variant(
+                    "encrypted".into(),
+                    Box::new(pattern_bytestring(b)),
+                )),
+                StreamOk(b) => body(Pattern::Variant(
+                    "ok".into(),
+                    Box::new(pattern_bytestring(b)),
+                )),
+                LeftPacked(index) => packed_is(&var("d"), *index, 2),
+                _ => unreachable!(),
+            };
+            let top = chain(
+                pdf_cos.call(),
+                "cos",
+                chain(
+                    resolve_ref.call_args(vec![
+                        record_proj(var("cos"), "header_offset"),
+                        record_proj(var("cos"), "sections"),
+                        Expr::Bool(true),
+                        Expr::U64(obj),
+                        Expr::U64(0),
+                        Expr::Seq(vec![]),
+                        Expr::U64(8),
+                    ]),
+                    "d",
+                    check,
+                ),
+            );
+            let prog = Compiler::compile_program(&module, &top).expect("must compile");
+            assert!(
+                prog.run(ReadCtxt::new(input)).is_ok(),
+                "{name}: resolving {obj} 0 in {:?}",
                 String::from_utf8_lossy(input)
             );
         }
@@ -964,9 +1252,21 @@ mod tests {
                 Fails,
             ),
             (
-                "a container with an unsupported filter",
+                "a container with an unsupported filter, left to the host",
                 objstm_pdf(
                     "/Type /ObjStm /N 2 /Filter /LZWDecode",
+                    INDEX,
+                    VALUES,
+                    None,
+                    &packed(),
+                ),
+                2,
+                LeftPacked(1),
+            ),
+            (
+                "a container with an unsupported filter that isn't /Type /ObjStm",
+                objstm_pdf(
+                    "/Type /XObject /N 2 /Filter /LZWDecode",
                     INDEX,
                     VALUES,
                     None,
@@ -977,7 +1277,11 @@ mod tests {
             ),
         ];
         let mut module = FormatModule::new();
-        let [_pdf_main, pdf_cos, resolve_ref] = top_formats(&mut module);
+        let TopFormats {
+            cos: pdf_cos,
+            resolve_ref,
+            ..
+        } = top_formats(&mut module);
         for (name, input, obj, expected) in cases {
             let is = |p: Pattern| {
                 fmt_match(
@@ -1003,6 +1307,7 @@ mod tests {
                     )),
                     true,
                 ),
+                LeftPacked(index) => (packed_is(&var("d"), *index, 2), true),
                 Fails => (Format::EMPTY, false),
                 _ => unreachable!(),
             };
@@ -1013,6 +1318,7 @@ mod tests {
                     resolve_ref.call_args(vec![
                         record_proj(var("cos"), "header_offset"),
                         record_proj(var("cos"), "sections"),
+                        Expr::Bool(false),
                         Expr::U64(obj),
                         Expr::U64(0),
                         Expr::Seq(vec![]),

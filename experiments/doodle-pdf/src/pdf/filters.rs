@@ -1,6 +1,8 @@
 //! Stream filters: DaeDaLus `ApplyFilters` and `FlateDecode` (`PdfDecl.ddl`), with PNG predictors.
 
-use doodle::{BaseType, Expr, Format, FormatRef, Label, Pattern, ValueType, helper::*};
+use doodle::{
+    BaseType, Expr, Format, FormatModule, FormatRef, Label, Pattern, ValueType, helper::*,
+};
 use doodle_numexpr_macro::numexpr;
 
 use super::value::{dict_lookup, lookup_nat_or};
@@ -229,10 +231,19 @@ fn flate_decode(zlib: FormatRef, params: Expr, body: Expr) -> Format {
     )
 }
 
-/// DaeDaLus `ApplyFilters`, given a stream's dictionary `header` and its raw bytes `raw`:
-/// `ok` with the decoded bytes, or `unsupported` with the name of the filter that can't be
-/// applied (followed by ` (with params)` if it has a `/DecodeParms` entry), as DaeDaLus
-/// `ApplyFilter` gives.
+/// DaeDaLus `ApplyFilters`, given a stream's dictionary `header`, its raw bytes `raw`, and
+/// whether the file is `encrypted` (a `Bool`): one of
+/// - `ok` with the decoded bytes;
+/// - `unsupported`, a record of `filter`, the name of the filter that can't be applied
+///   (followed by ` (with params)` if it has a `/DecodeParms` entry), as DaeDaLus
+///   `ApplyFilter` gives, and `raw`;
+/// - `encrypted` with `raw`, for a stream of an `encrypted` file other than a `/Type /XRef`
+///   one (which DaeDaLus exempts from `Decrypt`); no filter is applied.
+///
+/// `unsupported` and `encrypted` hand the stream to the host, which decrypts `raw` or applies
+/// its filters itself (calling `pdf.flate_decode` for `/FlateDecode`, see
+/// [`host_filter_formats`] and `pdf::host`), in place of the DaeDaLus host primitives
+/// `Decrypt`, `LZWDecode` and so on.
 ///
 /// Of the filters, only `/FlateDecode` with a supported predictor is applied (see
 /// [`flate_decode`]), and only on its own; no filter gives `ok` with `raw`. Unlike DaeDaLus:
@@ -240,41 +251,132 @@ fn flate_decode(zlib: FormatRef, params: Expr, body: Expr) -> Format {
 ///   `/DCTDecode`, which DaeDaLus decodes or passes through;
 /// - a chain of more than one filter is `unsupported`, naming the first, and nothing is
 ///   decoded;
-/// - nothing is decrypted (DaeDaLus decrypts every stream except a `/Type /XRef` one), so an
-///   encrypted file's streams are taken as they are;
-/// - an indirect `/Filter` or `/DecodeParms` isn't resolved, and fails.
+/// - an indirect `/Filter`, `/DecodeParms` or `/Type` isn't resolved; an indirect `/Filter` or
+///   `/DecodeParms` fails.
 ///
 /// A filter that isn't a name, or a `/DecodeParms` that isn't a dict or `null`, fails (DaeDaLus
 /// `Filter`, `FilterParam`), as does a `/FlateDecode` whose data doesn't decode.
-pub(super) fn apply_filters(zlib: FormatRef, header: Expr, raw: Expr) -> Format {
-    // DaeDaLus `LookupOptArray`: absent is `[]`, and a single value is `[value]`
-    let opt_array = |key: &[u8]| {
-        expr_match(
-            dict_lookup(key, header.clone()),
-            [
-                (pat_none(), Expr::Seq(vec![])),
-                (
-                    pat_some(Pattern::Variant("array".into(), Box::new(bind("vs")))),
-                    var("vs"),
-                ),
-                (pat_some(bind("v")), Expr::Seq(vec![var("v")])),
-            ],
-        )
-    };
-    let null = || Pattern::Variant("null".into(), Box::new(Pattern::Wildcard));
-    // DaeDaLus `FilterParam` of the first filter's parameters, which default to `null`
-    let param = fmt_match(
-        index_checked(var("_params"), Expr::U32(0)),
+pub(super) fn apply_filters(zlib: FormatRef, header: Expr, raw: Expr, encrypted: Expr) -> Format {
+    let is_xref = expr_match(
+        dict_lookup(b"Type", header.clone()),
+        [
+            (
+                pat_some(Pattern::Variant(
+                    "name".into(),
+                    Box::new(pattern_bytestring(b"/XRef")),
+                )),
+                Expr::Bool(true),
+            ),
+            (Pattern::Wildcard, Expr::Bool(false)),
+        ],
+    );
+    if_then_else(
+        and(encrypted, expr_not(is_xref)),
+        compute(variant("encrypted", raw.clone())),
+        decode_filters(zlib, header, raw),
+    )
+}
+
+/// DaeDaLus `LookupOptArray` of `key` in the dict `header`: absent is `[]`, and a single value
+/// is `[value]`
+fn opt_array(header: Expr, key: &[u8]) -> Expr {
+    expr_match(
+        dict_lookup(key, header),
+        [
+            (pat_none(), Expr::Seq(vec![])),
+            (
+                pat_some(Pattern::Variant("array".into(), Box::new(bind("vs")))),
+                var("vs"),
+            ),
+            (pat_some(bind("v")), Expr::Seq(vec![var("v")])),
+        ],
+    )
+}
+
+/// DaeDaLus `FilterParam` of a filter's parameters `param` (an `Option` of a `pdf.value`, as
+/// `index_checked` gives it from the `/DecodeParms` array, where absent is `null`): `Some` of
+/// a dict, or `None` for `null`; anything else fails.
+fn filter_param(param: Expr) -> Format {
+    let null = Pattern::Variant("null".into(), Box::new(Pattern::Wildcard));
+    fmt_match(
+        param,
         [
             (pat_none(), compute(expr_none())),
-            (pat_some(null()), compute(expr_none())),
+            (pat_some(null), compute(expr_none())),
             (
                 pat_some(Pattern::Variant("dict".into(), Box::new(bind("d")))),
                 compute(expr_some(var("d"))),
             ),
             (Pattern::Wildcard, Format::Fail), // "bad /DecodeParms"
         ],
+    )
+}
+
+/// The formats the host calls when a stream is left to it (see `pdf::host`), both taking
+/// `pdf.value`s as its `resolve_ref` results hold them:
+/// - `pdf.filter_chain`: given `val`, a stream's dictionary (a dict), the record of its
+///   `filters` and `params` (DaeDaLus `LookupOptArray` of `/Filter` and `/DecodeParms`), for
+///   the host to apply in order;
+/// - `pdf.flate_decode`: given `param` (an `Option` of a `pdf.value`, as for `filter_param`)
+///   and `bytes`, DaeDaLus `FlateDecode` of `bytes` (see [`flate_decode`]), which fails for
+///   an unsupported predictor.
+pub(super) fn host_filter_formats(
+    module: &mut FormatModule,
+    zlib: FormatRef,
+    value_type: ValueType,
+) -> [FormatRef; 2] {
+    let filter_chain = module.define_format_args(
+        "pdf.filter_chain",
+        vec![(Label::Borrowed("val"), value_type.clone())],
+        fmt_match(
+            var("val"),
+            [
+                (
+                    Pattern::Variant("dict".into(), Box::new(bind("header"))),
+                    compute(Expr::Record(vec![
+                        (
+                            Label::Borrowed("filters"),
+                            opt_array(var("header"), b"Filter"),
+                        ),
+                        (
+                            Label::Borrowed("params"),
+                            opt_array(var("header"), b"DecodeParms"),
+                        ),
+                    ])),
+                ),
+                (Pattern::Wildcard, Format::Fail), // "not a dict"
+            ],
+        ),
     );
+    let flate = module.define_format_args(
+        "pdf.flate_decode",
+        vec![
+            (
+                Label::Borrowed("param"),
+                ValueType::Option(Box::new(value_type)),
+            ),
+            (
+                Label::Borrowed("bytes"),
+                ValueType::Seq(Box::new(ValueType::Base(BaseType::U8))),
+            ),
+        ],
+        chain(
+            filter_param(var("param")),
+            "_param",
+            chain(
+                compute(flate_decode_params(var("_param"))),
+                "_fp",
+                flate_decode(zlib, var("_fp"), var("bytes")),
+            ),
+        ),
+    );
+    [filter_chain, flate]
+}
+
+/// [`apply_filters`] of a stream that isn't to be decrypted
+fn decode_filters(zlib: FormatRef, header: Expr, raw: Expr) -> Format {
+    // DaeDaLus `FilterParam` of the first filter's parameters, which default to `null`
+    let param = filter_param(index_checked(var("_params"), Expr::U32(0)));
     let name = fmt_match(
         index_unchecked(var("_filters"), Expr::U32(0)),
         [
@@ -289,16 +391,22 @@ pub(super) fn apply_filters(zlib: FormatRef, header: Expr, raw: Expr) -> Format 
         let with_params = b" (with params)".iter().map(|b| Expr::U8(*b)).collect();
         compute(variant(
             "unsupported",
-            expr_match(
-                var("_param"),
-                [
-                    (pat_none(), var("_name")),
-                    (
-                        Pattern::Wildcard,
-                        append(var("_name"), Expr::Seq(with_params)),
+            Expr::Record(vec![
+                (
+                    Label::Borrowed("filter"),
+                    expr_match(
+                        var("_param"),
+                        [
+                            (pat_none(), var("_name")),
+                            (
+                                Pattern::Wildcard,
+                                append(var("_name"), Expr::Seq(with_params)),
+                            ),
+                        ],
                     ),
-                ],
-            ),
+                ),
+                (Label::Borrowed("raw"), raw.clone()),
+            ]),
         ))
     };
     let lone_flate = and(
@@ -324,15 +432,15 @@ pub(super) fn apply_filters(zlib: FormatRef, header: Expr, raw: Expr) -> Format 
         ),
     );
     chain(
-        compute(opt_array(b"Filter")),
+        compute(opt_array(header.clone(), b"Filter")),
         "_filters",
         chain(
-            compute(opt_array(b"DecodeParms")),
+            compute(opt_array(header, b"DecodeParms")),
             "_params",
             fmt_match(
                 var("_filters"),
                 [
-                    (Pattern::Seq(vec![]), compute(variant("ok", raw))),
+                    (Pattern::Seq(vec![]), compute(variant("ok", raw.clone()))),
                     (
                         Pattern::Wildcard,
                         chain(

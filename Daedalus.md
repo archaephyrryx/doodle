@@ -290,3 +290,19 @@ implementation is supplied by the host. The PDF specifications use them for `Res
 `Format` or `Expr`. `FlateDecode` is within reach because deflate/zlib are written as `doodle` formats
 (`doodle-formats/src/format/{deflate,zlib}.rs`) and can be applied with `DecodeBytes`. The others would
 have to be written out in the grammar (LZW, in principle), or are out of reach in practice (decryption).
+
+The PDF prototype (`experiments/doodle-pdf`) handles them without a grammar extension, by deferring to
+a second, host-driven pass, as the OpenType formats do for offsets (`Phantom` reads relative to a view,
+parsed later by `generated/api_helper/otf_metrics.rs`). Where DaeDaLus would call a primitive, the
+grammar gives a handle instead:
+
+- a stream body that is `encrypted` (in a file whose trailer has `/Encrypt`, other than a `/Type /XRef`
+  stream) or `unsupported` (a filter other than a lone `/FlateDecode`), with its raw bytes;
+- a `packed` object, when its object stream's body is one of those: the container's number and stream,
+  its `/N` and `/First`, and the object's index.
+
+The host decrypts or decodes the bytes and calls back into the grammar for the rest: `pdf.flate_decode`
+for each `/FlateDecode` in the filter chain (read with `pdf.filter_chain`), and `pdf.obj_stream_entry`
+for a packed object (`src/pdf/host.rs`, with `LZWDecode` written in Rust). This can't serve a primitive
+that the first pass itself needs: an object packed in an encrypted object stream can be read by the
+host, but not used during the parse (e.g. as an indirect `/Length`), where it fails.
