@@ -86,6 +86,7 @@ pub(super) fn pdf_cos(pm: &mut PdfModule<'_>) -> FormatRef {
                     var("header_offset"),
                     var("startxref"),
                     Expr::Seq(vec![]),
+                    Expr::Seq(vec![]),
                     Expr::U64(64),
                 ]),
             ),

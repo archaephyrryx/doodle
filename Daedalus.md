@@ -275,12 +275,25 @@ to `Format::Permit`. The PDF prototype (`experiments/doodle-pdf`) also uses them
 
 DaeDaLus PDF specifications resolve indirect references (`n g R`) on demand, through the host primitive
 `ResolveRef` (`formats/pdf/new/pdf-cos-spec/PdfDecl.ddl`): any lookup into a dictionary may jump
-to an arbitrary object elsewhere in the file, and references may form cycles. `doodle` can only
-resolve eagerly: parse the cross-reference table first, pass it as an argument, and parse the target
-object at its offset with `WithRelativeOffset`. Recursion depth must be bounded explicitly (e.g. a `lim`
-argument), and cycles cannot be handled. A reference whose resolution depends on the structure being
-parsed (e.g. an xref stream whose own `/Length` is an indirect reference into that same xref stream)
-cannot be resolved at all.
+to an arbitrary object elsewhere in the file. The host (`c++/pdfcos/src/state.cpp`) registers each object
+as a thunk at its offset, parses it the first time it is asked for, and keeps the result; asking for an
+object that is still being parsed fails (a cycle), and asking for one with no entry, or of another
+generation, gives `nothing`, which `ResolveDeclRef` turns into `null`.
+
+`doodle` has no parse-level laziness, but explicit resolution gives the same results, apart from the
+memoization. The PDF prototype passes the cross-reference sections as an argument and parses the target
+object at its offset with `WithRelativeOffset`, in a recursive batch (`pdf.resolve_ref`) with a list of
+the objects being resolved (to fail on a cycle, as the host does) and an explicit depth bound. An object
+that is resolved twice is parsed twice.
+
+The host's table is filled as it follows the cross-reference chain: a section's entries are registered
+only after its `/Prev` and then `/XRefStm` links have been followed. So a cross-reference stream sees
+only the entries of the sections registered before it is parsed: none for the newest section (whose
+indirect `/Length` therefore fails, as `null` isn't a number), and for an `/XRefStm` stream (as in a
+hybrid file), the sections of its referrer's `/Prev` chain. `pdf.xref_chain` threads that table through
+the chain, and resolves a stream's indirect entries against it before parsing the stream. A reference
+whose resolution depends on the very structure being parsed (an xref stream whose own `/Length` is an
+object listed in that same stream) fails in DaeDaLus too.
 
 ## External primitives
 

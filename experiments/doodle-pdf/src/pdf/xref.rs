@@ -5,6 +5,7 @@ use doodle_numexpr_macro::numexpr;
 
 use super::PdfModule;
 use super::combinators::{interpret, match_str, void};
+use super::decl::resolve_val;
 use super::filters::apply_filters;
 use super::lexical::{ASCII_CR, ASCII_LF, SIMPLE_WS, decimal_value, kw, read_nat, token};
 use super::value::{
@@ -80,9 +81,13 @@ pub(super) fn cross_ref_section(pm: &mut PdfModule<'_>) -> FormatRef {
 ///
 /// `size` is required and must be a natural number. `root` must be a reference if present.
 /// `prev` and `xrefstm` are `None` if absent or not a natural number, as DaeDaLus `Optional`
-/// gives. DaeDaLus resolves an indirect `/XRefStm`; until #355 that gives `None` here.
-fn trailer_dict(dict: Expr) -> Format {
-    let optional_nat = |key: &[u8]| {
+/// gives.
+///
+/// Only `/XRefStm` is looked up with resolution in DaeDaLus (`LookupNat`), so it is looked up
+/// in `resolved`: `dict` with the [`resolved_entries`] of a cross-reference stream appended,
+/// or `dict` itself.
+fn trailer_dict(dict: Expr, resolved: Expr) -> Format {
+    let optional_nat = |key: &[u8], dict: &Expr| {
         expr_match(
             dict_lookup(key, dict.clone()),
             [
@@ -117,8 +122,8 @@ fn trailer_dict(dict: Expr) -> Format {
                 ],
             ),
         ),
-        ("prev", compute(optional_nat(b"Prev"))),
-        ("xrefstm", compute(optional_nat(b"XRefStm"))),
+        ("prev", compute(optional_nat(b"Prev", &dict))),
+        ("xrefstm", compute(optional_nat(b"XRefStm", &resolved))),
         ("all", compute(dict)),
     ])
 }
@@ -218,8 +223,8 @@ fn xref_entry(widths: Expr) -> Format {
 /// `/Index`, an array of pairs, or if `/Index` is absent or isn't an array of natural
 /// numbers, the single pair `0 /Size`. An `/Index` of odd length fails.
 ///
-/// DaeDaLus resolves an indirect `/Size`, `/Index` or element of it; until #355 that makes
-/// `/Size` fail and `/Index` take its default.
+/// `/Index` and its elements are as [`resolved_entries`] leaves them. An indirect `/Size`
+/// fails, as it does in DaeDaLus, whose `TrailerDict` looks `/Size` up directly.
 fn xref_index(header: Expr) -> Format {
     let u64_seq = ValueType::Seq(Box::new(ValueType::Base(BaseType::U64)));
     // DaeDaLus `LookupNats "Index" header`, as an `Option`
@@ -290,7 +295,7 @@ fn xref_index(header: Expr) -> Format {
 /// of the fields of an entry (from `/W`, `0` for any it doesn't give), and the `width` of a
 /// whole entry, the sum of all of `/W`. `/W` must be an array of natural numbers.
 ///
-/// DaeDaLus resolves an indirect `/W`; until #355 that fails here.
+/// `/W` is as [`resolved_entries`] leaves it; its elements aren't resolved (DaeDaLus `NatValue`).
 fn xref_widths(header: Expr) -> Format {
     let b = |i: u32| {
         compute(expr_option_map_or(
@@ -364,36 +369,30 @@ fn xref_stream_filters(zlib: FormatRef, header: Expr, raw: Expr) -> Format {
 ///
 /// As DaeDaLus `StreamBody` does, the body is the `/Length` bytes after the `stream` line,
 /// decoded by [`xref_stream_filters`], and the table is read from the decoded bytes, ignoring
-/// any after the last entry. DaeDaLus resolves an indirect `/Length`; until #355 that fails.
+/// any after the last entry.
+///
+/// It takes `extra`, the [`resolved_entries`] of its dictionary, which are appended to the
+/// dictionary (where they take precedence, see [`dict_lookup`]) for the lookups that DaeDaLus
+/// resolves: `/Length`, `/Filter`, `/DecodeParms`, `/Type`, `/Index`, `/W` and the trailer's
+/// `/XRefStm`. The trailer's other entries are looked up in the dictionary as written.
 pub(super) fn xref_obj(pm: &mut PdfModule<'_>) -> FormatRef {
     let any_ws = pm.any_ws();
     let simple_eol = pm.simple_eol();
     let natural = pm.natural();
     let pdf_value = pm.pdf_value();
+    let pdf_dict = pm.pdf_dict();
+    let dict_type = pm.format_type(pdf_dict);
     let zlib = pm.zlib();
     let module = pm.module();
-    let header = || var("_header");
-    module.define_format(
+    let header = || var("_rheader");
+    module.define_format_args(
         "pdf.xref_obj",
+        vec![(Label::Borrowed("extra"), dict_type)],
         record_auto([
-            // DaeDaLus `TopDecl`, which must be a `stream`
-            ("__ws", repeat(any_ws.call())),
-            ("__id", token(natural_u64(natural), any_ws)),
-            ("__gen", token(natural_u64(natural), any_ws)),
-            ("__kw_obj", kw(b"obj", any_ws)),
-            ("_val", pdf_value.call_args(vec![Expr::U64(32)])),
+            ("_header", stream_object_dict(any_ws, natural, pdf_value)),
             (
-                "_header",
-                fmt_match(
-                    var("_val"),
-                    [
-                        (
-                            Pattern::Variant("dict".into(), Box::new(bind("d"))),
-                            compute(var("d")),
-                        ),
-                        (Pattern::Wildcard, Format::Fail), // "not a stream"
-                    ],
-                ),
+                "_rheader",
+                compute(concat(Expr::Seq(vec![var("_header"), var("extra")]))),
             ),
             ("__kw_stream", match_str(b"stream")),
             ("__eol", simple_eol.call()),
@@ -449,20 +448,157 @@ pub(super) fn xref_obj(pm: &mut PdfModule<'_>) -> FormatRef {
                     ),
                 ),
             ),
-            ("trailer", trailer_dict(header())),
+            ("trailer", trailer_dict(var("_header"), header())),
         ]),
+    )
+}
+
+/// DaeDaLus `TopDecl` up to the dictionary of a stream object: whitespace, `n g obj`, and the
+/// value, which must be a dict (anything else fails, "not a stream"). The numbers aren't
+/// checked.
+fn stream_object_dict(any_ws: FormatRef, natural: FormatRef, pdf_value: FormatRef) -> Format {
+    map(
+        record_auto([
+            ("__ws", repeat(any_ws.call())),
+            ("__id", token(natural_u64(natural), any_ws)),
+            ("__gen", token(natural_u64(natural), any_ws)),
+            ("__kw_obj", kw(b"obj", any_ws)),
+            ("_val", pdf_value.call_args(vec![Expr::U64(32)])),
+            (
+                "dict",
+                fmt_match(
+                    var("_val"),
+                    [
+                        (
+                            Pattern::Variant("dict".into(), Box::new(bind("d"))),
+                            compute(var("d")),
+                        ),
+                        (Pattern::Wildcard, Format::Fail), // "not a stream"
+                    ],
+                ),
+            ),
+        ]),
+        lambda("h", record_proj(var("h"), "dict")),
+    )
+}
+
+/// The entries of the dictionary `header` (of a cross-reference stream, a `pdf.value.dict`
+/// result) that DaeDaLus looks up with resolution, resolved by `resolve` (see [`xref_chain`]),
+/// as dictionary entries to append to `header`. A key that `header` lacks gives no entry.
+///
+/// As in DaeDaLus:
+/// - `/Length`, `/W` and `/Type` are resolved (`LookupResolve`), and a failure fails;
+/// - `/Index` is resolved, then each element of it if it is an array (`LookupNats`), and a
+///   failure gives `null`, for which [`xref_index`] takes its default (`Default`);
+/// - `/Filter` and `/DecodeParms` are resolved, and a failure gives `[]` (`LookupOptArray`'s
+///   `Default []`);
+/// - the trailer's `/XRefStm` is resolved, and a failure gives `null`, which [`trailer_dict`]
+///   takes as no link (`Optional`).
+///
+/// An object that isn't in the table resolves to `null`, as in DaeDaLus, and the lookup then
+/// fails or takes its default as it would for a `null` written in place.
+fn resolved_entries(resolve: &dyn Fn(Expr) -> Format, header: Expr) -> Format {
+    enum Fallback {
+        None,
+        Null,
+        EmptyArray,
+    }
+    let keys: [(&[u8], Fallback); 7] = [
+        (b"Length", Fallback::None),
+        (b"W", Fallback::None),
+        (b"Type", Fallback::None),
+        (b"Index", Fallback::Null),
+        (b"Filter", Fallback::EmptyArray),
+        (b"DecodeParms", Fallback::EmptyArray),
+        (b"XRefStm", Fallback::Null),
+    ];
+    let fields = keys.into_iter().map(|(key, fallback)| {
+        let resolved = if key == b"Index" {
+            chain(
+                resolve(var("_xv")),
+                "_xi",
+                fmt_match(
+                    var("_xi"),
+                    [
+                        (
+                            Pattern::Variant("array".into(), Box::new(bind("_xis"))),
+                            map(
+                                for_each(var("_xis"), "_xe", resolve(var("_xe"))),
+                                lambda("_xes", variant("array", var("_xes"))),
+                            ),
+                        ),
+                        (Pattern::Wildcard, compute(var("_xi"))),
+                    ],
+                ),
+            )
+        } else {
+            resolve(var("_xv"))
+        };
+        let resolved = match fallback {
+            Fallback::None => resolved,
+            Fallback::Null => union_nondet([resolved, compute(variant("null", Expr::UNIT))]),
+            Fallback::EmptyArray => {
+                union_nondet([resolved, compute(variant("array", Expr::Seq(vec![])))])
+            }
+        };
+        let name = [b"/", key].concat();
+        let label = format!("x_{}", String::from_utf8_lossy(key));
+        (
+            label,
+            fmt_match(
+                dict_lookup(key, header.clone()),
+                [
+                    (
+                        pat_some(bind("_xv")),
+                        fmt_some(map(
+                            resolved,
+                            lambda(
+                                "_xr",
+                                Expr::Record(vec![
+                                    (Label::Borrowed("key"), expr_lift_seq(name, Expr::U8)),
+                                    (Label::Borrowed("value"), var("_xr")),
+                                ]),
+                            ),
+                        )),
+                    ),
+                    (pat_none(), fmt_none()),
+                ],
+            ),
+        )
+    });
+    let fields: Vec<(String, Format)> = fields.collect();
+    let labels: Vec<String> = fields.iter().map(|(l, _)| l.clone()).collect();
+    map(
+        record_auto(fields),
+        lambda(
+            "_xs",
+            concat(Expr::Seq(
+                labels
+                    .iter()
+                    .map(|l| {
+                        expr_option_map_or(
+                            Expr::Seq(vec![]),
+                            |e| Expr::Seq(vec![e]),
+                            record_proj(var("_xs"), l.clone()),
+                        )
+                    })
+                    .collect(),
+            )),
+        ),
     )
 }
 
 /// DaeDaLus `CrossRef`: the cross-reference section found at an offset, either `old_xref`
 /// (`CrossRefAndTrailer`: an `xref` table, then `trailer` and its dict) or `new_xref` (a
-/// cross-reference stream, [`xref_obj`]), trying them in that order (DaeDaLus `First`).
+/// cross-reference stream, [`xref_obj`], which gets `extra`), trying them in that order
+/// (DaeDaLus `First`).
 pub(super) fn cross_ref(pm: &mut PdfModule<'_>) -> FormatRef {
     let any_ws = pm.any_ws();
     let eol = pm.eol();
     let xref_table = pm.cross_ref_section();
     let pdf_dict = pm.pdf_dict();
     let xref_obj = xref_obj(pm);
+    let dict_type = pm.format_type(pdf_dict);
     let module = pm.module();
     let just_white = union([void(byte_in(SIMPLE_WS)), eol.call()]);
     let old_xref = record_auto([
@@ -472,11 +608,15 @@ pub(super) fn cross_ref(pm: &mut PdfModule<'_>) -> FormatRef {
         ("__ws", repeat(just_white)),
         ("__kw_trailer", kw(b"trailer", any_ws)),
         ("_dict", pdf_dict.call_args(vec![Expr::U64(32)])),
-        ("trailer", trailer_dict(var("_dict"))),
+        ("trailer", trailer_dict(var("_dict"), var("_dict"))),
     ]);
-    module.define_format(
+    module.define_format_args(
         "pdf.cross_ref",
-        alts_nondet([("old_xref", old_xref), ("new_xref", xref_obj.call())]),
+        vec![(Label::Borrowed("extra"), dict_type)],
+        alts_nondet([
+            ("old_xref", old_xref),
+            ("new_xref", xref_obj.call_args(vec![var("extra")])),
+        ]),
     )
 }
 
@@ -492,8 +632,22 @@ pub(super) fn cross_ref(pm: &mut PdfModule<'_>) -> FormatRef {
 ///
 /// `lim` bounds the depth of the links followed; the visited check alone already guarantees
 /// termination, so `lim` only guards against a very long chain overflowing the stack.
+///
+/// `table` is what the host's object table holds when the section is parsed (in precedence
+/// order, as `sections`), against which a cross-reference stream's [`resolved_entries`] are
+/// resolved (with `pdf.resolve_ref`, as unencrypted). The host registers a section's entries
+/// only after following its links, and follows `/Prev` before `/XRefStm`, so `table` is empty
+/// for the newest section, a `/Prev` section gets its referrer's `table`, and an `/XRefStm`
+/// section gets its referrer's `/Prev` sections ahead of its referrer's `table`. Only an
+/// `/XRefStm` stream (as in a hybrid file) can resolve a reference, then; elsewhere every
+/// reference is to an object that isn't in the table yet, and resolves to `null`.
 pub(super) fn xref_chain(pm: &mut PdfModule<'_>) -> FormatRef {
+    let any_ws = pm.any_ws();
+    let natural = pm.natural();
+    let pdf_value = pm.pdf_value();
     let cross_ref = pm.cross_ref();
+    let resolve_ref = pm.resolve_ref();
+    let sections_type = ValueType::Seq(Box::new(pm.format_type(cross_ref)));
     let module = pm.module();
     let u64_type = || ValueType::Base(BaseType::U64);
     let args = vec![
@@ -503,14 +657,51 @@ pub(super) fn xref_chain(pm: &mut PdfModule<'_>) -> FormatRef {
             Label::Borrowed("visited"),
             ValueType::Seq(Box::new(u64_type())),
         ),
+        (Label::Borrowed("table"), sections_type),
         (Label::Borrowed("lim"), u64_type()),
     ];
+    let resolve = move |v: Expr| {
+        resolve_val(
+            resolve_ref,
+            [
+                var("base"),
+                var("table"),
+                Expr::Bool(false),
+                Expr::Seq(vec![]),
+                Expr::U64(256),
+            ],
+            v,
+        )
+    };
+    // The `resolved_entries` of the cross-reference stream at `offset`, or none if there isn't
+    // one there (such as a classic section)
+    let extra = chain(
+        with_relative_offset(
+            Some(var("base")),
+            var("offset"),
+            union_nondet([
+                fmt_some(stream_object_dict(any_ws, natural, pdf_value)),
+                fmt_none(),
+            ]),
+        ),
+        "_stm_dict",
+        fmt_match(
+            var("_stm_dict"),
+            [
+                (
+                    pat_some(bind("_hdr")),
+                    resolved_entries(&resolve, var("_hdr")),
+                ),
+                (pat_none(), compute(Expr::Seq(vec![]))),
+            ],
+        ),
+    );
     let [chain_ref] = module.define_batch_with_args(
         [("pdf.xref_chain", args)],
         [Box::new(move |&[xref_chain]: &[FormatRef; 1]| {
-            // Follows `link` (an `Option` of an offset) with the visited offsets `visited`, or
-            // yields no sections if there is no link.
-            let follow = |link: Expr, visited: Expr| {
+            // Follows `link` (an `Option` of an offset) with the visited offsets `visited` and
+            // the object table `table`, or yields no sections if there is no link.
+            let follow = |link: Expr, visited: Expr, table: Expr| {
                 fmt_match(
                     link,
                     [
@@ -520,6 +711,7 @@ pub(super) fn xref_chain(pm: &mut PdfModule<'_>) -> FormatRef {
                                 var("base"),
                                 var("next"),
                                 visited.clone(),
+                                table,
                                 sub(var("lim"), Expr::U64(1)),
                             ]),
                         ),
@@ -542,31 +734,43 @@ pub(super) fn xref_chain(pm: &mut PdfModule<'_>) -> FormatRef {
                 ),
                 Format::Fail,
                 chain(
-                    with_relative_offset(Some(var("base")), var("offset"), cross_ref.call()),
-                    "section",
+                    extra,
+                    "_extra",
                     chain(
-                        follow(record_proj(trailer(), "prev"), visited_here()),
-                        "prev",
+                        with_relative_offset(
+                            Some(var("base")),
+                            var("offset"),
+                            cross_ref.call_args(vec![var("_extra")]),
+                        ),
+                        "section",
                         chain(
-                            follow(
-                                record_proj(trailer(), "xrefstm"),
-                                record_proj(var("prev"), "visited"),
-                            ),
-                            "xrefstm",
-                            compute(Expr::Record(vec![
-                                (
-                                    Label::Borrowed("sections"),
+                            follow(record_proj(trailer(), "prev"), visited_here(), var("table")),
+                            "prev",
+                            chain(
+                                follow(
+                                    record_proj(trailer(), "xrefstm"),
+                                    record_proj(var("prev"), "visited"),
                                     concat(Expr::Seq(vec![
-                                        Expr::Seq(vec![var("section")]),
-                                        record_proj(var("xrefstm"), "sections"),
                                         record_proj(var("prev"), "sections"),
+                                        var("table"),
                                     ])),
                                 ),
-                                (
-                                    Label::Borrowed("visited"),
-                                    record_proj(var("xrefstm"), "visited"),
-                                ),
-                            ])),
+                                "xrefstm",
+                                compute(Expr::Record(vec![
+                                    (
+                                        Label::Borrowed("sections"),
+                                        concat(Expr::Seq(vec![
+                                            Expr::Seq(vec![var("section")]),
+                                            record_proj(var("xrefstm"), "sections"),
+                                            record_proj(var("prev"), "sections"),
+                                        ])),
+                                    ),
+                                    (
+                                        Label::Borrowed("visited"),
+                                        record_proj(var("xrefstm"), "visited"),
+                                    ),
+                                ])),
+                            ),
                         ),
                     ),
                 ),
@@ -933,7 +1137,7 @@ mod tests {
                 None,
             ),
             (
-                "an indirect /Length (until #355)",
+                "an indirect /Length in the newest section (an empty table)",
                 one(&format!("{W121} /Length 5 0 R"), &rows(&[1, 2, 1], four)),
                 None,
             ),
@@ -1037,6 +1241,172 @@ mod tests {
                                             entries.clone(),
                                         ),
                                     ),
+                                    record_proj(var("x"), "xref"),
+                                ),
+                            ),
+                        ),
+                    ],
+                ),
+            ),
+            record_proj(var("cos"), "sections"),
+        );
+        for (name, input, expected) in cases {
+            let check = match &expected {
+                Some(out) => fmt_match(
+                    summary.clone(),
+                    [
+                        (
+                            Pattern::Seq(out.iter().map(|n| Pattern::U64(*n)).collect()),
+                            Format::EMPTY,
+                        ),
+                        (Pattern::Wildcard, Format::Fail),
+                    ],
+                ),
+                None => Format::EMPTY,
+            };
+            let top = chain(pdf_cos.call(), "cos", check);
+            let prog = Compiler::compile_program(&module, &top).expect("must compile");
+            assert_eq!(
+                prog.run(ReadCtxt::new(&input)).is_ok(),
+                expected.is_some(),
+                "{name}: expecting {expected:?} from {:?}",
+                String::from_utf8_lossy(&input)
+            );
+        }
+    }
+
+    /// A hybrid file: the objects `objs` (number and text), a classic section listing them
+    /// (`/Size 10`), a cross-reference stream `9 0` (its dictionary `/Size 3` and `dict`, with
+    /// `/Length 12` unless `dict` gives one; its body three in-use entries in `/W [1 2 1]`), and
+    /// a classic section (`/Size 1`) whose `/Prev` is the first and whose `/XRefStm` is the
+    /// stream. `startxref` is to the last section, or with `direct`, to the stream.
+    fn hybrid_pdf(objs: &[(u64, &str)], dict: &str, direct: bool) -> Vec<u8> {
+        let mut out = b"%PDF-1.5\n".to_vec();
+        let mut offsets = [None; 10];
+        for (n, text) in objs {
+            offsets[*n as usize] = Some(out.len());
+            out.extend(format!("{n} 0 obj\n{text}\nendobj\n").bytes());
+        }
+        let prev = out.len();
+        out.extend(b"xref\n0 10\n");
+        for off in offsets {
+            out.extend(
+                match off {
+                    Some(o) => format!("{o:010} 00000 n\r\n"),
+                    None => "0000000000 65535 f\r\n".to_string(),
+                }
+                .bytes(),
+            );
+        }
+        out.extend(b"trailer\n<< /Size 10 >>\n");
+        let body = be_rows(&[1, 2, 1], &[&[1, 0, 0], &[1, 0, 0], &[1, 0, 0]]);
+        let len = if dict.contains("/Length") {
+            String::new()
+        } else {
+            format!(" /Length {}", body.len())
+        };
+        let stream = out.len();
+        out.extend(format!("9 0 obj\n<< /Size 3 {dict}{len} >>\nstream\n").bytes());
+        out.extend(&body);
+        out.extend(b"\nendstream\nendobj\n");
+        let last = out.len();
+        out.extend(
+            format!(
+                "xref\n0 1\n0000000000 65535 f\r\ntrailer\n<< /Size 1 /Prev {prev} /XRefStm {stream} >>\n"
+            )
+            .bytes(),
+        );
+        let start = if direct { stream } else { last };
+        out.extend(format!("startxref\n{start}\n%%EOF\n").bytes());
+        out
+    }
+
+    /// A cross-reference stream resolves the indirect entries that DaeDaLus resolves against
+    /// the host's object table at the time (#360): for an `/XRefStm` stream, the sections of
+    /// its referrer's `/Prev` chain; for the newest section, nothing, so that a reference
+    /// there is to an object that isn't in the table yet, and is `null`. Each case gives, for
+    /// each section in precedence order, its `/Size`, then (for a stream) each subsection's
+    /// first object number, or `None` for a failure.
+    #[test]
+    fn xref_stream_resolves_against_older_sections() {
+        const TW: &str = "/Type /XRef /W [1 2 1]";
+        let hybrid = |first: u64| Some(vec![1, 3, first, 10]);
+        let cases: Vec<(&str, Vec<u8>, Option<Vec<u64>>)> = vec![
+            ("direct entries", hybrid_pdf(&[], TW, false), hybrid(0)),
+            (
+                "/Length from the /Prev section",
+                hybrid_pdf(&[(7, "12")], &format!("{TW} /Length 7 0 R"), false),
+                hybrid(0),
+            ),
+            (
+                "/Length in the newest section",
+                hybrid_pdf(&[(7, "12")], &format!("{TW} /Length 7 0 R"), true),
+                None,
+            ),
+            (
+                "/Length to an object in no section",
+                hybrid_pdf(&[], &format!("{TW} /Length 7 0 R"), false),
+                None,
+            ),
+            (
+                "/Length to an object of another generation",
+                hybrid_pdf(&[(7, "12")], &format!("{TW} /Length 7 1 R"), false),
+                None,
+            ),
+            (
+                "/W from the /Prev section",
+                hybrid_pdf(&[(7, "[1 2 1]")], "/Type /XRef /W 7 0 R", false),
+                hybrid(0),
+            ),
+            (
+                "/Type from the /Prev section",
+                hybrid_pdf(&[(7, "/XRef")], "/Type 7 0 R /W [1 2 1]", false),
+                hybrid(0),
+            ),
+            (
+                "/Index from the /Prev section",
+                hybrid_pdf(&[(7, "[5 3]")], &format!("{TW} /Index 7 0 R"), false),
+                hybrid(5),
+            ),
+            (
+                "an element of /Index from the /Prev section",
+                hybrid_pdf(&[(7, "5")], &format!("{TW} /Index [7 0 R 3]"), false),
+                hybrid(5),
+            ),
+            (
+                "/Index to an object in no section takes the default",
+                hybrid_pdf(&[], &format!("{TW} /Index 7 0 R"), false),
+                hybrid(0),
+            ),
+            (
+                "/Index to a stream takes the default",
+                hybrid_pdf(
+                    &[(7, "<< /Length 0 >>\nstream\n\nendstream")],
+                    &format!("{TW} /Index 7 0 R"),
+                    false,
+                ),
+                hybrid(0),
+            ),
+        ];
+        let mut module = FormatModule::new();
+        let pdf_cos = PdfModule::new(&mut module).cos();
+        let seq1 = |e: Expr| Expr::Seq(vec![e]);
+        let summary = flat_map(
+            lambda(
+                "s",
+                expr_match(
+                    var("s"),
+                    [
+                        (
+                            Pattern::Variant("old_xref".into(), Box::new(bind("x"))),
+                            seq1(record_lens(var("x"), &["trailer", "size"])),
+                        ),
+                        (
+                            Pattern::Variant("new_xref".into(), Box::new(bind("x"))),
+                            append(
+                                seq1(record_lens(var("x"), &["trailer", "size"])),
+                                flat_map(
+                                    lambda("sub", seq1(record_proj(var("sub"), "first_id"))),
                                     record_proj(var("x"), "xref"),
                                 ),
                             ),
