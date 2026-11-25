@@ -59,7 +59,11 @@ fn last_pdf_end(pdf_end: FormatRef) -> Format {
         chain(
             another_follows,
             "another",
-            if_then_else(var("another"), Format::Fail, compute(var("offset"))),
+            if_then_else(
+                var("another"),
+                Format::fail_with("not the last startxref"),
+                compute(var("offset")),
+            ),
         ),
     ))
 }
@@ -133,7 +137,7 @@ pub(super) fn pdf_cos(pm: &mut PdfModule<'_>) -> FormatRef {
                                                 "stream".into(),
                                                 Box::new(Pattern::Wildcard),
                                             ),
-                                            Format::Fail, // "/Root is a stream"
+                                            Format::fail_with("/Root is a stream"),
                                         ),
                                         (Pattern::Wildcard, compute(var("root_d"))),
                                     ],

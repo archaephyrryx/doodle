@@ -107,7 +107,7 @@ impl<TypeRep> std::hash::Hash for TypedFormat<TypeRep> {
             }
             TypedFormat::SkipRemainder
             | TypedFormat::Pos(_)
-            | TypedFormat::Fail
+            | TypedFormat::Fail(_)
             | TypedFormat::EndOfInput => {}
             TypedFormat::DecodeBytes(_, expr, inner) => {
                 expr.hash(state);
@@ -334,7 +334,8 @@ pub enum TypedFormat<TypeRep> {
         Label,
         Box<TypedFormat<TypeRep>>,
     ),
-    Fail,
+    /// [`Format::FailWith`](crate::Format::FailWith), with its message
+    Fail(Option<Label>),
     EndOfInput,
     Align(NonZeroUsize),
     Byte(ByteSet),
@@ -457,7 +458,7 @@ impl TypedFormat<GenType> {
             | TypedFormat::Compute(_, _)
             | TypedFormat::EndOfInput
             | TypedFormat::ParseFromView(_, _, _)
-            | TypedFormat::Fail => RecursiveBounds::exact(0),
+            | TypedFormat::Fail(_) => RecursiveBounds::exact(0),
 
             TypedFormat::Peek(_, inner) | TypedFormat::PeekNot(_, inner) => {
                 inner.lookahead_bounds_recursive(open)
@@ -617,7 +618,7 @@ impl TypedFormat<GenType> {
             | TypedFormat::PeekNot(_, _)
             | TypedFormat::EndOfInput
             | TypedFormat::Pos(_)
-            | TypedFormat::Fail => RecursiveBounds::exact(0),
+            | TypedFormat::Fail(_) => RecursiveBounds::exact(0),
 
             TypedFormat::SkipTo(_, inner) => {
                 RecursiveBounds::any() + inner.match_bounds_recursive(open)
@@ -734,7 +735,7 @@ impl TypedFormat<GenType> {
 
     pub(crate) fn get_type(&self) -> Option<Cow<'_, GenType>> {
         match self {
-            TypedFormat::Fail => None,
+            TypedFormat::Fail(_) => None,
             TypedFormat::SkipRemainder
             | TypedFormat::EndOfInput
             | TypedFormat::Align(_)
@@ -1465,7 +1466,7 @@ mod __impls {
                 }
                 TypedFormat::SkipRemainder => Format::SkipRemainder,
                 TypedFormat::Pos(_) => Format::Pos,
-                TypedFormat::Fail => Format::Fail,
+                TypedFormat::Fail(msg) => Format::FailWith(msg.clone()),
                 TypedFormat::EndOfInput => Format::EndOfInput,
                 TypedFormat::Align(n) => Format::Align(n),
                 TypedFormat::Byte(b) => Format::Byte(b),

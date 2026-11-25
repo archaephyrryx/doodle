@@ -11089,7 +11089,7 @@ opentype_main_directory::TableDirectory(inner)
 },
 
 _ => {
-return Err(ParseError::FailToken(11100042044514704042u64));
+return Err(ParseError::FailToken(None, 11100042044514704042u64));
 }
 };
 PResult::Ok(opentype_main { magic, directory })
@@ -14914,7 +14914,7 @@ opentype_gdef_table_data::Version1_0
 },
 
 1u16 => {
-return Err(ParseError::FailToken(16097120758067046920u64));
+return Err(ParseError::FailToken(None, 16097120758067046920u64));
 },
 
 2u16 => {
@@ -16454,7 +16454,7 @@ opentype_kern_kern_subtable_data::Format2(inner)
 },
 
 _ => {
-return Err(ParseError::FailToken(16771529512960957239u64));
+return Err(ParseError::FailToken(None, 16771529512960957239u64));
 }
 };
 PResult::Ok(opentype_kern_kern_subtable { version, length, coverage, data })
@@ -18270,7 +18270,7 @@ PResult::Ok(match distance_code as u8 {
 },
 
 30u8..=31u8 => {
-return Err(ParseError::FailToken(11323981950571132721u64));
+return Err(ParseError::FailToken(None, 11323981950571132721u64));
 },
 
 _other => {
@@ -21206,11 +21206,11 @@ opentype_layout_ground_subst::ReverseChainSingleSubst(inner)
 },
 
 7u16 => {
-return Err(ParseError::FailToken(515819609734101411u64));
+return Err(ParseError::FailToken(None, 515819609734101411u64));
 },
 
 _ => {
-return Err(ParseError::FailToken(9277543013594125416u64));
+return Err(ParseError::FailToken(None, 9277543013594125416u64));
 }
 })
 }
@@ -21234,7 +21234,7 @@ opentype_layout_single_subst_subst::Format2(inner)
 },
 
 _ => {
-return Err(ParseError::FailToken(5955168674639093440u64));
+return Err(ParseError::FailToken(None, 5955168674639093440u64));
 }
 };
 PResult::Ok(opentype_layout_single_subst { subst_format, subst })
@@ -21410,7 +21410,7 @@ opentype_layout_sequence_context_subst::Format3(inner)
 },
 
 _ => {
-return Err(ParseError::FailToken(824589811577025210u64));
+return Err(ParseError::FailToken(None, 824589811577025210u64));
 }
 };
 PResult::Ok(opentype_layout_sequence_context { table_scope, format, subst })
@@ -21441,7 +21441,7 @@ opentype_layout_chained_sequence_context_subst::Format3(inner)
 },
 
 _ => {
-return Err(ParseError::FailToken(4649034608147552416u64));
+return Err(ParseError::FailToken(None, 4649034608147552416u64));
 }
 };
 PResult::Ok(opentype_layout_chained_sequence_context { table_scope, format, subst })
@@ -21593,7 +21593,7 @@ opentype_coverage_table_data::Format2(inner)
 },
 
 _ => {
-return Err(ParseError::FailToken(14339975513692068616u64));
+return Err(ParseError::FailToken(None, 14339975513692068616u64));
 }
 };
 PResult::Ok(opentype_coverage_table { coverage_format, data })
@@ -21841,7 +21841,7 @@ opentype_class_def_data::Format2(inner)
 },
 
 _ => {
-return Err(ParseError::FailToken(16299205781335471965u64));
+return Err(ParseError::FailToken(None, 16299205781335471965u64));
 }
 };
 PResult::Ok(opentype_class_def { class_format, data })
@@ -22545,11 +22545,11 @@ opentype_layout_ground_pos::ChainedSequenceContext(inner)
 },
 
 9u16 => {
-return Err(ParseError::FailToken(4839194687019048322u64));
+return Err(ParseError::FailToken(None, 4839194687019048322u64));
 },
 
 _ => {
-return Err(ParseError::FailToken(7230273548678969972u64));
+return Err(ParseError::FailToken(None, 7230273548678969972u64));
 }
 })
 }
@@ -22573,7 +22573,7 @@ opentype_layout_single_pos_subtable::Format2(inner)
 },
 
 _ => {
-return Err(ParseError::FailToken(14903563845775542749u64));
+return Err(ParseError::FailToken(None, 14903563845775542749u64));
 }
 };
 PResult::Ok(opentype_layout_single_pos { pos_format, subtable })
@@ -22598,7 +22598,7 @@ opentype_layout_pair_pos_subtable::Format2(inner)
 },
 
 _ => {
-return Err(ParseError::FailToken(1969670610881234889u64));
+return Err(ParseError::FailToken(None, 1969670610881234889u64));
 }
 };
 PResult::Ok(opentype_layout_pair_pos { pos_format, subtable })
@@ -22935,7 +22935,7 @@ opentype_layout_anchor_table_table::Format3(inner)
 },
 
 _ => {
-return Err(ParseError::FailToken(6209434968043366837u64));
+return Err(ParseError::FailToken(None, 6209434968043366837u64));
 }
 };
 PResult::Ok(opentype_layout_anchor_table { anchor_format, table })
@@ -23729,7 +23729,7 @@ opentype_gdef_caret_value_data::Format3(inner)
 },
 
 _ => {
-return Err(ParseError::FailToken(9815657591077818003u64));
+return Err(ParseError::FailToken(None, 9815657591077818003u64));
 }
 };
 PResult::Ok(opentype_gdef_caret_value { format, data })
@@ -24042,7 +24042,7 @@ opentype_gasp_gasp_record_range_gasp_behavior::Version1(inner)
 },
 
 _ => {
-return Err(ParseError::FailToken(2197379665604321609u64));
+return Err(ParseError::FailToken(None, 2197379665604321609u64));
 }
 };
 PResult::Ok(opentype_gasp_gasp_record { range_max_ppem, range_gasp_behavior })

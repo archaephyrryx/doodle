@@ -209,14 +209,22 @@ const fn mk_method(ident: &'static str) -> MethodSpecifier {
 }
 
 // SECTION - helper functions for constructing `Err(ParseError::..)`-values corresponding to various kinds of failure-state
-/// Model RustExpr for handling [`Format::Fail`](crate::Format::Fail), as an `Err(<..>)`-value with accompanying trace-hash.
-pub fn err_fail(trace: u64) -> RustExpr {
+/// Model RustExpr for handling [`Format::FailWith`](crate::Format::FailWith), as an `Err(<..>)`-value
+/// with its message (`Some("..")` or `None`) and accompanying trace-hash.
+pub fn err_fail(message: Option<&Label>, trace: u64) -> RustExpr {
+    let message = match message {
+        Some(msg) => RustExpr::FunctionCall(
+            Box::new(RustExpr::local("Some")),
+            vec![RustExpr::str_lit(msg.clone())],
+        ),
+        None => RustExpr::NONE,
+    };
     RustExpr::ResultErr(Box::new(RustExpr::FunctionCall(
         Box::new(RustExpr::Entity(RustEntity::Scoped(
             vec![lbl("ParseError")],
             lbl("FailToken"),
         ))),
-        vec![RustExpr::u64lit(trace)],
+        vec![message, RustExpr::u64lit(trace)],
     )))
 }
 

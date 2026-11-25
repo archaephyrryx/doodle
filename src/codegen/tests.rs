@@ -233,6 +233,39 @@ mod elaboration {
         );
     }
 
+    /// Generated code reports a `Format::FailWith` message as a string literal in
+    /// `ParseError::FailToken`, and `None` for a `Format::Fail`.
+    #[test]
+    fn fail_with_message_in_gencode() {
+        use crate::helper::{chain, compute, expr_eq, if_then_else, var};
+        let mut module = FormatModule::new();
+        let top = module.define_format(
+            "test.fail_msg",
+            chain(
+                Format::ANY_BYTE,
+                "x",
+                if_then_else(
+                    expr_eq(var("x"), Expr::U8(b'a')),
+                    compute(var("x")),
+                    if_then_else(
+                        expr_eq(var("x"), Expr::U8(b'b')),
+                        Format::fail_with("say \"no\""),
+                        Format::Fail,
+                    ),
+                ),
+            ),
+        );
+        let src = produce_string_gencode(&module, &top.call());
+        assert!(
+            src.contains(r###"ParseError::FailToken(Some(r#"say "no""#), "###),
+            "source was:\n{src}"
+        );
+        assert!(
+            src.contains("ParseError::FailToken(None, "),
+            "source was:\n{src}"
+        );
+    }
+
     /// Base-case headcount test for an assortment of leaf-node formats
     #[test]
     fn test_headcount_simple() {
@@ -302,7 +335,7 @@ mod elaboration {
         match tf {
             FormatCall(_, _, _, _, def) => def.get().cloned().into_iter().collect(),
             ForEach(_, _, _, f) => vec![boxed(f)],
-            Fail | EndOfInput | Align(_) | Byte(_) | Pos(_) | SkipRemainder | WithView(..) => {
+            Fail(_) | EndOfInput | Align(_) | Byte(_) | Pos(_) | SkipRemainder | WithView(..) => {
                 vec![]
             }
             Variant(_, _, f) => vec![boxed(f)],
@@ -1215,6 +1248,7 @@ mod fixture_gen {
     /// types are unified, borrow hint included, and an owned literal would make the key field's type
     /// `Vec<u8>`, which its slice decoder does not produce (as it would for any join of the two).
     #[test]
+    #[ignore = "Fixture test to produce gencode test-suite"]
     fn find_by_key_behavior_test() {
         let mut module = FormatModule::new();
         let owned = module.define_format(

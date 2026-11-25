@@ -30,7 +30,10 @@ pub(super) fn stream(pm: &mut PdfModule<'_>) -> DepFormat<1, 0> {
                             Pattern::Variant("dict".into(), Box::new(bind("d"))),
                             compute(var("d")),
                         ),
-                        (Pattern::Wildcard, Format::Fail),
+                        (
+                            Pattern::Wildcard,
+                            Format::fail_with("stream header is not a dict"),
+                        ),
                     ],
                 ),
             ),
@@ -229,8 +232,12 @@ pub(super) fn resolve_val(resolve_ref: FormatRef, args: [Expr; 5], v: Expr) -> F
                                 Pattern::Variant("value".into(), Box::new(bind("rv"))),
                                 compute(var("rv")),
                             ),
-                            // "is a stream", or only the host can read it
-                            (Pattern::Wildcard, Format::Fail),
+                            (
+                                Pattern::Wildcard,
+                                Format::fail_with(
+                                    "reference is to a stream, or only the host can read it",
+                                ),
+                            ),
                         ],
                     ),
                 ),
@@ -263,7 +270,10 @@ pub(super) fn resolve_decl(resolve_ref: FormatRef, args: [Expr; 5], r: Expr) -> 
                     lim,
                 ]),
             ),
-            (Pattern::Wildcard, Format::Fail), // "invalid object number"
+            (
+                Pattern::Wildcard,
+                Format::fail_with("invalid object number"),
+            ),
         ],
     )
 }
@@ -312,7 +322,7 @@ pub(super) fn obj_stream_entry(pm: &mut PdfModule<'_>) -> FormatRef {
                         index_checked(var("_index"), var("index")),
                         [
                             (pat_some(bind("info")), compute(var("info"))),
-                            (pat_none(), Format::Fail), // "index past /N"
+                            (pat_none(), Format::fail_with("index past /N")),
                         ],
                     ),
                 ),
@@ -321,7 +331,7 @@ pub(super) fn obj_stream_entry(pm: &mut PdfModule<'_>) -> FormatRef {
                     if_then_else(
                         expr_eq(record_proj(var("_info"), "oid"), var("obj")),
                         Format::EMPTY,
-                        Format::Fail, // "object number doesn't match the xref"
+                        Format::fail_with("object number doesn't match the xref"),
                     ),
                 ),
                 (
@@ -463,7 +473,7 @@ pub(super) fn resolve(pm: &mut PdfModule<'_>) -> [FormatRef; 2] {
                                         ),
                                         Format::EMPTY,
                                     ),
-                                    (Pattern::Wildcard, Format::Fail), // "not /Type /ObjStm"
+                                    (Pattern::Wildcard, Format::fail_with("not /Type /ObjStm")),
                                 ],
                             ),
                         ),
@@ -531,43 +541,47 @@ pub(super) fn resolve(pm: &mut PdfModule<'_>) -> [FormatRef; 2] {
                                 map(obj_stream_entry, lambda("e", record_proj(var("e"), "decl"))),
                             ),
                             // including `null`, a missing container (the host fails)
-                            (Pattern::Wildcard, Format::Fail), // "container is not a stream"
+                            (
+                                Pattern::Wildcard,
+                                Format::fail_with("container is not a stream"),
+                            ),
                         ],
                     ),
                 );
                 if_then_else(
-                    or(
-                        expr_eq(var("lim"), Expr::U64(0)), // "resolution too deep"
-                        // "cycle": the host's check, which fails at once; without it, `lim`
-                        // would still end the cycle, with the same result
+                    expr_eq(var("lim"), Expr::U64(0)),
+                    Format::fail_with("resolution too deep"),
+                    // the host's check, which fails at once; without it, `lim` would still end
+                    // the cycle, with the same result
+                    if_then_else(
                         seq_any(|o| expr_eq(o, var("obj")), var("resolving")),
-                    ),
-                    Format::Fail,
-                    fmt_match(
-                        xref_entry_for(var("sections"), var("obj")),
-                        [
-                            (
-                                pat_some(entry()),
-                                if_then_else(
-                                    expr_eq(record_proj(var("at"), "gen"), var("gen")),
-                                    with_relative_offset(
-                                        Some(var("base")),
-                                        record_proj(var("at"), "offset"),
-                                        decl.call_args(pass_on()),
+                        Format::fail_with("reference cycle"),
+                        fmt_match(
+                            xref_entry_for(var("sections"), var("obj")),
+                            [
+                                (
+                                    pat_some(entry()),
+                                    if_then_else(
+                                        expr_eq(record_proj(var("at"), "gen"), var("gen")),
+                                        with_relative_offset(
+                                            Some(var("base")),
+                                            record_proj(var("at"), "offset"),
+                                            decl.call_args(pass_on()),
+                                        ),
+                                        null_decl(),
                                     ),
-                                    null_decl(),
                                 ),
-                            ),
-                            (
-                                pat_some(packed()),
-                                if_then_else(
-                                    expr_eq(var("gen"), Expr::U64(0)),
-                                    from_container,
-                                    null_decl(),
+                                (
+                                    pat_some(packed()),
+                                    if_then_else(
+                                        expr_eq(var("gen"), Expr::U64(0)),
+                                        from_container,
+                                        null_decl(),
+                                    ),
                                 ),
-                            ),
-                            (Pattern::Wildcard, null_decl()),
-                        ],
+                                (Pattern::Wildcard, null_decl()),
+                            ],
+                        ),
                     ),
                 )
             }),
@@ -593,7 +607,10 @@ pub(super) fn resolve(pm: &mut PdfModule<'_>) -> [FormatRef; 2] {
                                     Pattern::Variant("dict".into(), Box::new(bind("d"))),
                                     compute(var("d")),
                                 ),
-                                (Pattern::Wildcard, Format::Fail),
+                                (
+                                    Pattern::Wildcard,
+                                    Format::fail_with("stream header is not a dict"),
+                                ),
                             ],
                         ),
                     ),
@@ -635,7 +652,7 @@ pub(super) fn resolve(pm: &mut PdfModule<'_>) -> [FormatRef; 2] {
                                     expr_eq(var("_gen"), var("gen")),
                                 ),
                                 Format::EMPTY,
-                                Format::Fail, // "object and generation don't match the xref"
+                                Format::fail_with("object and generation don't match the xref"),
                             ),
                         ),
                         ("__kw_obj", kw(b"obj", any_ws)),

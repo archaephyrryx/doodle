@@ -118,7 +118,10 @@ fn trailer_dict(dict: Expr, resolved: Expr) -> Format {
                         compute(expr_some(var("r"))),
                     ),
                     (pat_none(), compute(expr_none())),
-                    (Pattern::Wildcard, Format::Fail), // "/Root is not a reference"
+                    (
+                        Pattern::Wildcard,
+                        Format::fail_with("/Root is not a reference"),
+                    ),
                 ],
             ),
         ),
@@ -153,7 +156,7 @@ fn be_bytes(n: Expr) -> Format {
             )),
             [
                 (pat_some(bind("v")), compute(var("v"))),
-                (pat_none(), Format::Fail), // "field too wide"
+                (pat_none(), Format::fail_with("field too wide")),
             ],
         ),
     )
@@ -173,7 +176,7 @@ fn xref_field_or(dflt: u64, width: Expr) -> Format {
 fn xref_field_required(width: Expr) -> Format {
     if_then_else(
         expr_eq(width.clone(), Expr::U64(0)),
-        Format::Fail, // "required field has width 0"
+        Format::fail_with("required field has width 0"),
         be_bytes(width),
     )
 }
@@ -285,7 +288,7 @@ fn xref_index(header: Expr) -> Format {
                     "i",
                     record_auto([("first_id", compute(ix(0))), ("num", compute(ix(1)))]),
                 ),
-                Format::Fail, // "odd /Index length"
+                Format::fail_with("odd /Index length"),
             ),
         ),
     )
@@ -323,7 +326,7 @@ fn xref_widths(header: Expr) -> Format {
                         pat_some(Pattern::Variant("array".into(), Box::new(bind("vs")))),
                         compute(var("vs")),
                     ),
-                    (Pattern::Wildcard, Format::Fail), // "/W is not an array"
+                    (Pattern::Wildcard, Format::fail_with("/W is not an array")),
                 ],
             ),
         ),
@@ -337,7 +340,7 @@ fn xref_widths(header: Expr) -> Format {
                 numeric_to_u64(sum),
                 [
                     (pat_some(bind("n")), compute(var("n"))),
-                    (pat_none(), Format::Fail), // "entry too wide"
+                    (pat_none(), Format::fail_with("entry too wide")),
                 ],
             ),
         ),
@@ -357,7 +360,7 @@ fn xref_stream_filters(zlib: FormatRef, header: Expr, raw: Expr) -> Format {
                     Pattern::Variant("ok".into(), Box::new(bind("bytes"))),
                     compute(var("bytes")),
                 ),
-                (Pattern::Wildcard, Format::Fail), // "unsupported filter"
+                (Pattern::Wildcard, Format::fail_with("unsupported filter")),
             ],
         ),
     )
@@ -422,7 +425,7 @@ pub(super) fn xref_obj(pm: &mut PdfModule<'_>) -> FormatRef {
                 if_then_else(
                     dict_name_is(b"Type", b"XRef", header()),
                     Format::EMPTY,
-                    Format::Fail, // "not /Type /XRef"
+                    Format::fail_with("not /Type /XRef"),
                 ),
             ),
             ("_index", xref_index(header())),
@@ -473,7 +476,7 @@ fn stream_object_dict(any_ws: FormatRef, natural: FormatRef, pdf_value: FormatRe
                             Pattern::Variant("dict".into(), Box::new(bind("d"))),
                             compute(var("d")),
                         ),
-                        (Pattern::Wildcard, Format::Fail), // "not a stream"
+                        (Pattern::Wildcard, Format::fail_with("not a stream")),
                     ],
                 ),
             ),
@@ -728,48 +731,53 @@ pub(super) fn xref_chain(pm: &mut PdfModule<'_>) -> FormatRef {
             let trailer = || section_trailer(var("section"));
             let visited_here = || append(var("visited"), Expr::Seq(vec![var("offset")]));
             if_then_else(
-                or(
-                    expr_eq(var("lim"), Expr::U64(0)), // "cross-reference chain too long"
-                    seq_any(|v| expr_eq(v, var("offset")), var("visited")), // "cycle"
-                ),
-                Format::Fail,
-                chain(
-                    extra,
-                    "_extra",
+                expr_eq(var("lim"), Expr::U64(0)),
+                Format::fail_with("cross-reference chain too long"),
+                if_then_else(
+                    seq_any(|v| expr_eq(v, var("offset")), var("visited")),
+                    Format::fail_with("cross-reference chain revisits a section"),
                     chain(
-                        with_relative_offset(
-                            Some(var("base")),
-                            var("offset"),
-                            cross_ref.call_args(vec![var("_extra")]),
-                        ),
-                        "section",
+                        extra,
+                        "_extra",
                         chain(
-                            follow(record_proj(trailer(), "prev"), visited_here(), var("table")),
-                            "prev",
+                            with_relative_offset(
+                                Some(var("base")),
+                                var("offset"),
+                                cross_ref.call_args(vec![var("_extra")]),
+                            ),
+                            "section",
                             chain(
                                 follow(
-                                    record_proj(trailer(), "xrefstm"),
-                                    record_proj(var("prev"), "visited"),
-                                    concat(Expr::Seq(vec![
-                                        record_proj(var("prev"), "sections"),
-                                        var("table"),
-                                    ])),
+                                    record_proj(trailer(), "prev"),
+                                    visited_here(),
+                                    var("table"),
                                 ),
-                                "xrefstm",
-                                compute(Expr::Record(vec![
-                                    (
-                                        Label::Borrowed("sections"),
+                                "prev",
+                                chain(
+                                    follow(
+                                        record_proj(trailer(), "xrefstm"),
+                                        record_proj(var("prev"), "visited"),
                                         concat(Expr::Seq(vec![
-                                            Expr::Seq(vec![var("section")]),
-                                            record_proj(var("xrefstm"), "sections"),
                                             record_proj(var("prev"), "sections"),
+                                            var("table"),
                                         ])),
                                     ),
-                                    (
-                                        Label::Borrowed("visited"),
-                                        record_proj(var("xrefstm"), "visited"),
-                                    ),
-                                ])),
+                                    "xrefstm",
+                                    compute(Expr::Record(vec![
+                                        (
+                                            Label::Borrowed("sections"),
+                                            concat(Expr::Seq(vec![
+                                                Expr::Seq(vec![var("section")]),
+                                                record_proj(var("xrefstm"), "sections"),
+                                                record_proj(var("prev"), "sections"),
+                                            ])),
+                                        ),
+                                        (
+                                            Label::Borrowed("visited"),
+                                            record_proj(var("xrefstm"), "visited"),
+                                        ),
+                                    ])),
+                                ),
                             ),
                         ),
                     ),

@@ -304,8 +304,10 @@ impl std::error::Error for BufferLimitError {}
 
 #[derive(Debug)]
 pub enum DecodeErrorKind<V: Clone = Value> {
-    /// Explicit [`Format::Fail`](crate::Format::Fail) token encountered, or successful parse in a `PeekNot` context.
+    /// Explicit [`Format::FailWith`](crate::Format::FailWith) token encountered, or successful parse in a `PeekNot` context.
     Fail {
+        /// The message of the `Format::FailWith`, if it has one
+        message: Option<Label>,
         bindings: Vec<(Label, ScopeEntry<V>)>,
         offset: usize,
         buffer: Vec<u8>,
@@ -388,6 +390,15 @@ impl BufferLimitError {
 }
 
 impl<V: Clone> DecodeErrorKind<V> {
+    /// This error with `message` as its [`Format::FailWith`](crate::Format::FailWith) message,
+    /// if it is a [`DecodeErrorKind::Fail`] (other errors are returned unchanged).
+    pub fn with_fail_message(mut self, message: Option<Label>) -> Self {
+        if let DecodeErrorKind::Fail { message: m, .. } = &mut self {
+            *m = message;
+        }
+        self
+    }
+
     pub fn with_trace<T>(self, trace: T) -> DecodeError<V>
     where
         T: std::fmt::Debug + Sync + Send + 'static,
@@ -403,13 +414,19 @@ impl<V: std::fmt::Debug + Clone> std::fmt::Display for DecodeErrorKind<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Fail {
+                message,
                 bindings,
                 buffer,
                 offset,
             } => {
+                if let Some(message) = message {
+                    write!(f, "decode failure ({message})")?;
+                } else {
+                    write!(f, "decode failure")?;
+                }
                 write!(
                     f,
-                    "decode failure at Offset={offset}, Buffer={buffer:#?} (Scope: {bindings:?})"
+                    " at Offset={offset}, Buffer={buffer:#?} (Scope: {bindings:?})"
                 )
             }
             Self::BadWhere {
@@ -512,6 +529,7 @@ impl DecodeErrorKind<Value> {
         let offset = input.offset;
         let buffer = input.input.to_owned();
         DecodeErrorKind::Fail {
+            message: None,
             bindings,
             offset,
             buffer,
@@ -540,6 +558,7 @@ impl DecodeErrorKind<ParsedValue> {
         let buffer = input.input.to_owned();
         let offset = input.offset;
         DecodeErrorKind::Fail {
+            message: None,
             bindings,
             buffer,
             offset,

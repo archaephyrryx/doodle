@@ -68,8 +68,11 @@ pub enum Format {
     /// This Format has no individual semantics and it should be treated as an unsupported value
     /// anywhere other than `define_batch_recvar`.
     RecVar(usize),
-    /// A format that never matches
-    Fail,
+    /// A format that never matches, with an optional message saying why (as DaeDaLus
+    /// `Fail <msg>`), which is reported with the resulting parse error.
+    ///
+    /// [`Format::Fail`] is the form without a message; [`Format::fail_with`] constructs one with.
+    FailWith(Option<Label>),
     /// Matches if the end of the input has been reached
     EndOfInput,
     /// Skips bytes if necessary to align the current offset to a multiple of N
@@ -252,6 +255,15 @@ impl LookaheadEffect {
 }
 
 impl Format {
+    /// A format that never matches, without a message (see [`Format::FailWith`]).
+    #[allow(non_upper_case_globals)]
+    pub const Fail: Self = Format::FailWith(None);
+
+    /// A format that never matches, reporting `message` as the reason (see [`Format::FailWith`]).
+    pub fn fail_with(message: impl IntoLabel) -> Self {
+        Format::FailWith(Some(message.into()))
+    }
+
     pub const EMPTY: Format = Format::Tuple(Vec::new());
 
     pub const ANY_BYTE: Format = Format::Byte(ByteSet::full());
@@ -525,7 +537,7 @@ impl Format {
             Format::RecVar(_) => unreachable!(
                 "Format::RecVar is rewritten to ItemVar at batch registration; never appears in a stored Format"
             ),
-            Format::Fail => RecursiveBounds::exact(0),
+            Format::FailWith(_) => RecursiveBounds::exact(0),
             Format::EndOfInput => RecursiveBounds::exact(0),
             Format::SkipRemainder => RecursiveBounds::any(),
             // any number of skipped bytes, then a match of `f`
@@ -633,7 +645,7 @@ impl Format {
             Format::RecVar(_) => unreachable!(
                 "Format::RecVar is rewritten to ItemVar at batch registration; never appears in a stored Format"
             ),
-            Format::Fail => RecursiveBounds::exact(0),
+            Format::FailWith(_) => RecursiveBounds::exact(0),
             Format::EndOfInput => RecursiveBounds::exact(0),
             // NOTE - for PeekNot purposes it is not fully clear how to treat SkipRemainder, but we want to mirror the behavior of `Repeat(Byte)`
             Format::SkipRemainder => RecursiveBounds::any(),
@@ -762,7 +774,7 @@ impl Format {
                 Format::ItemVar(start + ix, Vec::new(), Vec::new())
             }
             Format::ItemVar(level, args, views) => Format::ItemVar(level, args, views),
-            Format::Fail => Format::Fail,
+            Format::FailWith(msg) => Format::FailWith(msg),
             Format::EndOfInput => Format::EndOfInput,
             Format::Align(n) => Format::Align(n),
             Format::Byte(bs) => Format::Byte(bs),
@@ -898,7 +910,7 @@ impl Format {
             Format::Byte(_) | Format::Compute(_) | Format::WithView(..) => Some(self),
 
             // Leaf node (non-productive) - return None
-            Format::Fail
+            Format::FailWith(_)
             | Format::EndOfInput
             | Format::Align(_)
             | Format::Pos

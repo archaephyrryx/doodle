@@ -205,7 +205,8 @@ impl ReadArrayKind {
 pub enum Decoder {
     Call(usize, Vec<(Label, Expr)>, Vec<(Label, ViewExpr)>),
     Pos,
-    Fail,
+    /// Fails, with the message of its [`Format::FailWith`], if any
+    Fail(Option<Label>),
     EndOfInput,
     Align(NonZeroUsize),
     Byte(ByteSet),
@@ -353,7 +354,7 @@ impl CallIndices for Decoder {
         match self {
             Decoder::Call(ix, _, _) => f(ix),
             Decoder::Pos
-            | Decoder::Fail
+            | Decoder::Fail(_)
             | Decoder::EndOfInput
             | Decoder::Align(_)
             | Decoder::Byte(_)
@@ -532,7 +533,7 @@ impl<'a> Compiler<'a> {
         recursive: Option<Label>,
     ) -> usize {
         let n = self.program.decoders.len();
-        self.program.decoders.push((Decoder::Fail, t));
+        self.program.decoders.push((Decoder::Fail(None), t));
         self.compile_queue.push((f, next, n, recursive));
         n
     }
@@ -605,7 +606,7 @@ impl<'a> Compiler<'a> {
                 "Format::RecVar is rewritten to ItemVar at batch registration; never appears in a stored Format"
             ),
             Format::Phantom(_inner) => Ok(Decoder::Phantom),
-            Format::Fail => Ok(Decoder::Fail),
+            Format::FailWith(msg) => Ok(Decoder::Fail(msg.clone())),
             Format::DecodeBytes(expr, inner) => {
                 let d = self.compile_format(inner, Rc::new(Next::Empty))?;
                 Ok(Decoder::DecodeBytes(expr.clone(), Box::new(d)))
@@ -927,7 +928,7 @@ impl Decoder {
         let parse_arm: ParseFn = match self {
             Decoder::Call(..) => Self::parse_call,
             Decoder::Phantom => Self::parse_phantom,
-            Decoder::Fail => Self::parse_fail,
+            Decoder::Fail(_) => Self::parse_fail,
             Decoder::Pos => Self::parse_pos,
             Decoder::SkipRemainder => Self::parse_skip_remainder,
             Decoder::SkipTo(..) => Self::parse_skip_to,
@@ -1024,7 +1025,12 @@ impl Decoder {
         scope: &Scope<'_>,
         input: ReadCtxt<'input>,
     ) -> EDecodeResult<(Value, ReadCtxt<'input>)> {
-        Err(DecodeErrorKind::<Value>::fail(scope, input).into())
+        let Decoder::Fail(message) = self else {
+            unreachable!("parse_fail called on {self:?}")
+        };
+        Err(DecodeErrorKind::<Value>::fail(scope, input)
+            .with_fail_message(message.clone())
+            .into())
     }
 
     #[inline(never)]
@@ -2508,6 +2514,38 @@ mod tests {
         let d = Compiler::compile_one(&f).unwrap();
         rejects(&d, &[]);
         rejects(&d, &[0x00]);
+    }
+
+    /// A `Format::FailWith` message is reported in the error's display, including from within
+    /// other formats; a `Format::Fail` reports none.
+    #[test]
+    fn fail_with_message_is_reported() {
+        let cases = [
+            (Format::fail_with("not a stream"), Some("not a stream")),
+            (
+                Format::Variant(
+                    Label::Borrowed("v"),
+                    Box::new(tuple([is_byte(0x00), Format::fail_with("after a zero")])),
+                ),
+                Some("after a zero"),
+            ),
+            (Format::Fail, None),
+        ];
+        for (f, message) in cases {
+            let d = Compiler::compile_one(&f).unwrap();
+            let program = Program::new();
+            let err = d
+                .parse(&program, &Scope::Empty, ReadCtxt::new(&[0x00]))
+                .expect_err("must fail");
+            let shown = err.to_string();
+            match message {
+                Some(m) => assert!(
+                    shown.starts_with(&format!("decode failure ({m}) at")),
+                    "{shown}"
+                ),
+                None => assert!(shown.starts_with("decode failure at"), "{shown}"),
+            }
+        }
     }
 
     #[test]

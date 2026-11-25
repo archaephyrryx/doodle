@@ -3,8 +3,9 @@
 ## 3.1 (Primitive Parsers)
 
 * `^<value>` is achievable through `compute`
-* `Fail <msg>` requires a refactor we have discussed but never implemented
-  * This could be a modification of `Fail` itself, or a wrapper using `StyleHint` (see [#329](https://github.com/yeslogic/doodle/issues/329))
+* `Fail <msg>` is `Format::fail_with(msg)`, i.e. `Format::FailWith(Some(msg))` ([#329](https://github.com/yeslogic/doodle/issues/329)); `Format::Fail` is `FailWith(None)`
+  * The message is a fixed string, reported by the interpreter (`DecodeErrorKind::Fail`'s `message`) and by generated code (`ParseError::FailToken(Some(msg), _)`); DaeDaLus messages built from values (`concat [...]`) have no counterpart yet
+  * `GuardMsg p s` is `if_then_else(p, Format::EMPTY, Format::fail_with(s))`
 * We don't have a notion of character classes for the parser `$[c]`, but we could emulate this with `ByteSet` constants
 * `Match <string>` is achievable through `byte_seq`
 

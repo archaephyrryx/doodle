@@ -3773,7 +3773,7 @@ impl TypeChecker {
                 self.unify_var_utype(newvar, Rc::new(UType::seq(t_inner)))?;
                 Ok(newvar)
             }
-            Format::Fail => Ok(self.init_var_simple(UType::Empty)?.0),
+            Format::FailWith(_) => Ok(self.init_var_simple(UType::Empty)?.0),
             Format::SkipRemainder | Format::EndOfInput | Format::Align(_) => {
                 Ok(self.init_var_simple(UType::UNIT)?.0)
             }

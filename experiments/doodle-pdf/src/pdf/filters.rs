@@ -226,7 +226,7 @@ fn flate_decode(zlib: FormatRef, params: Expr, body: Expr) -> Format {
                 decode_bytes(var("inflated"), png_unpredict(params)),
             ),
         ),
-        Format::Fail, // "unsupported predictor"
+        Format::fail_with("unsupported predictor"),
     )
 }
 
@@ -306,7 +306,7 @@ fn filter_param(param: Expr) -> Format {
                 pat_some(Pattern::Variant("dict".into(), Box::new(bind("d")))),
                 compute(expr_some(var("d"))),
             ),
-            (Pattern::Wildcard, Format::Fail), // "bad /DecodeParms"
+            (Pattern::Wildcard, Format::fail_with("bad /DecodeParms")),
         ],
     )
 }
@@ -343,7 +343,7 @@ pub(super) fn host_filter_formats(pm: &mut PdfModule<'_>) -> [FormatRef; 2] {
                         ),
                     ])),
                 ),
-                (Pattern::Wildcard, Format::Fail), // "not a dict"
+                (Pattern::Wildcard, Format::fail_with("not a dict")),
             ],
         ),
     );
@@ -383,7 +383,7 @@ fn decode_filters(zlib: FormatRef, header: Expr, raw: Expr) -> Format {
                 Pattern::Variant("name".into(), Box::new(bind("n"))),
                 compute(var("n")),
             ),
-            (Pattern::Wildcard, Format::Fail), // "filter is not a name"
+            (Pattern::Wildcard, Format::fail_with("filter is not a name")),
         ],
     );
     let unsupported = || {

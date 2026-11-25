@@ -25,7 +25,7 @@ impl<TypeRep> CallIndices for TypedDecoderExt<TypeRep> {
     fn for_each_call_mut(&mut self, f: &mut dyn FnMut(&mut usize)) {
         match &mut self.dec {
             TypedDecoder::Call(_, ix, _) => f(ix),
-            TypedDecoder::Fail
+            TypedDecoder::Fail(_)
             | TypedDecoder::EndOfInput
             | TypedDecoder::Align(_)
             | TypedDecoder::Byte(_)
@@ -125,7 +125,7 @@ impl<TypeRep> From<TypedDecoder<TypeRep>> for TypedDecoderExt<TypeRep> {
 impl TypedDecoder<GenType> {
     pub(crate) fn get_type(&self) -> Option<Cow<'_, GenType>> {
         match self {
-            TypedDecoder::Fail => None,
+            TypedDecoder::Fail(_) => None,
             TypedDecoder::Align(_)
             | TypedDecoder::SkipRemainder
             | TypedDecoder::EndOfInput
@@ -200,7 +200,8 @@ pub(crate) enum TypedDecoder<TypeRep> {
             Vec<(Label, TypedViewExpr<TypeRep>)>,
         ),
     ),
-    Fail,
+    /// Fails, with the message of its `Format::FailWith`, if any
+    Fail(Option<Label>),
     EndOfInput,
     Align(NonZeroUsize),
     Byte(ByteSet),
@@ -440,7 +441,9 @@ impl<'a> GTCompiler<'a> {
         next: Rc<Next<'a>>,
     ) -> usize {
         let n = self.program.decoders.len();
-        self.program.decoders.push((TypedDecoder::Fail.into(), t));
+        self.program
+            .decoders
+            .push((TypedDecoder::Fail(None).into(), t));
         self.compile_queue.push((f, args, next, n));
         n
     }
@@ -541,7 +544,7 @@ impl<'a> GTCompiler<'a> {
                 };
                 Ok(TypedDecoder::SkipTo((nt, inner_t.clone()), da))
             }
-            TypedFormat::Fail => Ok(TypedDecoder::Fail),
+            TypedFormat::Fail(msg) => Ok(TypedDecoder::Fail(msg.clone())),
             TypedFormat::EndOfInput => Ok(TypedDecoder::EndOfInput),
             TypedFormat::SkipRemainder => Ok(TypedDecoder::SkipRemainder),
             TypedFormat::Align(n) => Ok(TypedDecoder::Align(*n)),
@@ -549,8 +552,8 @@ impl<'a> GTCompiler<'a> {
             TypedFormat::Variant(gt, label, f) => {
                 let d = self.compile_gt_format(f, None, next.clone())?;
                 // FIXME - this is a bit slipshod, maybe we want an inductive method for determining what formats are constructive vs void
-                if matches!(&d.dec, TypedDecoder::Fail) {
-                    Ok(TypedDecoder::Fail)
+                if let TypedDecoder::Fail(msg) = &d.dec {
+                    Ok(TypedDecoder::Fail(msg.clone()))
                 } else {
                     Ok(TypedDecoder::Variant(
                         gt.clone(),

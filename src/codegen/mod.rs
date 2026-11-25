@@ -668,7 +668,7 @@ impl CodeGen {
             TypedDecoder::Call(_gt, ix, (args, views)) => {
                 CaseLogic::Simple(SimpleLogic::Invoke(*ix, args.clone(), views.clone()))
             }
-            TypedDecoder::Fail => CaseLogic::Simple(SimpleLogic::Fail),
+            TypedDecoder::Fail(msg) => CaseLogic::Simple(SimpleLogic::Fail(msg.clone())),
             TypedDecoder::EndOfInput => CaseLogic::Simple(SimpleLogic::ExpectEnd),
             TypedDecoder::Align(n) => CaseLogic::Simple(SimpleLogic::SkipToNextMultiple(n.get())),
             TypedDecoder::Pos(nt) => CaseLogic::Simple(SimpleLogic::YieldCurrentOffsetAs(*nt)),
@@ -3600,7 +3600,8 @@ impl_toast_caselogic!(GTExpr);
 /// Cases that require no recursion into other case-logic
 #[derive(Clone, Debug)]
 enum SimpleLogic<ExprT, ViewExprT = TypedViewExpr<GenType>> {
-    Fail,
+    /// Fails, with the message of its `Format::FailWith`, if any
+    Fail(Option<Label>),
     ExpectEnd,
     Invoke(usize, Vec<(Label, ExprT)>, Vec<(Label, ViewExprT)>),
     SkipToNextMultiple(usize),
@@ -3618,7 +3619,9 @@ impl ToAst for SimpleLogic<GTExpr> {
 
     fn to_ast(&self, ctxt: ProdCtxt<'_>) -> GenBlock {
         match self {
-            SimpleLogic::Fail => GenBlock::explicit_return(model::err_fail(get_trace(&()))),
+            SimpleLogic::Fail(msg) => {
+                GenBlock::explicit_return(model::err_fail(msg.as_ref(), get_trace(&())))
+            }
             SimpleLogic::ExpectEnd => GenBlock::simple_expr(model::try_enforce_eos(ctxt.parser())),
             SimpleLogic::PhantomData => GenBlock::simple_expr(model::phantom_data()),
             SimpleLogic::SkipRemainder => {
@@ -3711,7 +3714,7 @@ impl ToAst for SimpleLogic<GTExpr> {
             SimpleLogic::CallDynamic(..) => true,
             // false cases
             // NOTE - these cases can be double-checked via the [`ToAst::to_ast`] impl for [`SimpleLogic`]
-            SimpleLogic::Fail => false,
+            SimpleLogic::Fail(_) => false,
             SimpleLogic::Eval(..) => false,
             SimpleLogic::ConstNone => false,
             SimpleLogic::PhantomData => false,
@@ -5495,9 +5498,9 @@ impl<'a> Elaborator<'a> {
                 let gt = self.get_gt_from_index(index);
                 TypedFormat::ParseFromView(gt, t_view, Box::new(t_inner))
             }
-            Format::Fail => {
+            Format::FailWith(msg) => {
                 self.increment_index();
-                TypedFormat::Fail
+                TypedFormat::Fail(msg.clone())
             }
             Format::EndOfInput => {
                 self.increment_index();

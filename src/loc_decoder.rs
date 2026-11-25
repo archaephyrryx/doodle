@@ -684,7 +684,7 @@ impl Decoder {
         let parse_arm: LocParseFn = match self {
             Decoder::Call(..) => Self::loc_parse_call,
             Decoder::Phantom => Self::loc_parse_phantom,
-            Decoder::Fail => Self::loc_parse_fail,
+            Decoder::Fail(_) => Self::loc_parse_fail,
             Decoder::Pos => Self::loc_parse_pos,
             Decoder::SkipRemainder => Self::loc_parse_skip_remainder,
             Decoder::SkipTo(..) => Self::loc_parse_skip_to,
@@ -781,7 +781,12 @@ impl Decoder {
         scope: &LocScope<'_>,
         input: ReadCtxt<'input>,
     ) -> ELocDecodeResult<(ParsedValue, ReadCtxt<'input>)> {
-        Err(DecodeErrorKind::<ParsedValue>::loc_fail(scope, input).into())
+        let Decoder::Fail(message) = self else {
+            unreachable!("loc_parse_fail called on {self:?}")
+        };
+        Err(DecodeErrorKind::<ParsedValue>::loc_fail(scope, input)
+            .with_fail_message(message.clone())
+            .into())
     }
 
     #[inline(never)]

@@ -409,7 +409,7 @@ mod census {
             Format::RecVar(_) => unreachable!(
                 "Format::RecVar is rewritten to ItemVar at batch registration; never appears in a stored Format"
             ),
-            Format::Fail => (),
+            Format::FailWith(_) => (),
             Format::EndOfInput => (),
             Format::Align(_) => (),
             Format::Byte(..) => (),

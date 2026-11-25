@@ -64,8 +64,9 @@ impl std::error::Error for CtxtParseError {
 /// General error type for both recoverable and unrecoverable errors encountered during parsing operations
 #[derive(Clone, Debug)]
 pub enum ParseError {
-    /// Unconditional error yielded when reading `Format::Fail` or equivalent derivatives.
-    FailToken(TraceHash),
+    /// Unconditional error yielded when reading `Format::FailWith` (including `Format::Fail`) or
+    /// equivalent derivatives, with the `Format::FailWith` message, if any.
+    FailToken(Option<&'static str>, TraceHash),
     /// The condition asserted by a `Format::Where` was not upheld by the value produced by the inner format.
     FalsifiedWhere(TraceHash),
     /// Reached local end-of-input (whether slice, or buffer) before reading sufficient elements to satisfy the minimum-element requirement of a "repeat N times" format, or the predicate of a repeat-unfil-condition format.
@@ -129,7 +130,12 @@ pub enum OverrunKind {
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::FailToken(trace) => write!(f, "reached Fail token (trace-hash: {trace})"),
+            ParseError::FailToken(Some(mesg), trace) => {
+                write!(f, "reached Fail token: {mesg} (trace-hash: {trace})")
+            }
+            ParseError::FailToken(None, trace) => {
+                write!(f, "reached Fail token (trace-hash: {trace})")
+            }
             ParseError::UnsoundOperation(Some(mesg), trace) => write!(
                 f,
                 "attempted unsound operation: {mesg} (trace-hash: {trace})"

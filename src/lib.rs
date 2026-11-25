@@ -1595,7 +1595,7 @@ impl FormatModule {
                 view.check_type(scope)?;
                 self.infer_format_type(scope, f)
             }
-            Format::Fail => Ok(ValueType::Empty),
+            Format::FailWith(_) => Ok(ValueType::Empty),
             Format::SkipRemainder | Format::EndOfInput => Ok(ValueType::Tuple(vec![])),
             Format::Align(_n) => Ok(ValueType::Tuple(vec![])),
             Format::Byte(_bs) => Ok(ValueType::U8),
@@ -2576,7 +2576,7 @@ impl<'a> NextDependence<'a> {
             ),
             // compiled without a continuation, or against `Next::Empty`
             Format::Phantom(_)
-            | Format::Fail
+            | Format::FailWith(_)
             | Format::Pos
             | Format::EndOfInput
             | Format::Align(_)
@@ -2696,7 +2696,7 @@ impl<'a> NextDependence<'a> {
             ),
             // compiled without a continuation, or against `Next::Empty`
             Format::Phantom(_)
-            | Format::Fail
+            | Format::FailWith(_)
             | Format::Pos
             | Format::EndOfInput
             | Format::Align(_)
@@ -3420,7 +3420,7 @@ impl<'a> MatchTreeStep<'a> {
                     Self::from_format(module, module.get_format(*level), next, guard)
                 })
             }
-            TypedFormat::Fail => Self::reject(),
+            TypedFormat::Fail(_) => Self::reject(),
             TypedFormat::EndOfInput => Self::accept(),
             TypedFormat::Align(n) => Self::from_align(module, next, *n, guard),
             TypedFormat::Phantom(..) => Self::from_next(module, next, guard),
@@ -3661,7 +3661,7 @@ impl<'a> MatchTreeStep<'a> {
             ),
             // never decoded, so consumes nothing
             Format::Phantom(..) => Self::from_next(module, next, guard),
-            Format::Fail => Self::reject(),
+            Format::FailWith(_) => Self::reject(),
             Format::EndOfInput => Self::accept(),
             // consumes whatever remains, which only the empty continuation can follow
             Format::SkipRemainder => Self::any_bytes(module, Rc::new(Next::Empty), guard),

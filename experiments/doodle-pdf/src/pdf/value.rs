@@ -349,11 +349,11 @@ pub(super) fn nat_value(value: Expr) -> Format {
                     number_as_nat(var("n")),
                     [
                         (pat_some(bind("x")), compute(var("x"))),
-                        (pat_none(), Format::Fail), // "not a natural number"
+                        (pat_none(), Format::fail_with("not a natural number")),
                     ],
                 ),
             ),
-            (Pattern::Wildcard, Format::Fail), // "not a number"
+            (Pattern::Wildcard, Format::fail_with("not a number")),
         ],
     )
 }
@@ -440,7 +440,7 @@ fn v_string(pm: &mut PdfModule<'_>) -> Format {
                     is_byte(b'('),
                     if_then_else(
                         expr_eq(var("lim"), Expr::U64(0)),
-                        Format::Fail, // "string nesting limit exceeded"
+                        Format::fail_with("string nesting limit exceeded"),
                         snoc(
                             string_chars.call_args(vec![sub(var("lim"), Expr::U64(1))]),
                             is_byte(b')'),
@@ -512,7 +512,7 @@ pub(super) fn pdf_value(pm: &mut PdfModule<'_>) -> [FormatRef; 2] {
     let nested = |f: Format| {
         if_then_else(
             expr_eq(var("lim"), Expr::U64(0)),
-            Format::Fail, // "value nesting limit exceeded"
+            Format::fail_with("value nesting limit exceeded"),
             f,
         )
     };
@@ -598,7 +598,7 @@ pub(super) fn dict_get(key: &[u8], dict: Expr) -> Format {
         dict_lookup(key, dict),
         [
             (pat_some(bind("v")), compute(var("v"))),
-            (pat_none(), Format::Fail), // "missing dictionary key"
+            (pat_none(), Format::fail_with("missing dictionary key")),
         ],
     )
 }
@@ -613,7 +613,7 @@ pub(super) fn natural_u64(natural: FormatRef) -> Format {
             number_as_nat(var("digits")),
             [
                 (pat_some(bind("n")), compute(var("n"))),
-                (pat_none(), Format::Fail), // "number too large"
+                (pat_none(), Format::fail_with("number too large")),
             ],
         ),
     )

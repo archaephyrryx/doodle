@@ -128,7 +128,7 @@ fn check_covered(
         Format::Phantom(inner) => {
             check_covered(module, path, inner)?;
         }
-        Format::Fail => {}
+        Format::FailWith(_) => {}
         Format::EndOfInput => {}
         Format::SkipRemainder => {}
         Format::Pos => {}
@@ -238,7 +238,7 @@ impl<'module, W: io::Write> Context<'module, W> {
                 "Format::RecVar is rewritten to ItemVar at batch registration; never appears in a stored Format"
             ),
             Format::Phantom(..) => Ok(()),
-            Format::Fail => Ok(()),
+            Format::FailWith(_) => Ok(()),
             Format::EndOfInput => Ok(()),
             Format::SkipRemainder => Ok(()),
             Format::Align(_) => Ok(()),

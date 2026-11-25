@@ -32,8 +32,8 @@ pub enum ModelKind {
 pub enum GroundFormat {
     /// Reference to a top-level item
     ItemVar(usize, Vec<Expr>, Vec<ViewExpr>), // FIXME - do the exprs here need type(+) info?
-    /// A format that never matches
-    Fail,
+    /// A format that never matches, with an optional message (see [`Format::FailWith`])
+    Fail(Option<Label>),
     /// Matches if the end of the input has been reached
     EndOfInput,
     /// Skips bytes if necessary to align the current offset to a multiple of N
@@ -984,7 +984,7 @@ impl FormatModuleExt {
                     }
                     Ok(self.get_format_type(*level).clone())
                 }
-                GroundFormat::Fail => Ok(ValueTypeExt::Empty),
+                GroundFormat::Fail(_) => Ok(ValueTypeExt::Empty),
 
                 GroundFormat::SkipRemainder | GroundFormat::EndOfInput | GroundFormat::Align(_) => {
                     Ok(ValueTypeExt::UNIT)
@@ -1859,7 +1859,7 @@ mod __impls {
                 Format::RecVar(_) => unreachable!(
                     "Format::RecVar is rewritten to ItemVar at batch registration; never appears in a stored Format"
                 ),
-                Format::Fail => FormatExt::Ground(GroundFormat::Fail),
+                Format::FailWith(msg) => FormatExt::Ground(GroundFormat::Fail(msg)),
                 Format::EndOfInput => FormatExt::Ground(GroundFormat::EndOfInput),
                 Format::Align(n) => FormatExt::Ground(GroundFormat::Align(n)),
                 Format::Byte(byte_set) => FormatExt::Ground(GroundFormat::Byte(byte_set)),
@@ -2049,7 +2049,7 @@ mod __impls {
     impl From<GroundFormat> for Format {
         fn from(f: GroundFormat) -> Self {
             match f {
-                GroundFormat::Fail => Format::Fail,
+                GroundFormat::Fail(msg) => Format::FailWith(msg),
                 GroundFormat::Pos => Format::Pos,
                 GroundFormat::EndOfInput => Format::EndOfInput,
                 GroundFormat::SkipRemainder => Format::SkipRemainder,

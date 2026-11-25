@@ -132,7 +132,7 @@ impl<'module> TreePrinter<'module> {
             | Format::RepeatUntilLast(_, format) => self.is_implied_value_format(format),
             Format::Slice(_, format) => self.is_implied_value_format(format),
             // REVIEW - vvv these cases were previously covered by catch-all false vvv
-            Format::Fail => true,
+            Format::FailWith(_) => true,
             Format::Align(_) => true,
             Format::Variant(_, inner) => self.is_implied_value_format(inner),
             Format::Union(formats) | Format::UnionNondet(formats) => {
@@ -451,7 +451,7 @@ impl<'module> TreePrinter<'module> {
             Format::RecVar(_) => unreachable!(
                 "Format::RecVar is rewritten to ItemVar at batch registration; never appears in a stored Format"
             ),
-            Format::Fail => panic!("uninhabited format (value={value:?}"),
+            Format::FailWith(_) => panic!("uninhabited format (value={value:?}"),
             Format::EndOfInput | Format::SkipRemainder => self.compile_parsed_value(value),
             Format::Align(_) => self.compile_parsed_value(value),
             Format::Byte(_) => self.compile_parsed_value(value),
@@ -670,7 +670,7 @@ impl<'module> TreePrinter<'module> {
             ),
             Format::DecodeBytes(_bytes, f) => self.compile_decoded_value(value, f),
             Format::ParseFromView(_view, f) => self.compile_decoded_value(value, f),
-            Format::Fail => panic!("uninhabited format (value={value}"),
+            Format::FailWith(_) => panic!("uninhabited format (value={value}"),
             Format::SkipRemainder | Format::EndOfInput => self.compile_value(value),
             Format::Align(_) => self.compile_value(value),
             Format::Byte(_) => self.compile_value(value),
@@ -2504,7 +2504,8 @@ impl<'module> TreePrinter<'module> {
                 }
                 frag
             }
-            Format::Fail => Fragment::string("fail"),
+            Format::FailWith(None) => Fragment::string("fail"),
+            Format::FailWith(Some(msg)) => Fragment::string(format!("fail {msg:?}")),
             Format::SkipRemainder => Fragment::string("skip-remainder"),
             Format::EndOfInput => Fragment::string("end-of-input"),
             Format::Pos => Fragment::string("pos"),
