@@ -1,3 +1,4 @@
+use crate::format::FailMsg;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -206,7 +207,7 @@ pub enum Decoder {
     Call(usize, Vec<(Label, Expr)>, Vec<(Label, ViewExpr)>),
     Pos,
     /// Fails, with the message of its [`Format::FailWith`], if any
-    Fail(Option<Label>),
+    Fail(FailMsg),
     EndOfInput,
     Align(NonZeroUsize),
     Byte(ByteSet),

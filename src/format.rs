@@ -12,6 +12,15 @@ use crate::record_fmt::RecordFormat;
 use crate::recursion::RecursiveBounds;
 use crate::validation::Condition;
 
+/// The message of a [`Format::FailWith`], reported with the parse error it produces: for now a
+/// fixed string, or none (as [`Format::Fail`] has).
+///
+/// Everything that carries a failure message, from `Format` through the interpreter's
+/// `Decoder` and `DecodeErrorKind` to the code generator's intermediate forms, holds it as a
+/// `FailMsg`, so that a richer message (such as one built from values, as DaeDaLus allows) can
+/// replace this definition rather than every `Option<Label>` that happens to be one.
+pub(crate) type FailMsg = Option<Label>;
+
 /// Binary format descriptions
 ///
 /// # Binary formats as regular expressions
@@ -72,7 +81,7 @@ pub enum Format {
     /// `Fail <msg>`), which is reported with the resulting parse error.
     ///
     /// [`Format::Fail`] is the form without a message; [`Format::fail_with`] constructs one with.
-    FailWith(Option<Label>),
+    FailWith(FailMsg),
     /// Matches if the end of the input has been reached
     EndOfInput,
     /// Skips bytes if necessary to align the current offset to a multiple of N

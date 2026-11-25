@@ -1,3 +1,4 @@
+use crate::format::FailMsg;
 use crate::{BaseKind, Endian, Label};
 
 use super::rust_ast::*;
@@ -211,7 +212,7 @@ const fn mk_method(ident: &'static str) -> MethodSpecifier {
 // SECTION - helper functions for constructing `Err(ParseError::..)`-values corresponding to various kinds of failure-state
 /// Model RustExpr for handling [`Format::FailWith`](crate::Format::FailWith), as an `Err(<..>)`-value
 /// with its message (`Some("..")` or `None`) and accompanying trace-hash.
-pub fn err_fail(message: Option<&Label>, trace: u64) -> RustExpr {
+pub fn err_fail(message: &FailMsg, trace: u64) -> RustExpr {
     let message = match message {
         Some(msg) => RustExpr::FunctionCall(
             Box::new(RustExpr::local("Some")),

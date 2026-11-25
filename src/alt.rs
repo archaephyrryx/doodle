@@ -1,6 +1,7 @@
 pub mod helper;
 pub mod prelude;
 
+use crate::format::FailMsg;
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashSet},
@@ -33,7 +34,7 @@ pub enum GroundFormat {
     /// Reference to a top-level item
     ItemVar(usize, Vec<Expr>, Vec<ViewExpr>), // FIXME - do the exprs here need type(+) info?
     /// A format that never matches, with an optional message (see [`Format::FailWith`])
-    Fail(Option<Label>),
+    Fail(FailMsg),
     /// Matches if the end of the input has been reached
     EndOfInput,
     /// Skips bytes if necessary to align the current offset to a multiple of N

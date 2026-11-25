@@ -1,5 +1,6 @@
 use crate::byte_set::ByteSet;
 use crate::decoder::{ArithError, Scope, ScopeEntry, SeqBoundsError, Value};
+use crate::format::FailMsg;
 use crate::loc_decoder::{LocScope, ParsedValue};
 use crate::numeric::core::EvalError as NumExprError;
 use crate::read::{BufferKind, ReadCtxt};
@@ -307,7 +308,7 @@ pub enum DecodeErrorKind<V: Clone = Value> {
     /// Explicit [`Format::FailWith`](crate::Format::FailWith) token encountered, or successful parse in a `PeekNot` context.
     Fail {
         /// The message of the `Format::FailWith`, if it has one
-        message: Option<Label>,
+        message: FailMsg,
         bindings: Vec<(Label, ScopeEntry<V>)>,
         offset: usize,
         buffer: Vec<u8>,
@@ -392,7 +393,7 @@ impl BufferLimitError {
 impl<V: Clone> DecodeErrorKind<V> {
     /// This error with `message` as its [`Format::FailWith`](crate::Format::FailWith) message,
     /// if it is a [`DecodeErrorKind::Fail`] (other errors are returned unchanged).
-    pub fn with_fail_message(mut self, message: Option<Label>) -> Self {
+    pub fn with_fail_message(mut self, message: FailMsg) -> Self {
         if let DecodeErrorKind::Fail { message: m, .. } = &mut self {
             *m = message;
         }

@@ -1,3 +1,4 @@
+use crate::format::FailMsg;
 use std::{
     borrow::Cow,
     cell::OnceCell,
@@ -3601,7 +3602,7 @@ impl_toast_caselogic!(GTExpr);
 #[derive(Clone, Debug)]
 enum SimpleLogic<ExprT, ViewExprT = TypedViewExpr<GenType>> {
     /// Fails, with the message of its `Format::FailWith`, if any
-    Fail(Option<Label>),
+    Fail(FailMsg),
     ExpectEnd,
     Invoke(usize, Vec<(Label, ExprT)>, Vec<(Label, ViewExprT)>),
     SkipToNextMultiple(usize),
@@ -3620,7 +3621,7 @@ impl ToAst for SimpleLogic<GTExpr> {
     fn to_ast(&self, ctxt: ProdCtxt<'_>) -> GenBlock {
         match self {
             SimpleLogic::Fail(msg) => {
-                GenBlock::explicit_return(model::err_fail(msg.as_ref(), get_trace(&())))
+                GenBlock::explicit_return(model::err_fail(msg, get_trace(&())))
             }
             SimpleLogic::ExpectEnd => GenBlock::simple_expr(model::try_enforce_eos(ctxt.parser())),
             SimpleLogic::PhantomData => GenBlock::simple_expr(model::phantom_data()),

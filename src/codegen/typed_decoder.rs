@@ -1,5 +1,6 @@
 use crate::byte_set::ByteSet;
 use crate::decoder::{CallIndices, merge_identical_decoders};
+use crate::format::FailMsg;
 use crate::validation::TypedCondition;
 use crate::{
     Format, FormatModule, Label, MatchTree, MaybeTyped, Next, NextDependence, RepeatRange,
@@ -201,7 +202,7 @@ pub(crate) enum TypedDecoder<TypeRep> {
         ),
     ),
     /// Fails, with the message of its `Format::FailWith`, if any
-    Fail(Option<Label>),
+    Fail(FailMsg),
     EndOfInput,
     Align(NonZeroUsize),
     Byte(ByteSet),

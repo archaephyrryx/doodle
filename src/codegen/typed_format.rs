@@ -1,3 +1,4 @@
+use crate::format::FailMsg;
 use std::borrow::Cow;
 use std::cell::{OnceCell, RefCell};
 use std::collections::HashSet;
@@ -335,7 +336,7 @@ pub enum TypedFormat<TypeRep> {
         Box<TypedFormat<TypeRep>>,
     ),
     /// [`Format::FailWith`](crate::Format::FailWith), with its message
-    Fail(Option<Label>),
+    Fail(FailMsg),
     EndOfInput,
     Align(NonZeroUsize),
     Byte(ByteSet),
